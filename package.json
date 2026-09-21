@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node tools/http-lab/server.test.mjs",
     "test:engine": "node tools/http-lab/engine.test.mjs",
+    "test:tls": "node tools/http-lab/tls.test.mjs",
     "lab:serve": "node tools/http-lab/cli.mjs"
   }
 }

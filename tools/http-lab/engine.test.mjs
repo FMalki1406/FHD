@@ -83,6 +83,26 @@ test('engine downloads and verifies the complete fixture', async t => {
   assert.deepEqual(await readFile(output), expected);
 });
 
+test('engine persists URL fingerprints and rejects a different query on resume', async t => {
+  const { directory, lab, output } = await setup(t);
+  const secret = 'synthetic-url-secret-4c183ec2';
+  const url = `${lab.url}/drop-once?token=${secret}`;
+  const first = await transfer(directory, url);
+  assert.equal(first.code, 2);
+  const before = await partSnapshot(directory);
+  const mismatch = await transfer(directory, `${url}-changed`);
+  assert.equal(mismatch.code, 2);
+  assert.match(mismatch.stderr, /LocalStateMismatch/);
+  assert.deepEqual(await partSnapshot(directory), before);
+  await assertNoOutput(output);
+  assertComplete(await transfer(directory, url), true);
+  for (const name of await readdir(directory)) {
+    assert.ok(!(await readFile(path.join(directory, name))).includes(Buffer.from(secret)),
+      'URL sentinel must not appear in persisted job files');
+  }
+  assert.ok(!first.stderr.includes(secret) && !first.stdout.includes(secret));
+});
+
 test('engine follows a redirect and preserves the verified representation', async t => {
   const { directory, lab, output } = await setup(t);
   assertComplete(await transfer(directory, `${lab.url}/redirect`), false);

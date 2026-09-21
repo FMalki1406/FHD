@@ -10,11 +10,18 @@ use std::{
 };
 
 pub struct Identity {
-    pub original_url: String,
-    pub final_url: String,
+    pub original_url_fingerprint: [u8; 32],
+    pub final_url_fingerprint: [u8; 32],
     pub strong_etag: Option<String>,
     pub total: u64,
     pub expected_sha256: Option<[u8; 32]>,
+}
+/// URL identity only, not encryption or authentication. Caller normalizes first.
+pub fn url_fingerprint(normalized_url: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"FHD.url-identity.v2\0");
+    hash.update(normalized_url.as_bytes());
+    hash.finalize().into()
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -26,6 +33,7 @@ pub enum Status {
 pub enum StoreError {
     Io(std::io::ErrorKind),
     Database,
+    UnsupportedVersion,
     InvalidInput,
     Corrupt,
     Locked,
@@ -53,8 +61,8 @@ impl From<rusqlite::Error> for StoreError {
 type Result<T> = std::result::Result<T, StoreError>;
 type SavedRow = (
     i64,
-    String,
-    String,
+    Vec<u8>,
+    Vec<u8>,
     Option<String>,
     i64,
     Option<Vec<u8>>,
@@ -99,13 +107,13 @@ impl Store {
         part.sync_all()?;
         let db = Connection::open(dir.join("state.sqlite"))?;
         configure(&db)?;
-        db.execute_batch("CREATE TABLE job (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, original TEXT NOT NULL, final TEXT NOT NULL, etag TEXT, total INTEGER NOT NULL CHECK(total>=0), expected BLOB, output TEXT NOT NULL, committed INTEGER NOT NULL CHECK(committed>=0 AND committed<=total), digest BLOB NOT NULL CHECK(length(digest)=32), phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 3));")?;
+        db.execute_batch("CREATE TABLE job (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, original BLOB NOT NULL CHECK(length(original)=32), final BLOB NOT NULL CHECK(length(final)=32), etag TEXT, total INTEGER NOT NULL CHECK(total>=0), expected BLOB, output TEXT NOT NULL, committed INTEGER NOT NULL CHECK(committed>=0 AND committed<=total), digest BLOB NOT NULL CHECK(length(digest)=32), phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 3));")?;
         let empty: [u8; 32] = Sha256::digest([]).into();
         db.execute(
-            "INSERT INTO job VALUES(1,1,?1,?2,?3,?4,?5,?6,0,?7,0)",
+            "INSERT INTO job VALUES(1,2,?1,?2,?3,?4,?5,?6,0,?7,0)",
             params![
-                identity.original_url,
-                identity.final_url,
+                identity.original_url_fingerprint.as_slice(),
+                identity.final_url_fingerprint.as_slice(),
                 identity.strong_etag,
                 identity.total as i64,
                 identity.expected_sha256.as_ref().map(|v| v.as_slice()),
@@ -144,13 +152,24 @@ impl Store {
             .write(true)
             .open(dir.join("owner.lock"))?;
         lock.try_lock().map_err(|_| StoreError::Locked)?;
+        let version_reader = Connection::open_with_flags(
+            dir.join("state.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        version_reader.pragma_update(None, "trusted_schema", "OFF")?;
+        let version: i64 =
+            version_reader.query_row("SELECT version FROM job WHERE id=1", [], |row| row.get(0))?;
+        if version != 2 {
+            return Err(StoreError::UnsupportedVersion);
+        }
+        drop(version_reader);
         let db = Connection::open_with_flags(
             dir.join("state.sqlite"),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
         configure(&db)?;
         let (version, original, final_url, etag, total, expected, output, committed, digest, phase): SavedRow = db.query_row("SELECT version,original,final,etag,total,expected,output,committed,digest,phase FROM job WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
-        if version != 1
+        if version != 2
             || total < 0
             || committed < 0
             || committed > total
@@ -163,8 +182,8 @@ impl Store {
             .map(|v| <[u8; 32]>::try_from(v).map_err(|_| StoreError::Corrupt))
             .transpose()?;
         let identity = Identity {
-            original_url: original,
-            final_url,
+            original_url_fingerprint: original.try_into().map_err(|_| StoreError::Corrupt)?,
+            final_url_fingerprint: final_url.try_into().map_err(|_| StoreError::Corrupt)?,
             strong_etag: etag,
             total: total as u64,
             expected_sha256,
@@ -370,10 +389,6 @@ fn hash_prefix(file: &mut File, len: u64) -> Result<Sha256> {
 }
 fn validate_identity(identity: &Identity) -> Result<()> {
     if identity.total > i64::MAX as u64
-        || identity.original_url.is_empty()
-        || identity.final_url.is_empty()
-        || identity.original_url.len() > 16384
-        || identity.final_url.len() > 16384
         || identity
             .strong_etag
             .as_ref()
@@ -479,13 +494,61 @@ mod tests {
     }
     fn identity(total: u64) -> Identity {
         Identity {
-            original_url: "https://example.test/file".into(),
-            final_url: "https://example.test/file".into(),
+            original_url_fingerprint: url_fingerprint("https://example.test/file"),
+            final_url_fingerprint: url_fingerprint("https://example.test/file"),
             strong_etag: Some("\"version1\"".into()),
             total,
             expected_sha256: None,
         }
     }
+    #[test]
+    fn url_fields_persist_only_fingerprints() {
+        let temp = TestDir::new();
+        let secret = "unique-query-secret-58310497";
+        let url = format!("https://example.test/private/{secret}?token={secret}");
+        let mut id = identity(3);
+        id.original_url_fingerprint = url_fingerprint(&url);
+        id.final_url_fingerprint = url_fingerprint(&(url.clone() + "&redirect=1"));
+        let mut store = Store::create(&temp.0, id, "download.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+        let recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(
+            recovered.identity().original_url_fingerprint,
+            url_fingerprint(&url)
+        );
+        drop(recovered);
+        for entry in fs::read_dir(&temp.0).unwrap() {
+            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            assert!(!bytes
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn legacy_schema_is_rejected_without_rewriting_or_truncating() {
+        let temp = TestDir::new();
+        fs::create_dir(&temp.0).unwrap();
+        fs::write(temp.0.join("owner.lock"), []).unwrap();
+        fs::write(temp.0.join("payload.part"), b"keep-uncommitted-tail").unwrap();
+        let db = Connection::open(temp.0.join("state.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE job(id INTEGER PRIMARY KEY, version INTEGER, original TEXT); INSERT INTO job VALUES(1,1,'legacy-secret-url');").unwrap();
+        drop(db);
+        let before = fs::read(temp.0.join("state.sqlite")).unwrap();
+        assert!(matches!(
+            Store::open(&temp.0),
+            Err(StoreError::UnsupportedVersion)
+        ));
+        assert_eq!(fs::read(temp.0.join("state.sqlite")).unwrap(), before);
+        assert_eq!(
+            fs::read(temp.0.join("payload.part")).unwrap(),
+            b"keep-uncommitted-tail"
+        );
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 3);
+    }
+
     #[test]
     fn recovery_keeps_checkpoint_and_discards_only_uncommitted_tail() {
         let temp = TestDir::new();

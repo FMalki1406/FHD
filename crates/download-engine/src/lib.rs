@@ -9,7 +9,7 @@ use reqwest::{
 use resume_policy::{Decision, Field, ResponseHeaders, ResumeRequest, StrongEtag};
 use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
-use transfer_store::{Identity, Status, Store, StoreError};
+use transfer_store::{url_fingerprint, Identity, Status, Store, StoreError};
 
 pub struct Options {
     pub url: String,
@@ -37,6 +37,7 @@ pub enum Error {
     ResumeRejected,
     LocalStateMismatch,
     Storage,
+    UnsupportedStorageVersion,
     WorkerFailed,
     Cancelled,
     InvalidTransition,
@@ -162,7 +163,10 @@ async fn disk<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|_| Error::WorkerFailed)?
-        .map_err(|_| Error::Storage)
+        .map_err(|error| match error {
+            StoreError::UnsupportedVersion => Error::UnsupportedStorageVersion,
+            _ => Error::Storage,
+        })
 }
 
 fn event(job: &mut Download, event: Event) -> Result<(), Error> {
@@ -262,7 +266,7 @@ pub async fn download(
         return Err(Error::Cancelled);
     }
     if let Some(store) = &existing {
-        if store.identity().original_url != original.as_str()
+        if store.identity().original_url_fingerprint != url_fingerprint(original.as_str())
             || store.identity().expected_sha256 != options.expected_sha256
             || store.output_name() != options.output_name
         {
@@ -320,14 +324,14 @@ pub async fn download(
     )
     .await?;
     validate_representation(response.headers())?;
-    let final_url = response.url().as_str().to_owned();
+    let final_url_fingerprint = url_fingerprint(response.url().as_str());
     let mut job = Download::new(DownloadId(1)); // Owned locally; no cross-task event channel exists here.
     job.command(Command::Start)
         .map_err(|_| Error::InvalidTransition)?;
     let total;
     if let Some(store) = &existing {
         let identity = store.identity();
-        if final_url != identity.final_url {
+        if final_url_fingerprint != identity.final_url_fingerprint {
             return Err(Error::RepresentationChanged);
         }
         total = identity.total;
@@ -401,8 +405,8 @@ pub async fn download(
             }
         };
         let identity = Identity {
-            original_url: original.to_string(),
-            final_url,
+            original_url_fingerprint: url_fingerprint(original.as_str()),
+            final_url_fingerprint,
             strong_etag,
             total,
             expected_sha256: options.expected_sha256,
@@ -502,8 +506,8 @@ mod tests {
         let mut store = Store::create(
             &dir,
             Identity {
-                original_url: url.into(),
-                final_url: url.into(),
+                original_url_fingerprint: url_fingerprint(url),
+                final_url_fingerprint: url_fingerprint(url),
                 strong_etag: None,
                 total: 3,
                 expected_sha256: None,
