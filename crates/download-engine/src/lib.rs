@@ -11,6 +11,9 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use transfer_store::{url_fingerprint, Identity, Status, Store, StoreError};
 
+pub mod manager;
+
+#[derive(Clone)]
 pub struct Options {
     pub url: String,
     pub job_dir: PathBuf,
@@ -22,7 +25,7 @@ pub struct Options {
     pub max_download_bytes: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidOptions,
     InvalidUrl,
@@ -294,6 +297,9 @@ pub async fn download(
         }
     }
     let start = existing.as_ref().map_or(0, Store::committed_len);
+    if start > 0 {
+        on_checkpoint(start);
+    }
     if existing
         .as_ref()
         .is_some_and(|s| matches!(s.status(), Status::ReadyToPublish | Status::Published))
@@ -445,11 +451,12 @@ pub async fn download(
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                disk(move || {
+                let committed = disk(move || {
                     store.checkpoint()?;
-                    Ok(())
+                    Ok(store.committed_len())
                 })
                 .await?;
+                on_checkpoint(committed);
                 return Err(error);
             }
         };
@@ -462,7 +469,12 @@ pub async fn download(
         // Bound each disk operation and copied buffer; no whole-file accumulation.
         for bytes in chunk.chunks(64 * 1024) {
             if is_cancelled(&cancel) {
-                disk(move || store.checkpoint()).await?;
+                let committed = disk(move || {
+                    store.checkpoint()?;
+                    Ok(store.committed_len())
+                })
+                .await?;
+                on_checkpoint(committed);
                 return Err(Error::Cancelled);
             }
             let owned = bytes.to_vec();
@@ -484,11 +496,12 @@ pub async fn download(
         return Err(Error::BodyLength);
     }
     if is_cancelled(&cancel) {
-        disk(move || {
+        let committed = disk(move || {
             store.checkpoint()?;
-            Ok(())
+            Ok(store.committed_len())
         })
         .await?;
+        on_checkpoint(committed);
         return Err(Error::Cancelled);
     }
     event(&mut job, Event::TransferFinished)?;

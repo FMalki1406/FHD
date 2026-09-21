@@ -82,3 +82,6 @@ npm run lab:serve
 
 - [رحلة التثبيت والتجربة وإدارة الأجهزة](docs/customer-installation-and-activation.md).
 - [مراجعة فشل التخزين](docs/disk-failure-review.md).
+
+- [إدارة مهام التنزيل](docs/task-manager.md).
+- [مراجعة إدارة المهام](docs/task-manager-review.md).
