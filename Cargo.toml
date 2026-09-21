@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/download-core", "crates/resume-policy", "crates/transfer-store", "crates/download-engine", "crates/queue-secrets"]
+members = ["crates/download-core", "crates/resume-policy", "crates/transfer-store", "crates/download-engine", "crates/queue-secrets", "crates/platform-files"]
 resolver = "2"
 
 [profile.release]

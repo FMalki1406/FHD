@@ -20,6 +20,7 @@ pub(crate) struct SavedJob {
     pub attempts: u8,
 }
 pub(crate) struct Snapshot {
+    pub last_id: u64,
     pub config: Config,
     pub jobs: Vec<SavedJob>,
     pub queue: Vec<JobId>,
@@ -165,7 +166,7 @@ fn option(bytes: &mut Vec<u8>, value: Option<u64>) {
 }
 
 fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
-    let mut bytes = Zeroizing::new(b"FHDQUEUE\x01".to_vec());
+    let mut bytes = Zeroizing::new(b"FHDQUEUE\x02".to_vec());
     let c = &snapshot.config;
     for value in [
         c.max_active as u64,
@@ -178,6 +179,7 @@ fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
         put(&mut bytes, value);
     }
     option(&mut bytes, c.global_bytes_per_second);
+    put(&mut bytes, snapshot.last_id);
     put(&mut bytes, snapshot.jobs.len() as u64);
     for job in &snapshot.jobs {
         put(&mut bytes, job.id.0);
@@ -199,6 +201,29 @@ fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
         put(&mut bytes, job.options.max_download_bytes);
         option(&mut bytes, job.options.bytes_per_second);
         bytes.push(job.options.parallel_connections);
+        string(
+            &mut bytes,
+            job.options
+                .request_policy
+                .authorization
+                .as_deref()
+                .unwrap_or(""),
+        );
+        string(
+            &mut bytes,
+            job.options.request_policy.cookie.as_deref().unwrap_or(""),
+        );
+        put(
+            &mut bytes,
+            job.options.request_policy.redirect_origins.len() as u64,
+        );
+        for origin in &job.options.request_policy.redirect_origins {
+            string(&mut bytes, origin);
+        }
+        bytes.push(u8::from(job.options.refresh_from.is_some()));
+        if let Some(hash) = job.options.refresh_from {
+            bytes.extend_from_slice(&hash);
+        }
         bytes.push(match job.priority {
             Priority::Low => 0,
             Priority::Normal => 1,
@@ -281,7 +306,8 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
         return Err(ManagerError::Persistence);
     }
     let mut r = Reader(plain);
-    if r.take(9)? != b"FHDQUEUE\x01" {
+    let version = r.take(9)?;
+    if version != b"FHDQUEUE\x01" && version != b"FHDQUEUE\x02" {
         return Err(ManagerError::Persistence);
     }
     let config = Config {
@@ -296,6 +322,11 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
         global_bytes_per_second: r.option()?,
     };
     config.validate()?;
+    let saved_last_id = if version == b"FHDQUEUE\x02" {
+        Some(r.n()?)
+    } else {
+        None
+    };
     let count = r.bounded(config.max_jobs as u64)?;
     let mut jobs = Vec::with_capacity(count);
     for _ in 0..count {
@@ -311,7 +342,7 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
         } else {
             None
         };
-        let options = Options {
+        let mut options = Options {
             url,
             job_dir,
             output_name,
@@ -321,7 +352,26 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
             max_download_bytes: r.n()?,
             bytes_per_second: r.option()?,
             parallel_connections: r.byte()?,
+            request_policy: Default::default(),
+            refresh_from: None,
         };
+        if version == b"FHDQUEUE\x02" {
+            let auth = r.string(8192)?;
+            let cookie = r.string(8192)?;
+            let mut origins = Vec::new();
+            for _ in 0..r.bounded(8)? {
+                origins.push(r.string(16_384)?);
+            }
+            options.request_policy = crate::RequestPolicy::new(
+                (!auth.is_empty()).then_some(auth),
+                (!cookie.is_empty()).then_some(cookie),
+                origins,
+            )
+            .map_err(failure)?;
+            if r.boolean()? {
+                options.refresh_from = Some(r.take(32)?.try_into().map_err(failure)?);
+            }
+        }
         let priority = match r.byte()? {
             0 => Priority::Low,
             1 => Priority::Normal,
@@ -364,7 +414,13 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
     if !r.0.is_empty() {
         return Err(ManagerError::Persistence);
     }
+    let maximum = jobs.iter().map(|j| j.id.0).max().unwrap_or(0);
+    let last_id = saved_last_id.unwrap_or(maximum);
+    if last_id < maximum {
+        return Err(ManagerError::Persistence);
+    }
     Ok(Snapshot {
+        last_id,
         config,
         jobs,
         queue,
@@ -375,8 +431,26 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
 mod tests {
     use super::*;
     #[test]
+    fn version_one_queue_is_read_without_inventing_credentials() {
+        let snapshot = Snapshot {
+            last_id: 0,
+            config: Config::default(),
+            jobs: vec![],
+            queue: vec![],
+        };
+        let mut old = encode(&snapshot).unwrap().to_vec();
+        old.truncate(old.len() - 32);
+        old[8] = 1;
+        old.drain(65..73);
+        old.extend_from_slice(&Sha256::digest(&old));
+        let restored = decode(&old).unwrap();
+        assert!(restored.jobs.is_empty());
+        assert_eq!(restored.last_id, 0);
+    }
+    #[test]
     fn envelope_rejects_changes_and_invalid_lengths() {
         let snapshot = Snapshot {
+            last_id: 0,
             config: Config::default(),
             jobs: vec![],
             queue: vec![],

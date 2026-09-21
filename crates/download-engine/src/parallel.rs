@@ -11,6 +11,7 @@ pub(super) struct Plan {
     pub connections: u8,
     pub checkpoint_bytes: u64,
     pub pacing: TrafficControl,
+    pub request_policy: RequestPolicy,
 }
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ struct Fetch {
     etag: String,
     fingerprint: [u8; 32],
     pacing: TrafficControl,
+    request_policy: RequestPolicy,
 }
 
 impl Fetch {
@@ -36,6 +38,7 @@ impl Fetch {
             self.url,
             Some((start, end, &self.etag)),
             self.allow_http,
+            &self.request_policy,
             &mut cancel,
         )
         .await?;
@@ -149,6 +152,7 @@ pub(super) async fn transfer(
             .ok_or(Error::ResumeUnsupported)?,
         fingerprint: store.identity().final_url_fingerprint,
         pacing: plan.pacing,
+        request_policy: plan.request_policy,
     };
     let mut offset = store.len();
     let end = offset + RANGE_BYTES.min(fetch.total - offset);

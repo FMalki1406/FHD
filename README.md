@@ -98,3 +98,13 @@ npm run lab:serve
 - [النقل المتوازي وحدوده](docs/parallel-downloads.md).
 - [حدود السرعة المشتركة والتعديل الحي](docs/bandwidth-policy.md).
 - [المراجعة الهندسية والأمنية للدفعة](docs/four-features-review.md).
+- [تأهيل المحرك عبر الأنظمة](docs/engine-qualification.md): تعريف CI أضيف؛ نتائج Linux وmacOS معلقة حتى تشغيله والتحقق منها.
+
+## التوافق وإدارة الوجهات
+
+- [الاعتماد وCookies والتحويلات](docs/request-compatibility.md).
+- [تجديد الروابط المؤقتة](docs/signed-url-refresh.md).
+- [النقل مجهول الحجم](docs/unknown-length-transfers.md).
+- [الوجهات والتعارض والمساحة](docs/file-destinations.md).
+- [حد استقبال الطلبات الداخلي](docs/application-intake.md).
+- [مراجعة الدفعة](docs/remaining-engine-review.md).

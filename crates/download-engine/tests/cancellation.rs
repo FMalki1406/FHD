@@ -27,7 +27,7 @@ struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-cancellation-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -110,6 +110,8 @@ impl Server {
             max_download_bytes: TOTAL as u64,
             bytes_per_second: None,
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
 }

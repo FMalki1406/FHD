@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use download_engine::{
     manager::{Config, JobSnapshot, Manager, ManagerError, Priority, RetryPolicy, State},
     Error, Options,
@@ -29,7 +31,7 @@ struct Lab {
 }
 impl Lab {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-durable-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -83,6 +85,8 @@ impl Lab {
             max_download_bytes: TOTAL as u64,
             bytes_per_second: None,
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
     fn count(&self, name: &str) -> usize {
@@ -158,6 +162,10 @@ fn serve(mut socket: TcpStream, stop: Arc<AtomicBool>, counts: Arc<Mutex<HashMap
         return;
     }
     let lower = text.to_ascii_lowercase();
+    if name == "second" {
+        assert!(lower.contains("authorization: bearer queue_auth_canary"));
+        assert!(lower.contains("cookie: session=queue_cookie_canary"));
+    }
     let data = body();
     if lower.contains("range: bytes=") {
         assert!(lower.contains("range: bytes=4096-16383"));
@@ -235,8 +243,15 @@ async fn encrypted_queue_reopens_without_urls_and_preserves_settings_and_partial
             .any(|j| j.id == a && j.committed_bytes == PREFIX as u64)
     })
     .await;
+    let mut authenticated = lab.options("second");
+    authenticated.request_policy = download_engine::RequestPolicy::new(
+        Some("Bearer QUEUE_AUTH_CANARY".into()),
+        Some("session=QUEUE_COOKIE_CANARY".into()),
+        vec![],
+    )
+    .unwrap();
     let b = manager
-        .enqueue_with_priority(lab.options("second"), Priority::High)
+        .enqueue_with_priority(authenticated, Priority::High)
         .await
         .unwrap();
     manager.set_job_rate(b, Some(65536)).await.unwrap();
@@ -247,6 +262,8 @@ async fn encrypted_queue_reopens_without_urls_and_preserves_settings_and_partial
         b"PRIVATE_QUEUE_SECRET".as_slice(),
         b"private-filename.bin",
         b"127.0.0.1",
+        b"QUEUE_AUTH_CANARY",
+        b"QUEUE_COOKIE_CANARY",
     ] {
         assert!(!data.windows(secret.len()).any(|part| part == secret));
     }

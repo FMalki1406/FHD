@@ -22,7 +22,7 @@ struct Fixture {
 impl Fixture {
     fn new(bytes: Vec<u8>) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let directory = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-rate-{}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
@@ -95,6 +95,8 @@ impl Fixture {
             max_download_bytes: 1024 * 1024,
             bytes_per_second: Some(rate),
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
 }

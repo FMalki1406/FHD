@@ -83,6 +83,8 @@ fn arguments() -> Result<Options, &'static str> {
         max_download_bytes,
         bytes_per_second,
         parallel_connections,
+        request_policy: Default::default(),
+        refresh_from: None,
     })
 }
 

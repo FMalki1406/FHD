@@ -9,6 +9,7 @@ download-core = { path = "../download-core" }
 resume-policy = { path = "../resume-policy" }
 transfer-store = { path = "../transfer-store" }
 queue-secrets = { path = "../queue-secrets" }
+platform-files = { path = "../platform-files" }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 sha2 = "=0.11.0"
 zeroize = "=1.9.0"

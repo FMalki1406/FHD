@@ -1,0 +1,67 @@
+name: Engine verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_extended:
+        description: Run the optional bounded 64 MiB streaming workload
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Engine (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.13.1"
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Record environment
+        run: |
+          rustc +1.98.1 --version --verbose
+          cargo +1.98.1 --version
+          node --version
+      - name: Check formatting
+        run: cargo +1.98.1 fmt --all -- --check
+      - name: Check Rust warnings
+        run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test Rust workspace
+        run: cargo +1.98.1 test --workspace --locked
+      - name: Build developer transfer tool
+        run: cargo +1.98.1 build --bin fhd-transfer --locked
+      - name: Test HTTP fixtures
+        run: node tools/http-lab/server.test.mjs
+      - name: Test real transfer executable
+        run: node tools/http-lab/engine.test.mjs
+      - name: Test TLS certificate rejection on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: node tools/http-lab/tls.test.mjs
+      - name: Run optional streaming workload
+        if: github.event_name == 'workflow_dispatch' && inputs.run_extended
+        run: cargo +1.98.1 test -p download-engine --test unknown_length bounded_64_mib_chunked_workload --locked -- --ignored --exact

@@ -29,7 +29,7 @@ struct Lab {
 }
 impl Lab {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-manager-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -83,6 +83,8 @@ impl Lab {
             max_download_bytes: TOTAL as u64,
             bytes_per_second: None,
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
 }

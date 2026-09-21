@@ -80,6 +80,7 @@ enum Fault {
     PartialWrite(usize),
     CheckpointSync,
     CheckpointReceiptAcknowledgement,
+    UnknownCompletionReceiptAcknowledgement,
     PublishLink,
     PublishSync,
     PublishReceiptAcknowledgement,
@@ -96,6 +97,7 @@ pub struct Store {
     phase: i64,
     hasher: Sha256,
     poisoned: bool,
+    unknown_length: bool,
     #[cfg(test)]
     fault: Option<Fault>,
     // Fields drop in declaration order: release ownership after DB and part close.
@@ -103,6 +105,22 @@ pub struct Store {
 }
 impl Store {
     pub fn create(dir: &Path, identity: Identity, output_name: &str) -> Result<Self> {
+        Self::create_inner(dir, identity, output_name, false)
+    }
+    /// `identity.total` is the hard byte limit until clean framing determines size.
+    /// Unfinished unknown-length stores must never be resumed by appending bytes.
+    pub fn create_unknown(dir: &Path, identity: Identity, output_name: &str) -> Result<Self> {
+        if identity.total == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        Self::create_inner(dir, identity, output_name, true)
+    }
+    fn create_inner(
+        dir: &Path,
+        identity: Identity,
+        output_name: &str,
+        unknown_length: bool,
+    ) -> Result<Self> {
         validate_name(output_name)?;
         validate_identity(&identity)?;
         let dir = std::path::absolute(dir)?;
@@ -123,9 +141,12 @@ impl Store {
         let db = Connection::open(dir.join("state.sqlite"))?;
         configure(&db)?;
         db.execute_batch("CREATE TABLE job (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, original BLOB NOT NULL CHECK(length(original)=32), final BLOB NOT NULL CHECK(length(final)=32), etag TEXT, total INTEGER NOT NULL CHECK(total>=0), expected BLOB, output TEXT NOT NULL, committed INTEGER NOT NULL CHECK(committed>=0 AND committed<=total), digest BLOB NOT NULL CHECK(length(digest)=32), phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 3));")?;
+        if unknown_length {
+            db.execute_batch("ALTER TABLE job ADD COLUMN length_known INTEGER NOT NULL DEFAULT 0 CHECK(length_known IN (0,1));")?;
+        }
         let empty: [u8; 32] = Sha256::digest([]).into();
         db.execute(
-            "INSERT INTO job VALUES(1,2,?1,?2,?3,?4,?5,?6,0,?7,0)",
+            "INSERT INTO job(id,version,original,final,etag,total,expected,output,committed,digest,phase) VALUES(1,?8,?1,?2,?3,?4,?5,?6,0,?7,0)",
             params![
                 identity.original_url_fingerprint.as_slice(),
                 identity.final_url_fingerprint.as_slice(),
@@ -133,7 +154,8 @@ impl Store {
                 identity.total as i64,
                 identity.expected_sha256.as_ref().map(|v| v.as_slice()),
                 output_name,
-                empty.as_slice()
+                empty.as_slice(),
+                if unknown_length { 3 } else { 2 }
             ],
         )?;
         sync_directory(&dir)?;
@@ -149,6 +171,7 @@ impl Store {
             phase: 0,
             hasher: Sha256::new(),
             poisoned: false,
+            unknown_length,
             #[cfg(test)]
             fault: None,
         })
@@ -176,7 +199,7 @@ impl Store {
         version_reader.pragma_update(None, "trusted_schema", "OFF")?;
         let version: i64 =
             version_reader.query_row("SELECT version FROM job WHERE id=1", [], |row| row.get(0))?;
-        if version != 2 {
+        if !matches!(version, 2 | 3) {
             return Err(StoreError::UnsupportedVersion);
         }
         drop(version_reader);
@@ -186,7 +209,20 @@ impl Store {
         )?;
         configure(&db)?;
         let (version, original, final_url, etag, total, expected, output, committed, digest, phase): SavedRow = db.query_row("SELECT version,original,final,etag,total,expected,output,committed,digest,phase FROM job WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
-        if version != 2
+        let unknown_length = if version == 3 {
+            match db.query_row("SELECT length_known FROM job WHERE id=1", [], |row| {
+                row.get::<_, i64>(0)
+            })? {
+                0 => true,
+                1 => false,
+                _ => return Err(StoreError::Corrupt),
+            }
+        } else {
+            false
+        };
+        if !matches!(version, 2 | 3)
+            || (unknown_length && (phase != 0 || total == 0))
+            || (version == 3 && !unknown_length && phase == 0)
             || total < 0
             || committed < 0
             || committed > total
@@ -237,7 +273,9 @@ impl Store {
             committed,
             phase,
             hasher,
-            poisoned: false,
+            // Interrupted unknown framing cannot authorize any further bytes.
+            poisoned: unknown_length,
+            unknown_length,
             #[cfg(test)]
             fault: None,
         };
@@ -248,6 +286,33 @@ impl Store {
     }
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+    pub fn is_unknown_length(&self) -> bool {
+        self.unknown_length
+    }
+    /// Caller must validate response ETag/length AND resource binding (or a trusted
+    /// expected full-file hash). ETag alone is not identity across different URLs.
+    /// A failed update poisons this handle; reopen reconciles ambiguous commits.
+    pub fn rebind_urls(&mut self, original: [u8; 32], final_url: [u8; 32]) -> Result<()> {
+        if self.poisoned
+            || self.phase != 0
+            || self.unknown_length
+            || self.identity.strong_etag.is_none()
+        {
+            return Err(StoreError::NotWritable);
+        }
+        self.poisoned = true;
+        let changed = self.db.execute(
+            "UPDATE job SET original=?1,final=?2 WHERE id=1",
+            params![original.as_slice(), final_url.as_slice()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Corrupt);
+        }
+        self.identity.original_url_fingerprint = original;
+        self.identity.final_url_fingerprint = final_url;
+        self.poisoned = false;
+        Ok(())
     }
     pub fn output_name(&self) -> &str {
         &self.output
@@ -260,6 +325,12 @@ impl Store {
     }
     pub fn committed_len(&self) -> u64 {
         self.committed
+    }
+    /// Digest of this handle's verified/read or successfully appended prefix.
+    /// Callers exporting a file must additionally require Published status and
+    /// compare its length; this digest does not authenticate an external source.
+    pub fn verified_sha256(&self) -> [u8; 32] {
+        self.hasher.clone().finalize().into()
     }
     pub fn status(&self) -> Status {
         match self.phase {
@@ -316,12 +387,34 @@ impl Store {
     }
     /// Call only after the transport has validated clean body termination.
     pub fn mark_transfer_complete(&mut self) -> Result<()> {
-        if self.len != self.identity.total {
+        if self.unknown_length || self.len != self.identity.total {
             return Err(StoreError::Incomplete);
         }
         self.checkpoint()?;
         self.poisoned = true;
         self.db.execute("UPDATE job SET phase=1 WHERE id=1", [])?;
+        self.phase = 1;
+        self.poisoned = false;
+        Ok(())
+    }
+    /// Call only after the protocol parser confirms clean framing termination.
+    /// The durable size and completion marker change in a single transaction.
+    pub fn mark_unknown_transfer_complete(&mut self) -> Result<()> {
+        if !self.unknown_length {
+            return Err(StoreError::InvalidInput);
+        }
+        self.checkpoint()?;
+        self.poisoned = true;
+        let transaction = self.db.transaction()?;
+        let changed = transaction.execute("UPDATE job SET total=?1,length_known=1,phase=1 WHERE id=1 AND version=3 AND length_known=0 AND phase=0", [self.len as i64])?;
+        if changed != 1 {
+            return Err(StoreError::Corrupt);
+        }
+        transaction.commit()?;
+        #[cfg(test)]
+        self.fail_at(Fault::UnknownCompletionReceiptAcknowledgement)?;
+        self.identity.total = self.len;
+        self.unknown_length = false;
         self.phase = 1;
         self.poisoned = false;
         Ok(())
@@ -530,7 +623,7 @@ mod tests {
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "fhd-store-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -563,6 +656,107 @@ mod tests {
         assert!(matches!(store.checkpoint(), Err(StoreError::NotWritable)));
         assert!(store.mark_transfer_complete().is_err());
         assert!(store.finalize().is_err());
+    }
+
+    #[test]
+    fn unknown_length_finishes_with_actual_size_only_after_explicit_clean_end() {
+        let temp = TestDir::new();
+        let mut store = Store::create_unknown(&temp.0, identity(100), "x.bin").unwrap();
+        assert!(store.is_unknown_length());
+        store.append(b"abc").unwrap();
+        assert!(matches!(
+            store.mark_transfer_complete(),
+            Err(StoreError::Incomplete)
+        ));
+        assert!(matches!(store.finalize(), Err(StoreError::Incomplete)));
+        store.mark_unknown_transfer_complete().unwrap();
+        assert!(!store.is_unknown_length());
+        assert_eq!(store.identity().total, 3);
+        drop(store);
+        let mut reopened = Store::open(&temp.0).unwrap();
+        assert_eq!(reopened.status(), Status::ReadyToPublish);
+        assert!(!reopened.is_unknown_length());
+        assert_eq!(fs::read(reopened.finalize().unwrap()).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn unknown_interruption_preserves_checkpoint_but_cannot_append_or_publish() {
+        let temp = TestDir::new();
+        let mut store = Store::create_unknown(&temp.0, identity(5), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        assert!(matches!(
+            store.append(b"def"),
+            Err(StoreError::InvalidInput)
+        ));
+        drop(store);
+        let mut reopened = Store::open(&temp.0).unwrap();
+        assert!(reopened.is_unknown_length());
+        assert_eq!(reopened.committed_len(), 3);
+        assert_failed_handle_is_closed(&mut reopened);
+        assert!(reopened.mark_unknown_transfer_complete().is_err());
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abc");
+        assert!(!temp.0.join("x.bin").exists());
+    }
+
+    #[test]
+    fn empty_unknown_stream_can_complete_and_unknown_completion_sync_failure_cannot_publish() {
+        let empty = TestDir::new();
+        let mut store = Store::create_unknown(&empty.0, identity(5), "x.bin").unwrap();
+        store.mark_unknown_transfer_complete().unwrap();
+        assert_eq!(fs::read(store.finalize().unwrap()).unwrap(), b"");
+        let failed = TestDir::new();
+        let mut store = Store::create_unknown(&failed.0, identity(5), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.fault = Some(Fault::CheckpointSync);
+        assert!(store.mark_unknown_transfer_complete().is_err());
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let reopened = Store::open(&failed.0).unwrap();
+        assert!(reopened.is_unknown_length());
+        assert_eq!(reopened.status(), Status::Downloading);
+        assert!(!failed.0.join("x.bin").exists());
+    }
+
+    #[test]
+    fn unknown_completion_receipt_failure_reopens_atomic_actual_size_and_clean_end() {
+        let temp = TestDir::new();
+        let mut store = Store::create_unknown(&temp.0, identity(100), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.fault = Some(Fault::UnknownCompletionReceiptAcknowledgement);
+        assert!(store.mark_unknown_transfer_complete().is_err());
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let mut reopened = Store::open(&temp.0).unwrap();
+        assert!(!reopened.is_unknown_length());
+        assert_eq!(reopened.identity().total, 3);
+        assert_eq!(reopened.status(), Status::ReadyToPublish);
+        assert_eq!(fs::read(reopened.finalize().unwrap()).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn rebind_persists_identity_and_rejects_unknown_or_completed_store() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        store.rebind_urls([1; 32], [2; 32]).unwrap();
+        drop(store);
+        let mut reopened = Store::open(&temp.0).unwrap();
+        assert_eq!(reopened.identity().original_url_fingerprint, [1; 32]);
+        assert_eq!(reopened.identity().final_url_fingerprint, [2; 32]);
+        assert_eq!(reopened.committed_len(), 3);
+        reopened.mark_transfer_complete().unwrap();
+        assert!(matches!(
+            reopened.rebind_urls([3; 32], [4; 32]),
+            Err(StoreError::NotWritable)
+        ));
+        let unknown = TestDir::new();
+        let mut store = Store::create_unknown(&unknown.0, identity(5), "x.bin").unwrap();
+        assert!(matches!(
+            store.rebind_urls([3; 32], [4; 32]),
+            Err(StoreError::NotWritable)
+        ));
     }
 
     #[test]

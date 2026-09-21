@@ -1,4 +1,4 @@
-//! Single-owner, single-connection transfer. No browser/IPC-facing API yet.
+//! Single-owner bounded HTTP transfers. No browser transport or public IPC yet.
 #![forbid(unsafe_code)]
 
 use download_core::state::{Command, Download, DownloadId, Event};
@@ -11,11 +11,16 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use transfer_store::{url_fingerprint, Identity, Status, Store, StoreError};
 
+pub mod files;
+pub mod intake;
 pub mod manager;
 mod parallel;
 mod queue_store;
 mod rate;
+mod request_policy;
+mod unknown;
 pub use rate::{Bandwidth, TrafficControl};
+pub use request_policy::RequestPolicy;
 
 #[derive(Clone)]
 pub struct Options {
@@ -32,6 +37,9 @@ pub struct Options {
     pub bytes_per_second: Option<u64>,
     /// Bounded range workers per file, 1..=8.
     pub parallel_connections: u8,
+    pub request_policy: RequestPolicy,
+    /// Only a trusted local refresh command may supply the previous URL identity.
+    pub refresh_from: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +70,7 @@ pub enum Error {
     InvalidTransition,
     BodyLength,
     SizeLimit,
+    InsufficientSpace,
 }
 
 impl std::fmt::Display for Error {
@@ -208,12 +217,15 @@ async fn request(
     mut url: Url,
     range: Option<(u64, u64, &str)>,
     allow_http: bool,
+    policy: &RequestPolicy,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Response, Error> {
+    let initial = url.clone();
     for redirects in 0..=5 {
         let mut builder = client
             .get(url.clone())
             .header(header::ACCEPT_ENCODING, "identity");
+        builder = policy.apply(builder, &url, &initial)?;
         if let Some((start, total, etag)) = range {
             builder = builder
                 .header(header::RANGE, format!("bytes={start}-{}", total - 1))
@@ -238,10 +250,7 @@ async fn request(
             let location = std::str::from_utf8(location).map_err(|_| Error::InvalidHeaders)?;
             let next = url.join(location).map_err(|_| Error::InvalidUrl)?;
             let next = parse_url(next.as_str(), allow_http)?;
-            // A conservative first transport: explicit cross-origin redirect consent is not implemented.
-            if next.origin() != url.origin() {
-                return Err(Error::RedirectOriginChange);
-            }
+            policy.authorize_redirect(&url, &next)?;
             url = next;
         } else {
             return Ok(response);
@@ -281,6 +290,10 @@ pub async fn download_controlled(
     {
         return Err(Error::InvalidOptions);
     }
+    options.request_policy.validate()?;
+    if options.refresh_from.is_some() && options.expected_sha256.is_none() {
+        return Err(Error::InvalidOptions);
+    }
     let original = parse_url(&options.url, options.allow_http)?;
     if is_cancelled(&cancel) {
         return Err(Error::Cancelled);
@@ -311,7 +324,8 @@ pub async fn download_controlled(
         return Err(Error::Cancelled);
     }
     if let Some(store) = &existing {
-        if store.identity().original_url_fingerprint != url_fingerprint(original.as_str())
+        if (store.identity().original_url_fingerprint != url_fingerprint(original.as_str())
+            && options.refresh_from != Some(store.identity().original_url_fingerprint))
             || store.identity().expected_sha256 != options.expected_sha256
             || store.output_name() != options.output_name
         {
@@ -322,6 +336,15 @@ pub async fn download_controlled(
         }
     }
     let start = existing.as_ref().map_or(0, Store::committed_len);
+    if let Some(store) = &existing {
+        if store.status() == Status::Downloading && !store.is_unknown_length() {
+            files::before_transfer(
+                std::path::absolute(&options.job_dir).map_err(|e| Error::StorageIo(e.kind()))?,
+                store.identity().total.saturating_sub(start),
+            )
+            .await?;
+        }
+    }
     if start > 0 {
         on_checkpoint(start);
     }
@@ -340,6 +363,9 @@ pub async fn download_controlled(
             resumed_from: start,
             path,
         });
+    }
+    if existing.as_ref().is_some_and(Store::is_unknown_length) {
+        return Err(Error::ResumeUnsupported);
     }
     // A full prefix without the clean framing marker must not be promoted to success.
     if existing
@@ -368,6 +394,7 @@ pub async fn download_controlled(
         original.clone(),
         range,
         options.allow_http,
+        &options.request_policy,
         &mut cancel,
     )
     .await?;
@@ -385,7 +412,8 @@ pub async fn download_controlled(
     let total;
     if let Some(store) = &existing {
         let identity = store.identity();
-        if final_url_fingerprint != identity.final_url_fingerprint {
+        if final_url_fingerprint != identity.final_url_fingerprint && options.refresh_from.is_none()
+        {
             return Err(Error::RepresentationChanged);
         }
         total = identity.total;
@@ -436,10 +464,20 @@ pub async fn download_controlled(
         if response.headers().contains_key(header::CONTENT_RANGE) {
             return Err(Error::InvalidHeaders);
         }
+        if !response.headers().contains_key(header::CONTENT_LENGTH) {
+            return unknown::transfer(response, options, original, pacing, cancel, on_checkpoint)
+                .await;
+        }
         total = length(response.headers())?;
         if total > options.max_download_bytes {
             return Err(Error::SizeLimit);
         }
+        let parent = options.job_dir.parent().ok_or(Error::InvalidOptions)?;
+        files::before_transfer(
+            std::path::absolute(parent).map_err(|e| Error::StorageIo(e.kind()))?,
+            total,
+        )
+        .await?;
         let strong_etag = match field(response.headers(), header::ETAG) {
             Field::Missing => None,
             Field::Repeated => return Err(Error::InvalidHeaders),
@@ -471,6 +509,14 @@ pub async fn download_controlled(
     }
     event(&mut job, Event::ProbeSucceeded)?;
     let mut store = existing.take().ok_or(Error::Storage)?;
+    if options.refresh_from.is_some() {
+        let original_fingerprint = url_fingerprint(original.as_str());
+        store = disk(move || {
+            store.rebind_urls(original_fingerprint, final_url_fingerprint)?;
+            Ok(store)
+        })
+        .await?;
+    }
     let mut received = start;
     let use_parallel = options.parallel_connections > 1
         && total - start > parallel::RANGE_BYTES
@@ -485,6 +531,7 @@ pub async fn download_controlled(
                 connections: options.parallel_connections,
                 checkpoint_bytes: options.checkpoint_bytes,
                 pacing: pacing.clone(),
+                request_policy: options.request_policy.clone(),
             },
             store,
             &mut response,
@@ -585,7 +632,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn recovery_checks_owner_and_identity_before_publication() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-engine-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -619,6 +666,8 @@ mod tests {
             max_download_bytes: 1024,
             bytes_per_second: None,
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         };
         let (sender, cancel) = watch::channel(false);
         for opts in [

@@ -168,13 +168,15 @@ impl Config {
 
 type Reply<T> = oneshot::Sender<Result<T, ManagerError>>;
 enum Command {
-    Enqueue(Options, Priority, Reply<JobId>),
+    Enqueue(Box<Options>, Priority, Reply<JobId>),
     SetPriority(JobId, Priority, Reply<()>),
     Pause(JobId, Reply<()>),
     Resume(JobId, Reply<()>),
     GlobalRate(Option<u64>, Reply<()>),
     JobRate(JobId, Option<u64>, Reply<()>),
     ResumeAll(Reply<()>),
+    Refresh(JobId, String, Reply<()>),
+    Forget(JobId, Reply<()>),
 }
 
 /// One owner; command methods may be used concurrently through shared references.
@@ -226,6 +228,7 @@ impl Manager {
                         config,
                         jobs: vec![],
                         queue: vec![],
+                        last_id: 0,
                     };
                     store.save(&saved)?;
                     saved
@@ -280,7 +283,7 @@ impl Manager {
                 .position(|queued| queued == id)
                 .unwrap_or(usize::MAX)
         });
-        Self::launch_with_global(runtime, config, jobs, Some(store), global)
+        Self::launch_with_global(runtime, config, jobs, Some(store), global, saved.last_id)
     }
 
     fn launch(
@@ -291,7 +294,7 @@ impl Manager {
     ) -> Result<Self, ManagerError> {
         let global = Bandwidth::new(config.global_bytes_per_second)
             .map_err(|_| ManagerError::InvalidLimits)?;
-        Self::launch_with_global(runtime, config, jobs, store, global)
+        Self::launch_with_global(runtime, config, jobs, store, global, 0)
     }
 
     fn launch_with_global(
@@ -300,11 +303,12 @@ impl Manager {
         jobs: Vec<(JobId, Job)>,
         store: Option<QueueStore>,
         global: Bandwidth,
+        last_id: u64,
     ) -> Result<Self, ManagerError> {
         let (commands, receiver) = mpsc::channel(64);
         let (updates, snapshots) = watch::channel(Vec::new());
         publish(&jobs, &updates);
-        let actor = runtime.spawn(run(receiver, updates, config, jobs, store, global));
+        let actor = runtime.spawn(run(receiver, updates, config, jobs, store, global, last_id));
         Ok(Self {
             commands: Some(commands),
             snapshots,
@@ -370,7 +374,7 @@ impl Manager {
         self.commands
             .as_ref()
             .ok_or(ManagerError::Closed)?
-            .send(Command::Enqueue(options, priority, reply))
+            .send(Command::Enqueue(Box::new(options), priority, reply))
             .await
             .map_err(|_| ManagerError::Closed)?;
         result.await.map_err(|_| ManagerError::Closed)?
@@ -413,6 +417,31 @@ impl Manager {
         result.await.map_err(|_| ManagerError::Closed)?
     }
 
+    /// Updates only the query of a paused/failed resource; resumption remains explicit.
+    pub async fn refresh_url(&self, id: JobId, url: String) -> Result<(), ManagerError> {
+        crate::parse_url(&url, true).map_err(|_| ManagerError::InvalidOptions)?;
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::Refresh(id, url, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
+    /// Removes inactive queue metadata only. User files and partial data are retained.
+    pub async fn forget(&self, id: JobId) -> Result<(), ManagerError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::Forget(id, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
     /// Stops admission, cancels active jobs, and awaits every worker without aborting.
     /// Success means workers drained, not that every job paused successfully; retain
     /// a snapshot subscription to inspect failures after shutdown.
@@ -440,6 +469,11 @@ struct Job {
 }
 
 fn validate_options(options: &Options) -> Result<(), ManagerError> {
+    options
+        .request_policy
+        .validate()
+        .map_err(|_| ManagerError::InvalidOptions)?;
+    crate::files::validate_name(&options.output_name).map_err(|_| ManagerError::InvalidOptions)?;
     if options.url.len() > 16_384
         || options.output_name.is_empty()
         || options.output_name.len() > 255
@@ -609,12 +643,14 @@ async fn save_state(
     jobs: &[(JobId, Job)],
     queue: &VecDeque<JobId>,
     config: &Config,
+    last_id: u64,
 ) -> Result<(), ManagerError> {
     let Some(mut owned) = store.take() else {
         return Ok(());
     };
     let snapshot = Snapshot {
         config: config.clone(),
+        last_id,
         jobs: jobs
             .iter()
             .map(|(id, job)| SavedJob {
@@ -662,6 +698,7 @@ async fn run(
     mut jobs: Vec<(JobId, Job)>,
     mut store: Option<QueueStore>,
     global: Bandwidth,
+    mut last_id: u64,
 ) -> Result<(), ManagerError> {
     let mut queue: VecDeque<_> = jobs.iter().map(|(id, _)| *id).collect();
     let mut workers: JoinSet<Result<Outcome, Error>> = JoinSet::new();
@@ -694,7 +731,7 @@ async fn run(
             }
         }
         if dirty && failure.is_none() {
-            if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
                 failure = Some(error);
                 closing = true;
                 commands.close();
@@ -726,7 +763,7 @@ async fn run(
             }
             job.state = State::Running;
             job.attempts = job.attempts.saturating_add(1);
-            if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
                 failure = Some(error);
                 closing = true;
                 commands.close();
@@ -765,7 +802,7 @@ async fn run(
         publish(&jobs, &updates);
         if closing && workers.is_empty() {
             if dirty && failure.is_none() {
-                if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+                if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
                     failure = Some(error);
                 }
             }
@@ -796,8 +833,44 @@ async fn run(
             }
             command = commands.recv(), if !closing => {
                 match command {
+                    Some(Command::Refresh(id,url,reply)) => {
+                        let Some((_,job))=jobs.iter_mut().find(|(key,_)|*key==id) else {let _=reply.send(Err(ManagerError::UnknownJob));continue;};
+                        if !matches!(job.state,State::Paused|State::Failed(_)){let _=reply.send(Err(ManagerError::InvalidTransition));continue;}
+                        if job.options.expected_sha256.is_none(){let _=reply.send(Err(ManagerError::InvalidOptions));continue;}
+                        let old=crate::parse_url(&job.options.url,job.options.allow_http);
+                        let new=crate::parse_url(&url,job.options.allow_http);
+                        let (Ok(old),Ok(new))=(old,new) else {let _=reply.send(Err(ManagerError::InvalidOptions));continue;};
+                        if old.origin()!=new.origin() || old.path()!=new.path(){let _=reply.send(Err(ManagerError::InvalidOptions));continue;}
+                                                let directory=job.options.job_dir.clone();
+                        let expected=job.options.expected_sha256;
+                        let current=transfer_store::url_fingerprint(old.as_str());
+                        let previous=job.options.refresh_from;
+                        let binding=tokio::task::spawn_blocking(move || {
+                            match std::fs::symlink_metadata(&directory) {
+                                Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
+                                Err(_) => Err(ManagerError::InvalidPath),
+                                Ok(_) => {
+                                    let store=transfer_store::Store::open(&directory).map_err(|_|ManagerError::WorkerFailed)?;
+                                    let identity=store.identity();
+                                    if store.status()!=transfer_store::Status::Downloading || store.is_unknown_length() || identity.strong_etag.is_none() || identity.expected_sha256!=expected || (identity.original_url_fingerprint!=current && Some(identity.original_url_fingerprint)!=previous) {return Err(ManagerError::InvalidOptions);}
+                                    Ok(Some(identity.original_url_fingerprint))
+                                }
+                            }
+                        }).await;
+                        job.options.refresh_from=match binding{Ok(Ok(value))=>value,Ok(Err(error))=>{let _=reply.send(Err(error));continue;},Err(_)=>{let _=reply.send(Err(ManagerError::WorkerFailed));continue;}};
+                        job.options.url=new.to_string();
+                        job.state=State::Paused;
+                        dirty=true;acknowledgements.push(Acknowledge::Unit(reply));
+                    }
+                    Some(Command::Forget(id,reply)) => {
+                        let Some(index)=jobs.iter().position(|(key,_)|*key==id)else{let _=reply.send(Err(ManagerError::UnknownJob));continue;};
+                        if matches!(jobs[index].1.state,State::Running|State::Pausing){let _=reply.send(Err(ManagerError::InvalidTransition));continue;}
+                        jobs.remove(index);queue.retain(|key|*key!=id);
+                        dirty=true;acknowledgements.push(Acknowledge::Unit(reply));
+                    }
                     None => { closing = true; stop(&mut jobs, &mut queue); dirty = true; }
                     Some(Command::Enqueue(options, priority, reply)) => {
+                        let options = *options;
                         if jobs.len() >= config.max_jobs { let _ = reply.send(Err(ManagerError::Capacity)); continue; }
                         let origin = match origin(&options) { Ok(origin) => origin, Err(error) => { let _ = reply.send(Err(error)); continue; } };
                         let path = options.job_dir.clone();
@@ -807,7 +880,8 @@ async fn run(
                             Err(_) => { let _ = reply.send(Err(ManagerError::WorkerFailed)); continue; }
                         };
                         if jobs.iter().any(|(_, job)| job.key == key) { let _ = reply.send(Err(ManagerError::DuplicateJob)); continue; }
-                        let Some(next) = jobs.iter().map(|(id, _)| id.0).max().unwrap_or(0).checked_add(1) else { let _ = reply.send(Err(ManagerError::Capacity)); continue; };
+                        let Some(next) = last_id.checked_add(1) else { let _ = reply.send(Err(ManagerError::Capacity)); continue; };
+                        last_id = next;
                         let id = JobId(next);
                         let control = match TrafficControl::with_global(global.clone(), options.bytes_per_second) { Ok(control) => control, Err(_) => { let _ = reply.send(Err(ManagerError::InvalidOptions)); continue; } };
                         jobs.push((id, Job { options, origin, priority, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None, attempts: 0, retry_at: None, control }));
@@ -887,7 +961,10 @@ mod tests {
     fn options() -> Options {
         Options {
             url: "https://example.com/private?secret=DO_NOT_DISCLOSE".into(),
-            job_dir: std::env::temp_dir().join("private-job"),
+            job_dir: std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join("private-job"),
             output_name: "private-filename.bin".into(),
             expected_sha256: None,
             allow_http: false,
@@ -895,6 +972,8 @@ mod tests {
             max_download_bytes: 1024,
             bytes_per_second: None,
             parallel_connections: 1,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
 
@@ -1083,7 +1162,7 @@ mod tests {
             "COM¹",
         ] {
             assert_eq!(
-                path_key(std::env::temp_dir().join(leaf)),
+                path_key(std::env::temp_dir().canonicalize().unwrap().join(leaf)),
                 Err(ManagerError::InvalidPath)
             );
         }

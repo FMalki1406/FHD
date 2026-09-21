@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ const expected = makeFixture();
 const digest = createHash('sha256').update(expected).digest('hex');
 
 async function setup(t) {
-  const parent = await mkdtemp(path.join(tmpdir(), 'fhd-integration-'));
+  const parent = await realpath(await mkdtemp(path.join(tmpdir(), 'fhd-integration-')));
   const directory = path.join(parent, 'job');
   t.after(() => rm(parent, { recursive: true, force: true }));
   const lab = await startLab();
@@ -228,4 +228,16 @@ test('engine validates connection bounds and accepts parallel fallback for small
   }
   assertComplete(await transfer(directory, `${lab.url}/file`, { extraArgs: ['--connections', '4'] }), false);
   assert.deepEqual(await readFile(output), expected);
+});
+
+test('CLI resumes a relative job directory after checking remaining disk space', async t => {
+  const { lab } = await setup(t);
+  const parent = await realpath(await mkdtemp(path.join(projectRoot, 'target', 'fhd-relative-')));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const directory = path.join(parent, 'job');
+  const relative = path.relative(process.cwd(), directory);
+  assert.equal(path.isAbsolute(relative), false);
+  assert.equal((await transfer(relative, `${lab.url}/drop-once`)).code, 2);
+  assertComplete(await transfer(relative, `${lab.url}/drop-once`), true);
+  assert.deepEqual(await readFile(path.join(directory, 'fixture.bin')), expected);
 });

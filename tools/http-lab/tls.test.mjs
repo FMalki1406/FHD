@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer, get } from 'node:https';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -89,7 +89,7 @@ test('engine rejects an untrusted TLS certificate before sending HTTP or creatin
   let credentials;
   try { credentials = JSON.parse(generated.stdout); }
   catch { throw new Error('Certificate generator returned invalid data'); }
-  const parent = await mkdtemp(path.join(tmpdir(), 'fhd-tls-'));
+  const parent = await realpath(await mkdtemp(path.join(tmpdir(), 'fhd-tls-')));
   const directory = path.join(parent, 'job');
   t.after(() => rm(parent, { recursive: true, force: true }));
 

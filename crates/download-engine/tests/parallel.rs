@@ -27,7 +27,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(mode: usize) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fhd-parallel-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -128,6 +128,8 @@ impl Fixture {
             max_download_bytes: 2 * 1024 * 1024,
             bytes_per_second: None,
             parallel_connections: 3,
+            request_policy: Default::default(),
+            refresh_from: None,
         }
     }
 }

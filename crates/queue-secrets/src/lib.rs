@@ -120,3 +120,20 @@ mod tests {
         assert_eq!(protect(&[]), Err(Error::InvalidSize));
     }
 }
+
+#[cfg(all(test, not(windows)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_platform_never_returns_plaintext_or_fake_ciphertext() {
+        assert_eq!(
+            protect(b"private credential"),
+            Err(Error::UnsupportedPlatform)
+        );
+        assert_eq!(
+            unprotect(b"pretend ciphertext"),
+            Err(Error::UnsupportedPlatform)
+        );
+    }
+}
