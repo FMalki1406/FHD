@@ -72,6 +72,19 @@ type SavedRow = (
     i64,
 );
 
+// Instance-local failure points exist only in unit-test builds. They never read
+// environment variables or affect the public storage API.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    PartialWrite(usize),
+    CheckpointSync,
+    CheckpointReceiptAcknowledgement,
+    PublishLink,
+    PublishSync,
+    PublishReceiptAcknowledgement,
+}
+
 pub struct Store {
     db: Connection,
     part: File,
@@ -83,6 +96,8 @@ pub struct Store {
     phase: i64,
     hasher: Sha256,
     poisoned: bool,
+    #[cfg(test)]
+    fault: Option<Fault>,
     // Fields drop in declaration order: release ownership after DB and part close.
     _lock: File,
 }
@@ -134,6 +149,8 @@ impl Store {
             phase: 0,
             hasher: Sha256::new(),
             poisoned: false,
+            #[cfg(test)]
+            fault: None,
         })
     }
     pub fn open(dir: &Path) -> Result<Self> {
@@ -221,6 +238,8 @@ impl Store {
             phase,
             hasher,
             poisoned: false,
+            #[cfg(test)]
+            fault: None,
         };
         if phase == 3 {
             store.verify_destination()?;
@@ -262,6 +281,12 @@ impl Store {
         }
         // A short write followed by failure requires reopen/reconciliation.
         self.poisoned = true;
+        #[cfg(test)]
+        if let Some(Fault::PartialWrite(count)) = self.fault {
+            self.fault = None;
+            self.part.write_all(&bytes[..count.min(bytes.len())])?;
+            return Err(StoreError::Io(std::io::ErrorKind::StorageFull));
+        }
         self.part.write_all(bytes)?;
         self.hasher.update(bytes);
         self.len = new_len;
@@ -272,13 +297,21 @@ impl Store {
         if self.poisoned || self.phase != 0 {
             return Err(StoreError::NotWritable);
         }
+        // A failed durability operation may have an ambiguous on-disk outcome.
+        // Reopen and reconcile the receipt before allowing more mutations.
+        self.poisoned = true;
+        #[cfg(test)]
+        self.fail_at(Fault::CheckpointSync)?;
         self.part.sync_all()?;
         let digest: [u8; 32] = self.hasher.clone().finalize().into();
         self.db.execute(
             "UPDATE job SET committed=?1,digest=?2 WHERE id=1",
             params![self.len as i64, digest.as_slice()],
         )?;
+        #[cfg(test)]
+        self.fail_at(Fault::CheckpointReceiptAcknowledgement)?;
         self.committed = self.len;
+        self.poisoned = false;
         Ok(())
     }
     /// Call only after the transport has validated clean body termination.
@@ -287,14 +320,24 @@ impl Store {
             return Err(StoreError::Incomplete);
         }
         self.checkpoint()?;
+        self.poisoned = true;
         self.db.execute("UPDATE job SET phase=1 WHERE id=1", [])?;
         self.phase = 1;
+        self.poisoned = false;
         Ok(())
     }
     pub fn finalize(&mut self) -> Result<PathBuf> {
         if self.poisoned || self.phase == 0 {
             return Err(StoreError::Incomplete);
         }
+        self.poisoned = true;
+        let result = self.finalize_inner();
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+    fn finalize_inner(&mut self) -> Result<PathBuf> {
         if self.phase == 1 {
             match fs::symlink_metadata(self.dir.join(&self.output)) {
                 Ok(_) => return Err(StoreError::Collision),
@@ -339,14 +382,28 @@ impl Store {
                 self.verify_destination()?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.phase == 2 => {
+                #[cfg(test)]
+                self.fail_at(Fault::PublishLink)?;
                 fs::hard_link(self.dir.join("payload.part"), &dest)?;
             }
             Err(e) => return Err(e.into()),
         }
+        #[cfg(test)]
+        self.fail_at(Fault::PublishSync)?;
         self.part.sync_all()?;
         sync_directory(&self.dir)?;
         self.db.execute("UPDATE job SET phase=3 WHERE id=1", [])?;
+        #[cfg(test)]
+        self.fail_at(Fault::PublishReceiptAcknowledgement)?;
         self.phase = 3;
+        Ok(())
+    }
+    #[cfg(test)]
+    fn fail_at(&mut self, point: Fault) -> Result<()> {
+        if self.fault == Some(point) {
+            self.fault = None;
+            return Err(StoreError::Io(std::io::ErrorKind::Other));
+        }
         Ok(())
     }
     fn verify_destination(&self) -> Result<()> {
@@ -501,6 +558,196 @@ mod tests {
             expected_sha256: None,
         }
     }
+    fn assert_failed_handle_is_closed(store: &mut Store) {
+        assert!(matches!(store.append(b""), Err(StoreError::NotWritable)));
+        assert!(matches!(store.checkpoint(), Err(StoreError::NotWritable)));
+        assert!(store.mark_transfer_complete().is_err());
+        assert!(store.finalize().is_err());
+    }
+
+    #[test]
+    fn partial_disk_full_write_recovers_only_acknowledged_prefix() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(6), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        store.fault = Some(Fault::PartialWrite(2));
+        assert!(matches!(
+            store.append(b"def"),
+            Err(StoreError::Io(std::io::ErrorKind::StorageFull))
+        ));
+        assert_eq!(store.committed_len(), 3);
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abcde");
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let mut recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abc");
+        recovered.append(b"def").unwrap();
+        recovered.mark_transfer_complete().unwrap();
+        assert_eq!(fs::read(recovered.finalize().unwrap()).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn failed_checkpoint_sync_never_advances_receipt() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(6), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        store.append(b"def").unwrap();
+        store.fault = Some(Fault::CheckpointSync);
+        assert!(matches!(store.checkpoint(), Err(StoreError::Io(_))));
+        assert_eq!(store.committed_len(), 3);
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.committed_len(), 3);
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abc");
+        assert!(!temp.0.join("x.bin").exists());
+    }
+
+    #[test]
+    fn sqlite_checkpoint_abort_preserves_previous_receipt() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(6), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        store.append(b"def").unwrap();
+        store.db.execute_batch("CREATE TRIGGER fail_receipt BEFORE UPDATE OF committed ON job BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
+        assert!(matches!(store.checkpoint(), Err(StoreError::Database)));
+        assert_eq!(store.committed_len(), 3);
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let mut recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.committed_len(), 3);
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abc");
+        recovered
+            .db
+            .execute_batch("DROP TRIGGER fail_receipt")
+            .unwrap();
+        recovered.append(b"def").unwrap();
+        recovered.mark_transfer_complete().unwrap();
+        assert_eq!(fs::read(recovered.finalize().unwrap()).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn ambiguous_checkpoint_result_reopens_actual_committed_receipt() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(6), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.checkpoint().unwrap();
+        store.append(b"def").unwrap();
+        store.fault = Some(Fault::CheckpointReceiptAcknowledgement);
+        assert!(store.checkpoint().is_err());
+        assert_eq!(store.committed_len(), 3);
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let mut recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.committed_len(), 6);
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abcdef");
+        assert_eq!(recovered.status(), Status::Downloading);
+        assert!(recovered.finalize().is_err());
+    }
+
+    #[test]
+    fn ambiguous_publication_result_reopens_verified_published_file() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.mark_transfer_complete().unwrap();
+        store.fault = Some(Fault::PublishReceiptAcknowledgement);
+        assert!(store.finalize().is_err());
+        assert_eq!(store.status(), Status::ReadyToPublish);
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.status(), Status::Published);
+        assert_eq!(fs::read(temp.0.join("x.bin")).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn sqlite_completion_abort_cannot_invent_clean_eof_after_reopen() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.db.execute_batch("CREATE TRIGGER fail_complete BEFORE UPDATE OF phase ON job WHEN NEW.phase=1 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;").unwrap();
+        assert!(matches!(
+            store.mark_transfer_complete(),
+            Err(StoreError::Database)
+        ));
+        assert_failed_handle_is_closed(&mut store);
+        drop(store);
+        let mut recovered = Store::open(&temp.0).unwrap();
+        assert_eq!(recovered.committed_len(), 3);
+        assert_eq!(recovered.status(), Status::Downloading);
+        assert!(matches!(recovered.finalize(), Err(StoreError::Incomplete)));
+        assert!(!temp.0.join("x.bin").exists());
+    }
+
+    #[test]
+    fn publication_io_failures_reconcile_without_false_success() {
+        for fault in [Fault::PublishLink, Fault::PublishSync] {
+            let temp = TestDir::new();
+            let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+            store.append(b"abc").unwrap();
+            store.mark_transfer_complete().unwrap();
+            store.fault = Some(fault);
+            assert!(matches!(store.finalize(), Err(StoreError::Io(_))));
+            assert_eq!(store.status(), Status::ReadyToPublish);
+            assert_eq!(temp.0.join("x.bin").exists(), fault == Fault::PublishSync);
+            assert_failed_handle_is_closed(&mut store);
+            drop(store);
+            let mut recovered = Store::open(&temp.0).unwrap();
+            assert_eq!(recovered.status(), Status::ReadyToPublish);
+            assert_eq!(fs::read(recovered.finalize().unwrap()).unwrap(), b"abc");
+            assert_eq!(recovered.status(), Status::Published);
+        }
+    }
+
+    #[test]
+    fn sqlite_publication_aborts_recover_intent_and_existing_link() {
+        for rejected_phase in [2, 3] {
+            let temp = TestDir::new();
+            let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+            store.append(b"abc").unwrap();
+            store.mark_transfer_complete().unwrap();
+            store.db.execute_batch(&format!("CREATE TRIGGER fail_publish BEFORE UPDATE OF phase ON job WHEN NEW.phase={rejected_phase} BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;")).unwrap();
+            assert!(matches!(store.finalize(), Err(StoreError::Database)));
+            assert_eq!(store.status(), Status::ReadyToPublish);
+            assert_eq!(temp.0.join("x.bin").exists(), rejected_phase == 3);
+            assert_failed_handle_is_closed(&mut store);
+            drop(store);
+            let mut recovered = Store::open(&temp.0).unwrap();
+            assert_eq!(recovered.status(), Status::ReadyToPublish);
+            recovered
+                .db
+                .execute_batch("DROP TRIGGER fail_publish")
+                .unwrap();
+            assert_eq!(fs::read(recovered.finalize().unwrap()).unwrap(), b"abc");
+            drop(recovered);
+            assert_eq!(Store::open(&temp.0).unwrap().status(), Status::Published);
+        }
+    }
+
+    #[test]
+    fn collision_after_failed_publication_preserves_both_files() {
+        let temp = TestDir::new();
+        let mut store = Store::create(&temp.0, identity(3), "x.bin").unwrap();
+        store.append(b"abc").unwrap();
+        store.mark_transfer_complete().unwrap();
+        store.fault = Some(Fault::PublishLink);
+        assert!(store.finalize().is_err());
+        drop(store);
+        fs::write(temp.0.join("x.bin"), b"unrelated user file").unwrap();
+        let mut recovered = Store::open(&temp.0).unwrap();
+        assert!(matches!(recovered.finalize(), Err(StoreError::Collision)));
+        assert_eq!(
+            fs::read(temp.0.join("x.bin")).unwrap(),
+            b"unrelated user file"
+        );
+        assert_eq!(fs::read(temp.0.join("payload.part")).unwrap(), b"abc");
+    }
+
     #[test]
     fn url_fields_persist_only_fingerprints() {
         let temp = TestDir::new();

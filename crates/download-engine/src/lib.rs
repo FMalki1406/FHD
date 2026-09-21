@@ -37,6 +37,11 @@ pub enum Error {
     ResumeRejected,
     LocalStateMismatch,
     Storage,
+    StorageIo(std::io::ErrorKind),
+    StorageLocked,
+    DestinationConflict,
+    StoredDataCorrupt,
+    ChecksumMismatch,
     UnsupportedStorageVersion,
     WorkerFailed,
     Cancelled,
@@ -163,10 +168,19 @@ async fn disk<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|_| Error::WorkerFailed)?
-        .map_err(|error| match error {
-            StoreError::UnsupportedVersion => Error::UnsupportedStorageVersion,
-            _ => Error::Storage,
-        })
+        .map_err(storage_error)
+}
+
+fn storage_error(error: StoreError) -> Error {
+    match error {
+        StoreError::UnsupportedVersion => Error::UnsupportedStorageVersion,
+        StoreError::Io(kind) => Error::StorageIo(kind),
+        StoreError::Locked => Error::StorageLocked,
+        StoreError::Collision => Error::DestinationConflict,
+        StoreError::Corrupt => Error::StoredDataCorrupt,
+        StoreError::HashMismatch => Error::ChecksumMismatch,
+        _ => Error::Storage,
+    }
 }
 
 fn event(job: &mut Download, event: Event) -> Result<(), Error> {
@@ -257,7 +271,10 @@ pub async fn download(
         .map_err(|_| Error::Network)?;
 
     let directory = options.job_dir.clone();
-    let mut existing = if directory.try_exists().map_err(|_| Error::Storage)? {
+    let mut existing = if directory
+        .try_exists()
+        .map_err(|error| Error::StorageIo(error.kind()))?
+    {
         Some(disk(move || Store::open(&directory)).await?)
     } else {
         None

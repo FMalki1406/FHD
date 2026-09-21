@@ -137,8 +137,23 @@ test('engine refuses to overwrite an unrelated destination', async t => {
   assert.equal((await transfer(directory, `${lab.url}/drop-once`)).code, 2);
   const existing = Buffer.from('unrelated user content');
   await writeFile(output, existing);
-  assert.equal((await transfer(directory, `${lab.url}/drop-once`)).code, 2);
+  const result = await transfer(directory, `${lab.url}/drop-once`);
+  assert.equal(result.code, 2);
+  assert.equal(result.stderr.trim(), 'DestinationConflict');
   assert.deepEqual(await readFile(output), existing);
+});
+
+test('engine reports corrupted durable bytes without modifying them', async t => {
+  const { directory, lab, output } = await setup(t);
+  assert.equal((await transfer(directory, `${lab.url}/drop-once`)).code, 2);
+  const bytes = await partSnapshot(directory);
+  bytes[0] ^= 0xff;
+  await writeFile(path.join(directory, 'payload.part'), bytes);
+  const result = await transfer(directory, `${lab.url}/drop-once`);
+  assert.equal(result.code, 2);
+  assert.equal(result.stderr.trim(), 'StoredDataCorrupt');
+  assert.deepEqual(await partSnapshot(directory), bytes);
+  await assertNoOutput(output);
 });
 
 test('engine recovers after forced process termination at a durable checkpoint', async t => {
@@ -153,7 +168,9 @@ test('engine recovers after forced process termination at a durable checkpoint',
 
 test('engine does not publish bytes that fail the expected digest', async t => {
   const { directory, lab, output } = await setup(t);
-  assert.equal((await transfer(directory, `${lab.url}/file`, { sha256: '0'.repeat(64) })).code, 2);
+  const result = await transfer(directory, `${lab.url}/file`, { sha256: '0'.repeat(64) });
+  assert.equal(result.code, 2);
+  assert.equal(result.stderr.trim(), 'ChecksumMismatch');
   await assertNoOutput(output);
 });
 

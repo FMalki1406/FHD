@@ -79,3 +79,6 @@ npm run lab:serve
 - [ناقل الشبكة الداخلي](crates/download-engine/README.md).
 - [التخزين والاستعادة](crates/transfer-store/README.md).
 - [مراجعة الشبكة والتخزين الأمنية](docs/network-storage-security-review.md).
+
+- [رحلة التثبيت والتجربة وإدارة الأجهزة](docs/customer-installation-and-activation.md).
+- [مراجعة فشل التخزين](docs/disk-failure-review.md).
