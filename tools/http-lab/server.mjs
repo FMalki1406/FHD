@@ -28,9 +28,15 @@ export async function startLab({ port = 0 } = {}) {
   let revision = 1;
   let data = makeFixture(revision);
   let etag = `"${createHash('sha256').update(data).digest('hex')}"`;
+  // Stateful scenarios are isolated from /file and from each other.
+  const onceStates = new Map(['/drop-once', '/changed-once', '/wrong-range-once', '/no-range-once'].map(path => [path, {
+    dropped: false,
+    data: makeFixture(1),
+    etag: `"${createHash('sha256').update(makeFixture(1)).digest('hex')}"`,
+  }]));
   const timers = new Set();
   const sockets = new Set();
-  const routes = new Set(['/file', '/no-range', '/drop', '/short-body', '/wrong-range', '/slow']);
+  const routes = new Set(['/file', '/no-range', '/drop', '/short-body', '/wrong-range', '/slow', ...onceStates.keys()]);
 
   const server = http.createServer((req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -73,9 +79,10 @@ export async function startLab({ port = 0 } = {}) {
     }
 
     // Snapshot the revision so concurrent mutations never change an in-flight response.
-    const body = data;
-    const validator = etag;
-    const supportRange = url.pathname !== '/no-range';
+    const onceState = onceStates.get(url.pathname);
+    const body = onceState?.data ?? data;
+    const validator = onceState?.etag ?? etag;
+    const supportRange = !['/no-range', '/no-range-once'].includes(url.pathname);
     res.setHeader('ETag', validator);
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="fixture.bin"');
@@ -92,7 +99,7 @@ export async function startLab({ port = 0 } = {}) {
         return;
       }
       status = 206;
-      const reportedStart = selected.start + (url.pathname === '/wrong-range' ? 1 : 0);
+      const reportedStart = selected.start + (['/wrong-range', '/wrong-range-once'].includes(url.pathname) ? 1 : 0);
       res.setHeader('Content-Range', `bytes ${reportedStart}-${selected.end}/${body.length}`);
     }
     const payload = body.subarray(selected.start, selected.end + 1);
@@ -101,10 +108,18 @@ export async function startLab({ port = 0 } = {}) {
       res.end();
       return;
     }
-    if (url.pathname === '/drop' || url.pathname === '/short-body') {
+    const dropOnce = onceState && !onceState.dropped && !req.headers.range;
+    if (dropOnce) {
+      onceState.dropped = true;
+      if (url.pathname === '/changed-once') {
+        onceState.data = makeFixture(2);
+        onceState.etag = `"${createHash('sha256').update(onceState.data).digest('hex')}"`;
+      }
+    }
+    if (dropOnce || url.pathname === '/drop' || url.pathname === '/short-body') {
       res.flushHeaders();
       res.write(payload.subarray(0, Math.floor(payload.length / 2)), () => {
-        if (url.pathname === '/drop') res.destroy();
+        if (dropOnce || url.pathname === '/drop') res.destroy();
         else res.end();
       });
       return;

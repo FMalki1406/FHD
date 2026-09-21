@@ -1,0 +1,9 @@
+[package]
+name = "transfer-store"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+sha2 = "=0.11.0"

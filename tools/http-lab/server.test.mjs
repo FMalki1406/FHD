@@ -108,6 +108,72 @@ for (const path of ['/drop', '/short-body']) {
   });
 }
 
+test('drop-once preserves its validator and supports recovery after exactly one interrupted full GET', async t => {
+  const lab = await setup(t);
+  const full = await request(`${lab.url}/file`);
+  const head = await request(`${lab.url}/drop-once`, { method: 'HEAD' });
+  assert.equal(head.headers.etag, full.headers.etag);
+  const beforeDrop = await request(`${lab.url}/drop-once`, { headers: { Range: 'bytes=0-9' } });
+  assert.equal(beforeDrop.status, 206);
+  let partial = Buffer.alloc(0);
+  await assert.rejects(request(`${lab.url}/drop-once`, {
+    onResponse: res => res.on('data', chunk => { partial = Buffer.concat([partial, chunk]); }),
+  }), error => error.code === 'ECONNRESET');
+  assert.equal(partial.length, full.body.length / 2);
+  const resumed = await request(`${lab.url}/drop-once`, {
+    headers: { Range: `bytes=${partial.length}-`, 'If-Range': head.headers.etag },
+  });
+  assert.equal(resumed.status, 206);
+  assert.equal(resumed.headers.etag, head.headers.etag);
+  assert.deepEqual(Buffer.concat([partial, resumed.body]), full.body);
+  assert.deepEqual((await request(`${lab.url}/drop-once`)).body, full.body);
+});
+
+test('changed-once rejects stale If-Range after interruption without mutating other routes', async t => {
+  const lab = await setup(t);
+  const full = await request(`${lab.url}/file`);
+  const head = await request(`${lab.url}/changed-once`, { method: 'HEAD' });
+  await assert.rejects(request(`${lab.url}/changed-once`), error => error.code === 'ECONNRESET');
+  const resumed = await request(`${lab.url}/changed-once`, {
+    headers: { Range: 'bytes=32768-', 'If-Range': head.headers.etag },
+  });
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.body.length, full.body.length);
+  assert.notEqual(resumed.headers.etag, head.headers.etag);
+  assert.notDeepEqual(resumed.body, full.body);
+  assert.deepEqual((await request(`${lab.url}/file`)).body, full.body);
+  assert.equal((await request(`${lab.url}/drop-once`, { method: 'HEAD' })).headers.etag, full.headers.etag);
+  assert.deepEqual((await request(`${lab.url}/changed-once`)).body, resumed.body);
+});
+
+test('one-shot interruption state is reset for each lab instance', async t => {
+  for (let instance = 0; instance < 2; instance += 1) {
+    const lab = await setup(t);
+    for (const path of ['/drop-once', '/changed-once']) {
+      await assert.rejects(request(`${lab.url}${path}`), error => error.code === 'ECONNRESET');
+      assert.equal((await request(`${lab.url}${path}`)).status, 200);
+    }
+  }
+});
+
+test('wrong-range-once interrupts the first full request then misreports the recovery offset', async t => {
+  const lab = await setup(t);
+  await assert.rejects(request(`${lab.url}/wrong-range-once`), error => error.code === 'ECONNRESET');
+  const result = await request(`${lab.url}/wrong-range-once`, { headers: { Range: 'bytes=32768-' } });
+  assert.equal(result.status, 206);
+  assert.equal(result.headers['content-range'], 'bytes 32769-65535/65536');
+  assert.equal(result.body.length, 32768);
+});
+
+test('no-range-once interrupts the first request then ignores a recovery range', async t => {
+  const lab = await setup(t);
+  await assert.rejects(request(`${lab.url}/no-range-once`), error => error.code === 'ECONNRESET');
+  const result = await request(`${lab.url}/no-range-once`, { headers: { Range: 'bytes=32768-' } });
+  assert.equal(result.status, 200);
+  assert.equal(result.headers['content-range'], undefined);
+  assert.equal(result.body.length, 65536);
+});
+
 test('incorrect Content-Range fixture actually contradicts requested offset', async t => {
   const lab = await setup(t);
   const result = await request(`${lab.url}/wrong-range`, { headers: { Range: 'bytes=100-199' } });

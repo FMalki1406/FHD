@@ -31,4 +31,4 @@
 - `npm.cmd test` on PowerShell (or `npm test` where supported) runs the HTTP lab tests using Node's built-in test framework without a child test process.
 - `npm run lab:serve` starts a loopback-only synthetic fixture server. It is a development tool, not the product backend or download engine.
 - Rust pure domain crates exist under `crates/`: download-core and resume-policy. Follow `docs/development.md` for the pinned local toolchain and test/fmt/clippy commands.
-- The network transfer engine, durable storage, desktop app, browser extensions, and production licensing are not yet implemented; consult the current execution record rather than inferring their existence.
+- download-engine and transfer-store implement a developer-only single-connection CLI with durable checkpoints. Build fhd-transfer then run npm run test:engine for actual transfer/recovery tests. Desktop, browser integration and production licensing remain unimplemented; consult docs/execution-status.md.
