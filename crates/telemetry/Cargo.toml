@@ -1,0 +1,9 @@
+[package]
+name = "fhd-telemetry"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+zeroize = "=1.9.0"

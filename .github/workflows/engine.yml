@@ -48,6 +48,10 @@ jobs:
           node --version
       - name: Check formatting
         run: cargo +1.98.1 fmt --all -- --check
+      - name: Enforce architecture boundaries
+        run: |
+          node tools/check-architecture.test.mjs
+          node tools/check-architecture.mjs
       - name: Check Rust warnings
         run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
       - name: Test Rust workspace

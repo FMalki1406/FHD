@@ -241,6 +241,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fhd-app"
+version = "0.1.0"
+dependencies = [
+ "fhd-domain",
+]
+
+[[package]]
+name = "fhd-config"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
+name = "fhd-domain"
+version = "0.1.0"
+dependencies = [
+ "resume-policy",
+]
+
+[[package]]
+name = "fhd-telemetry"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "fhd-testkit"
+version = "0.1.0"
+dependencies = [
+ "fhd-app",
+ "fhd-domain",
+ "tokio",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"

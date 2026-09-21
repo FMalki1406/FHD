@@ -1,0 +1,12 @@
+[package]
+name = "fhd-testkit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fhd-app = { path = "../application" }
+fhd-domain = { path = "../domain" }
+
+[dev-dependencies]
+tokio = { version = "=1.51.4", features = ["macros", "rt", "sync"] }
