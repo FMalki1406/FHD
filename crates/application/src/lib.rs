@@ -1,5 +1,6 @@
 //! Application decisions over ports. No networking, filesystem or database dependency.
 #![forbid(unsafe_code)]
+pub mod storage;
 
 use fhd_domain::{Job, JobId, JobSpec};
 use std::{future::Future, pin::Pin};
