@@ -81,6 +81,7 @@ impl Lab {
             allow_http: true,
             checkpoint_bytes: PREFIX as u64,
             max_download_bytes: TOTAL as u64,
+            bytes_per_second: None,
         }
     }
 }

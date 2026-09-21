@@ -83,6 +83,20 @@ test('engine downloads and verifies the complete fixture', async t => {
   assert.deepEqual(await readFile(output), expected);
 });
 
+test('CLI applies byte rate and rejects invalid rates before creating state', async t => {
+  const { directory, lab, output } = await setup(t);
+  for (const rate of ['0', '1073741825', 'invalid']) {
+    const rejected = await transfer(directory, `${lab.url}/file`, { extraArgs: ['--bytes-per-second', rate] });
+    assert.equal(rejected.code, 2);
+    await assert.rejects(stat(directory), { code: 'ENOENT' });
+  }
+  const start = performance.now();
+  const result = await transfer(directory, `${lab.url}/file`, { extraArgs: ['--bytes-per-second', '65536'] });
+  assertComplete(result, false);
+  assert.ok(performance.now() - start >= 950, 'body must be paced through completion');
+  assert.deepEqual(await readFile(output), expected);
+});
+
 test('engine persists URL fingerprints and rejects a different query on resume', async t => {
   const { directory, lab, output } = await setup(t);
   const secret = 'synthetic-url-secret-4c183ec2';

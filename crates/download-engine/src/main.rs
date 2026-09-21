@@ -13,9 +13,18 @@ fn arguments() -> Result<Options, &'static str> {
     let mut checkpoint_bytes = 1024 * 1024;
     let mut expected_sha256 = None;
     let mut max_download_bytes = 100 * 1024 * 1024 * 1024;
+    let mut bytes_per_second = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-http" => allow_http = true,
+            "--bytes-per-second" => {
+                bytes_per_second = Some(
+                    args.next()
+                        .ok_or("missing byte rate")?
+                        .parse()
+                        .map_err(|_| "invalid byte rate")?,
+                );
+            }
             "--checkpoint-bytes" => {
                 checkpoint_bytes = args
                     .next()
@@ -64,6 +73,7 @@ fn arguments() -> Result<Options, &'static str> {
         allow_http,
         checkpoint_bytes,
         max_download_bytes,
+        bytes_per_second,
     })
 }
 

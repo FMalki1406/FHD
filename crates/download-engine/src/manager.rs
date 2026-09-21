@@ -230,6 +230,7 @@ fn validate_options(options: &Options) -> Result<(), ManagerError> {
         || options.checkpoint_bytes > 64 * 1024 * 1024
         || options.max_download_bytes == 0
         || options.max_download_bytes > i64::MAX as u64
+        || !crate::rate::valid_limit(options.bytes_per_second)
         || crate::parse_url(&options.url, options.allow_http).is_err()
     {
         return Err(ManagerError::InvalidOptions);
@@ -522,6 +523,7 @@ mod tests {
             allow_http: false,
             checkpoint_bytes: 1024,
             max_download_bytes: 1024,
+            bytes_per_second: None,
         }
     }
 
@@ -590,6 +592,16 @@ mod tests {
         let mut opts = options();
         opts.output_name = "x".repeat(256);
         assert_eq!(validate_options(&opts), Err(ManagerError::InvalidOptions));
+        for rate in [0, crate::rate::MAX_BYTES_PER_SECOND + 1, u64::MAX] {
+            let mut opts = options();
+            opts.bytes_per_second = Some(rate);
+            assert_eq!(validate_options(&opts), Err(ManagerError::InvalidOptions));
+        }
+        for rate in [None, Some(1), Some(crate::rate::MAX_BYTES_PER_SECOND)] {
+            let mut opts = options();
+            opts.bytes_per_second = rate;
+            assert_eq!(validate_options(&opts), Ok(()));
+        }
         assert_eq!(
             path_key(PathBuf::from("relative/job")),
             Err(ManagerError::InvalidPath)

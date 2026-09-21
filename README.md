@@ -88,3 +88,6 @@ npm run lab:serve
 
 - [سياسة الأولويات وحدود الأصل](docs/scheduling-policy.md).
 - [مراجعة الجدولة](docs/scheduler-review.md).
+
+- [تحديد سرعة التنزيل](docs/bandwidth-policy.md).
+- [مراجعة تحديد السرعة](docs/bandwidth-review.md).

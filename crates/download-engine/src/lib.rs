@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use transfer_store::{url_fingerprint, Identity, Status, Store, StoreError};
 
 pub mod manager;
+mod rate;
 
 #[derive(Clone)]
 pub struct Options {
@@ -23,6 +24,9 @@ pub struct Options {
     pub allow_http: bool,
     pub checkpoint_bytes: u64,
     pub max_download_bytes: u64,
+    /// Per-transfer response-body consumption cap; None means unlimited.
+    /// Network/TLS/OS buffers can read ahead. This is not an exact wire cap.
+    pub bytes_per_second: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +215,8 @@ async fn request(
         let response = tokio::select! {
             biased;
             _ = cancelled(cancel) => return Err(Error::Cancelled),
-            result = builder.send() => result.map_err(|_| Error::Network)?,
+            result = tokio::time::timeout(Duration::from_secs(30), builder.send()) =>
+                result.map_err(|_| Error::Network)?.map_err(|_| Error::Network)?,
         };
         if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             if redirects == 5 {
@@ -248,6 +253,7 @@ pub async fn download(
     mut cancel: watch::Receiver<bool>,
     on_checkpoint: impl Fn(u64),
 ) -> Result<Outcome, Error> {
+    let pacing = rate::BodyPacing::new(options.bytes_per_second)?;
     if options.checkpoint_bytes == 0
         || options.checkpoint_bytes > 64 * 1024 * 1024
         || options.max_download_bytes == 0
@@ -268,7 +274,6 @@ pub async fn download(
         .no_deflate()
         .no_zstd()
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
         .user_agent("FHD-development/0.1")
         .build()
         .map_err(|_| Error::Network)?;
@@ -445,7 +450,10 @@ pub async fn download(
         let next = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => Err(Error::Cancelled),
-            next = response.chunk() => next.map_err(|_| Error::Network),
+            // Only active HTTP waiting counts. A reqwest read_timeout would
+            // also count our deliberate pacing sleeps between body polls.
+            next = tokio::time::timeout(Duration::from_secs(30), response.chunk()) =>
+                next.map_err(|_| Error::Network).and_then(|result| result.map_err(|_| Error::Network)),
         };
         let chunk = match next {
             Ok(Some(chunk)) => chunk,
@@ -467,8 +475,17 @@ pub async fn download(
             return Err(Error::BodyLength);
         }
         // Bound each disk operation and copied buffer; no whole-file accumulation.
-        for bytes in chunk.chunks(64 * 1024) {
-            if is_cancelled(&cancel) {
+        for bytes in chunk.chunks(pacing.slice_bytes()) {
+            let pacing_cancelled = if let Some(delay) = pacing.delay(bytes.len() as u32) {
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => true,
+                    _ = tokio::time::sleep(delay) => false,
+                }
+            } else {
+                false
+            };
+            if pacing_cancelled || is_cancelled(&cancel) {
                 let committed = disk(move || {
                     store.checkpoint()?;
                     Ok(store.committed_len())
@@ -556,6 +573,7 @@ mod tests {
             allow_http: false,
             checkpoint_bytes: 1024,
             max_download_bytes: 1024,
+            bytes_per_second: None,
         };
         let (sender, cancel) = watch::channel(false);
         for opts in [
