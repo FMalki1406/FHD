@@ -17,6 +17,7 @@ use transfer_store::Store;
 
 const PREFIX: usize = 4096;
 const TOTAL: usize = 16384;
+static NEXT_LAB: AtomicUsize = AtomicUsize::new(0);
 fn body() -> Vec<u8> {
     (0..TOTAL).map(|i| (i % 251) as u8).collect()
 }
@@ -30,8 +31,9 @@ struct Lab {
 impl Lab {
     fn new() -> Self {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "fhd-manager-{}-{}",
+            "fhd-manager-{}-{}-{}",
             std::process::id(),
+            NEXT_LAB.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
