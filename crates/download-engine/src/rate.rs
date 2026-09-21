@@ -232,16 +232,36 @@ mod tests {
     }
     #[tokio::test]
     async fn cancellation_interrupts_wait_without_allocating_credit() {
-        let control = TrafficControl::new(Some(1)).unwrap();
-        let (owner, mut cancel) = watch::channel(false);
-        let updater = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        for job in [true, false] {
+            let global = Bandwidth::new(if job { None } else { Some(1) }).unwrap();
+            let control =
+                TrafficControl::with_global(global, if job { Some(1) } else { None }).unwrap();
+            let (owner, mut cancel) = watch::channel(false);
+            let mut waiting = Box::pin(control.consume(10, &mut cancel));
+            poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
             owner.send_replace(true);
-        });
-        assert_eq!(
-            control.consume(10, &mut cancel).await,
-            Err(Error::Cancelled)
-        );
-        updater.await.unwrap();
+            // The very next poll must complete; no timer advance or real-time
+            // deadline can accidentally make an uncancellable wait pass.
+            poll_fn(|cx| {
+                assert_eq!(
+                    waiting.as_mut().poll(cx),
+                    Poll::Ready(Err(Error::Cancelled))
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(waiting);
+            assert!(control.gate.try_lock().is_ok());
+            assert!(control.job.inner.gate.try_lock().is_ok());
+            assert!(control.global.inner.gate.try_lock().is_ok());
+        }
     }
 }
