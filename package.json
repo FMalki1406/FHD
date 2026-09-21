@@ -1,0 +1,11 @@
+{
+  "name": "fhd-engineering",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node tools/http-lab/server.test.mjs",
+    "lab:serve": "node tools/http-lab/cli.mjs"
+  }
+}

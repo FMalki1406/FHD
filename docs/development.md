@@ -1,0 +1,41 @@
+# بيئة التطوير والتحقق
+
+التاريخ: 2026-09-21. البيئة المتحقق منها حاليًا Windows x64 فقط.
+
+## Rust
+
+أُعدت أدوات Rust محليًا تحت `.tools/cargo` و`.tools/rustup` داخل المشروع، دون تعديل PATH العام. هذه الملفات غير مضمّنة في المصدر. إصدار المشروع مثبت في `rust-toolchain.toml` على **1.98.1**، وهو الإصدار الذي أعاده manifest الرسمي للقناة stable عند الإعداد (تاريخ الإصدار الوارد فيه 2026-09-03). هذه واقعة إعداد وليست ضمانًا لخلو الأدوات من العيوب أو اعتمادها إلى الأبد.
+
+جرى تنزيل rustup-init من `https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe` والتحقق من SHA-256 مقابل الملف المنشور بجواره قبل تشغيله:
+
+```text
+6F4BEF66261261FCB43131BE8720BAB817D403A09EDEC7455C371974B90BDB7E
+```
+
+تطابق البصمة يحمي من اختلاف الملف المنقول؛ تحميل الملف والبصمة من نفس المصدر ليس توثيقًا مستقلًا ضد اختراق المصدر. أدوات MSVC الموجودة على الجهاز هي Visual Studio 2019 Build Tools؛ لم يُثبت SDK أو Visual Studio إضافي.
+
+إعادة إعداد جهاز Windows جديد: استخدم [تعليمات Rust الرسمية](https://rust-lang.org/tools/install/) و[متطلبات Windows](https://rust-lang.github.io/rustup/installation/windows.html)، ثم ثبت النسخة المسجلة في ملف toolchain مع rustfmt وclippy. عند استخدام العزل المحلي عين CARGO_HOME وRUSTUP_HOME إلى `.tools/cargo` و`.tools/rustup` تحت جذر المشروع قبل تشغيل المثبت مع `--no-modify-path`. لا تشغل مثبتًا من مصدر غير موثق.
+
+## أوامر المشروع
+
+في PowerShell من جذر المشروع:
+
+```powershell
+./tools/rust.ps1 -CargoArguments @('fmt', '--all', '--', '--check')
+./tools/rust.ps1 -CargoArguments @('test', '--workspace', '--locked', '--offline')
+./tools/rust.ps1 -CargoArguments @('clippy', '--workspace', '--all-targets', '--locked', '--offline', '--', '-D', 'warnings')
+npm.cmd test
+```
+
+الـwrapper يضبط متغيرات أدوات المشروع أثناء الأمر ويعيدها بعده، ويعيد رمز الخروج. مرر قائمة المعاملات صراحة كما في المثال حتى لا يفسر PowerShell خيارات مثل `-p` أو `--` لنفسه بدل Cargo. على بيئة تملك Rust قياسيًا يمكن تشغيل أوامر cargo المقابلة مباشرة؛ اختبار macOS/Linux لم ينفذ بعد.
+
+يحفظ Cargo.lock مدخلات البناء المحلولة. الوحدتان الحاليتان بلا تبعيات خارجية؛ `--offline` يمنع جلب crates أثناء الاختبار. عند إضافة تبعيات، يلزم توثيق مراجعتها وتحضيرها قبل التحقق المقفل.
+
+## حدود الكود الحالي
+
+- download-core: نطاقات وحالات مجال فقط؛ لا منفذ شبكة أو قرص.
+- resume-policy: تحقق محافظ لرؤوس استجابة استكمال، لا HTTP client ولا TLS أو كتابة ملفات.
+- tools/http-lab: خادم محلي اصطناعي؛ لا backend للمنتج.
+- لا CI بعيد مفعّل، ولا مثبّت تطبيق أو إصدار موقع. أوامر الفحص محلية فعلية، وليست دليل تأهيل المنتج.
+
+تثبيت إصدار Node وإضافة CI ما زالا ENG-001 قبل اعتماد المختبر في بيئة جماعية. نسخة Node المتاحة المستخدمة في الاختبار مسجلة في [حالة التنفيذ](execution-status.md).
