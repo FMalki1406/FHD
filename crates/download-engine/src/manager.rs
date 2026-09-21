@@ -19,6 +19,38 @@ use tokio::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JobId(pub u64);
 
+/// Non-preemptive scheduling priority. Equal priorities retain queue order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+// A normalized origin, never included in public snapshots or diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn origin(options: &Options) -> Result<Origin, ManagerError> {
+    let url = crate::parse_url(&options.url, options.allow_http)
+        .map_err(|_| ManagerError::InvalidOptions)?;
+    Ok(Origin {
+        scheme: url.scheme().to_owned(),
+        host: url
+            .host_str()
+            .ok_or(ManagerError::InvalidOptions)?
+            .to_owned(),
+        port: url
+            .port_or_known_default()
+            .ok_or(ManagerError::InvalidOptions)?,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     Queued,
@@ -33,6 +65,7 @@ pub enum State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSnapshot {
     pub id: JobId,
+    pub priority: Priority,
     pub state: State,
     pub committed_bytes: u64,
 }
@@ -60,7 +93,8 @@ impl std::error::Error for ManagerError {}
 
 type Reply<T> = oneshot::Sender<Result<T, ManagerError>>;
 enum Command {
-    Enqueue(Options, Reply<JobId>),
+    Enqueue(Options, Priority, Reply<JobId>),
+    SetPriority(JobId, Priority, Reply<()>),
     Pause(JobId, Reply<()>),
     Resume(JobId, Reply<()>),
 }
@@ -75,16 +109,27 @@ pub struct Manager {
 
 impl Manager {
     pub fn start(max_active: usize, max_jobs: usize) -> Result<Self, ManagerError> {
+        Self::start_with_limits(max_active, max_jobs, max_active)
+    }
+
+    /// Limits concurrent transfers by normalized scheme, host and effective port.
+    /// Running and pausing workers hold their slots until they have joined.
+    pub fn start_with_limits(
+        max_active: usize,
+        max_jobs: usize,
+        max_per_origin: usize,
+    ) -> Result<Self, ManagerError> {
         if !(1..=32).contains(&max_active)
             || !(1..=1024).contains(&max_jobs)
             || max_active > max_jobs
+            || !(1..=max_active).contains(&max_per_origin)
         {
             return Err(ManagerError::InvalidLimits);
         }
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| ManagerError::NoRuntime)?;
         let (commands, receiver) = mpsc::channel(64);
         let (updates, snapshots) = watch::channel(Vec::new());
-        let actor = runtime.spawn(run(receiver, updates, max_active, max_jobs));
+        let actor = runtime.spawn(run(receiver, updates, max_active, max_jobs, max_per_origin));
         Ok(Self {
             commands: Some(commands),
             snapshots,
@@ -97,12 +142,32 @@ impl Manager {
     }
 
     pub async fn enqueue(&self, options: Options) -> Result<JobId, ManagerError> {
+        self.enqueue_with_priority(options, Priority::Normal).await
+    }
+
+    pub async fn enqueue_with_priority(
+        &self,
+        options: Options,
+        priority: Priority,
+    ) -> Result<JobId, ManagerError> {
         validate_options(&options)?;
         let (reply, result) = oneshot::channel();
         self.commands
             .as_ref()
             .ok_or(ManagerError::Closed)?
-            .send(Command::Enqueue(options, reply))
+            .send(Command::Enqueue(options, priority, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
+    /// Updates queued, paused or failed jobs without preempting an active transfer.
+    pub async fn set_priority(&self, id: JobId, priority: Priority) -> Result<(), ManagerError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::SetPriority(id, priority, reply))
             .await
             .map_err(|_| ManagerError::Closed)?;
         result.await.map_err(|_| ManagerError::Closed)?
@@ -147,6 +212,8 @@ impl Manager {
 
 struct Job {
     options: Options,
+    origin: Origin,
+    priority: Priority,
     key: PathBuf,
     state: State,
     progress: Arc<AtomicU64>,
@@ -228,6 +295,7 @@ fn publish(jobs: &[(JobId, Job)], updates: &watch::Sender<Vec<JobSnapshot>>) {
         .iter()
         .map(|(id, job)| JobSnapshot {
             id: *id,
+            priority: job.priority,
             state: job.state.clone(),
             committed_bytes: job.progress.load(Ordering::Relaxed),
         })
@@ -270,11 +338,44 @@ fn finish(job: &mut Job, result: Result<Outcome, Error>) {
     };
 }
 
+fn next_eligible(
+    jobs: &[(JobId, Job)],
+    queue: &VecDeque<JobId>,
+    max_per_origin: usize,
+) -> Option<usize> {
+    let mut selected = None;
+    let mut selected_priority = Priority::Low;
+    for (index, id) in queue.iter().enumerate() {
+        let Some((_, candidate)) = jobs.iter().find(|(key, _)| key == id) else {
+            continue;
+        };
+        if candidate.state != State::Queued {
+            continue;
+        }
+        let active = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.origin == candidate.origin
+                    && matches!(job.state, State::Running | State::Pausing)
+            })
+            .count();
+        if active >= max_per_origin {
+            continue;
+        }
+        if selected.is_none() || candidate.priority > selected_priority {
+            selected = Some(index);
+            selected_priority = candidate.priority;
+        }
+    }
+    selected
+}
+
 async fn run(
     mut commands: mpsc::Receiver<Command>,
     updates: watch::Sender<Vec<JobSnapshot>>,
     max_active: usize,
     max_jobs: usize,
+    max_per_origin: usize,
 ) {
     let mut jobs: Vec<(JobId, Job)> = Vec::new();
     let mut queue = VecDeque::new();
@@ -291,7 +392,10 @@ async fn run(
             stop(&mut jobs, &mut queue);
         }
         while !closing && workers.len() < max_active {
-            let Some(id) = queue.pop_front() else {
+            let Some(index) = next_eligible(&jobs, &queue, max_per_origin) else {
+                break;
+            };
+            let Some(id) = queue.remove(index) else {
                 break;
             };
             let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else {
@@ -340,8 +444,12 @@ async fn run(
             command = commands.recv(), if !closing => {
                 match command {
                     None => { closing = true; stop(&mut jobs, &mut queue); }
-                    Some(Command::Enqueue(options, reply)) => {
+                    Some(Command::Enqueue(options, priority, reply)) => {
                         if jobs.len() >= max_jobs { let _ = reply.send(Err(ManagerError::Capacity)); continue; }
+                        let origin = match origin(&options) {
+                            Ok(origin) => origin,
+                            Err(error) => { let _ = reply.send(Err(error)); continue; }
+                        };
                         let path = options.job_dir.clone();
                         let key = tokio::task::spawn_blocking(move || path_key(path)).await;
                         let key = match key {
@@ -353,10 +461,18 @@ async fn run(
                             let _ = reply.send(Err(ManagerError::DuplicateJob)); continue;
                         }
                         let id = JobId(jobs.len() as u64 + 1);
-                        jobs.push((id, Job { options, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None }));
+                        jobs.push((id, Job { options, origin, priority, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None }));
                         queue.push_back(id);
                         publish(&jobs, &updates);
                         let _ = reply.send(Ok(id));
+                    }
+                    Some(Command::SetPriority(id, priority, reply)) => {
+                        let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
+                        if matches!(job.state, State::Queued | State::Paused | State::Failed(_)) {
+                            job.priority = priority;
+                            publish(&jobs, &updates);
+                            let _ = reply.send(Ok(()));
+                        } else { let _ = reply.send(Err(ManagerError::InvalidTransition)); }
                     }
                     Some(Command::Pause(id, reply)) => {
                         let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
@@ -412,6 +528,8 @@ mod tests {
     fn pausing_job() -> Job {
         Job {
             options: options(),
+            origin: origin(&options()).unwrap(),
+            priority: Priority::Normal,
             key: PathBuf::new(),
             state: State::Pausing,
             progress: Arc::new(AtomicU64::new(0)),
@@ -456,6 +574,16 @@ mod tests {
             ));
         }
         assert!(matches!(Manager::start(1, 1), Err(ManagerError::NoRuntime)));
+        for limits in [(2, 8, 0), (2, 8, 3), (0, 8, 1), (33, 64, 1)] {
+            assert!(matches!(
+                Manager::start_with_limits(limits.0, limits.1, limits.2),
+                Err(ManagerError::InvalidLimits)
+            ));
+        }
+        assert!(matches!(
+            Manager::start_with_limits(2, 8, 1),
+            Err(ManagerError::NoRuntime)
+        ));
         let mut opts = options();
         opts.url = "x".repeat(16_385);
         assert_eq!(validate_options(&opts), Err(ManagerError::InvalidOptions));
@@ -466,6 +594,77 @@ mod tests {
             path_key(PathBuf::from("relative/job")),
             Err(ManagerError::InvalidPath)
         );
+    }
+
+    #[test]
+    fn origins_normalize_hosts_and_default_ports_without_merging_other_ports() {
+        let key = |url: &str| {
+            let mut opts = options();
+            opts.url = url.into();
+            opts.allow_http = true;
+            origin(&opts).unwrap()
+        };
+        assert!(key("https://EXAMPLE.com:443/a?token=one") == key("https://example.com/b"));
+        assert!(key("http://example.com:80/a") == key("http://example.com/b"));
+        assert!(key("https://example.com:444/a") != key("https://example.com/a"));
+        assert!(key("http://example.com:443/a") != key("https://example.com/a"));
+        assert!(key("https://[0:0:0:0:0:0:0:1]:443/a") == key("https://[::1]/b"));
+    }
+
+    fn queued_job(url: &str, priority: Priority) -> Job {
+        let mut job = pausing_job();
+        job.options.url = url.into();
+        job.origin = origin(&job.options).unwrap();
+        job.priority = priority;
+        job.state = State::Queued;
+        job
+    }
+
+    #[test]
+    fn scheduler_bypasses_saturated_origin_and_keeps_slots_until_pausing_joins() {
+        let mut active = queued_job("https://a.example/file", Priority::Low);
+        active.state = State::Pausing;
+        let mut jobs = vec![
+            (JobId(1), active),
+            (
+                JobId(2),
+                queued_job("https://a.example/next", Priority::High),
+            ),
+            (
+                JobId(3),
+                queued_job("https://b.example/next", Priority::Low),
+            ),
+        ];
+        let queue = VecDeque::from([JobId(2), JobId(3)]);
+        assert_eq!(next_eligible(&jobs, &queue, 1), Some(1));
+        jobs[2].1.state = State::Running;
+        assert_eq!(next_eligible(&jobs, &queue, 1), None);
+        // Only completion/join releases the previous origin slot.
+        finish(&mut jobs[0].1, Err(Error::Cancelled));
+        assert_eq!(next_eligible(&jobs, &queue, 1), Some(0));
+    }
+
+    #[test]
+    fn scheduler_selects_highest_priority_then_fifo_without_reordering_queue() {
+        let mut jobs = vec![
+            (JobId(1), queued_job("https://a.example/1", Priority::Low)),
+            (JobId(2), queued_job("https://a.example/2", Priority::High)),
+            (JobId(3), queued_job("https://a.example/3", Priority::High)),
+            (
+                JobId(4),
+                queued_job("https://a.example/4", Priority::Normal),
+            ),
+        ];
+        let mut queue = VecDeque::from([JobId(1), JobId(2), JobId(3), JobId(4)]);
+        assert_eq!(next_eligible(&jobs, &queue, 2), Some(1));
+        queue.remove(1);
+        jobs[1].1.state = State::Running;
+        assert_eq!(next_eligible(&jobs, &queue, 2), Some(1));
+        // Priority changes retain the original FIFO position within the queue.
+        jobs[0].1.priority = Priority::High;
+        assert_eq!(next_eligible(&jobs, &queue, 2), Some(0));
+        jobs[0].1.state = State::Running;
+        assert_eq!(next_eligible(&jobs, &queue, 2), None);
     }
 
     #[test]

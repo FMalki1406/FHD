@@ -327,3 +327,151 @@ async fn pausing_queued_job_prevents_network_until_explicit_resume() {
     assert_eq!(lab.requests.load(Ordering::Acquire), 2);
     manager.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn saturated_origin_does_not_block_other_origin_and_keeps_its_limit() {
+    let first = Lab::new();
+    let second = Lab::new();
+    let manager = Manager::start_with_limits(3, 8, 1).unwrap();
+    let mut updates = manager.subscribe();
+    let a = manager.enqueue(first.options("a")).await.unwrap();
+    let b = manager
+        .enqueue_with_priority(first.options("b"), download_engine::manager::Priority::High)
+        .await
+        .unwrap();
+    let c = manager
+        .enqueue_with_priority(second.options("c"), download_engine::manager::Priority::Low)
+        .await
+        .unwrap();
+    let d = manager.enqueue(second.options("d")).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .filter(|j| (j.id == a || j.id == c) && j.committed_bytes == PREFIX as u64)
+            .count()
+            == 2
+    })
+    .await;
+    assert_eq!(first.requests.load(Ordering::Acquire), 1);
+    assert_eq!(second.requests.load(Ordering::Acquire), 1);
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == b && j.state == State::Queued));
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == d && j.state == State::Queued));
+    manager.pause(a).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == b && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    assert_eq!(first.requests.load(Ordering::Acquire), 2);
+    assert_eq!(second.requests.load(Ordering::Acquire), 1);
+    assert_eq!(
+        Store::open(&first.root.join("a")).unwrap().committed_len(),
+        PREFIX as u64
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn priorities_pick_highest_waiting_without_interrupting_running_job() {
+    use download_engine::manager::Priority;
+    let lab = Lab::new();
+    let manager = Manager::start_with_limits(1, 5, 1).unwrap();
+    let mut updates = manager.subscribe();
+    let gate = manager.enqueue(lab.options("gate")).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == gate && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    let low = manager
+        .enqueue_with_priority(lab.options("low"), Priority::Low)
+        .await
+        .unwrap();
+    let normal = manager.enqueue(lab.options("normal")).await.unwrap();
+    let high = manager
+        .enqueue_with_priority(lab.options("high"), Priority::High)
+        .await
+        .unwrap();
+    assert_eq!(lab.requests.load(Ordering::Acquire), 1);
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == gate && j.state == State::Running));
+    manager.pause(gate).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == high && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == normal && j.state == State::Queued));
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == low && j.state == State::Queued));
+    manager.pause(high).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == normal && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    manager.pause(normal).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == low && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn changing_queued_priority_keeps_equal_priority_fifo_and_rejects_running_change() {
+    use download_engine::manager::Priority;
+    let lab = Lab::new();
+    let manager = Manager::start_with_limits(1, 4, 1).unwrap();
+    let mut updates = manager.subscribe();
+    let gate = manager.enqueue(lab.options("gate")).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == gate && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    let first = manager
+        .enqueue_with_priority(lab.options("first"), Priority::Low)
+        .await
+        .unwrap();
+    let second = manager
+        .enqueue_with_priority(lab.options("second"), Priority::High)
+        .await
+        .unwrap();
+    manager.set_priority(first, Priority::High).await.unwrap();
+    assert!(manager.set_priority(gate, Priority::Low).await.is_err());
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == first && j.priority == Priority::High));
+    manager.pause(gate).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == first && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    assert!(updates
+        .borrow()
+        .iter()
+        .any(|j| j.id == second && j.state == State::Queued));
+    manager.pause(first).await.unwrap();
+    wait_for(&mut updates, |jobs| {
+        jobs.iter()
+            .any(|j| j.id == second && j.committed_bytes == PREFIX as u64)
+    })
+    .await;
+    manager.shutdown().await.unwrap();
+}

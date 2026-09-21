@@ -85,3 +85,6 @@ npm run lab:serve
 
 - [إدارة مهام التنزيل](docs/task-manager.md).
 - [مراجعة إدارة المهام](docs/task-manager-review.md).
+
+- [سياسة الأولويات وحدود الأصل](docs/scheduling-policy.md).
+- [مراجعة الجدولة](docs/scheduler-review.md).
