@@ -11,6 +11,14 @@ use zeroize::Zeroizing;
 
 const MAX_BLOB: usize = 64 * 1024 * 1024;
 const MAX_PLAIN: usize = 48 * 1024 * 1024;
+pub(crate) const MAX_RECEIPTS: usize = 4096;
+#[derive(Clone)]
+pub(crate) struct Receipt {
+    pub key_hash: [u8; 32],
+    pub payload_hash: [u8; 32],
+    pub job_id: JobId,
+    pub removed: bool,
+}
 pub(crate) struct SavedJob {
     pub id: JobId,
     pub options: Options,
@@ -21,6 +29,7 @@ pub(crate) struct SavedJob {
 }
 pub(crate) struct Snapshot {
     pub last_id: u64,
+    pub receipts: Vec<Receipt>,
     pub config: Config,
     pub jobs: Vec<SavedJob>,
     pub queue: Vec<JobId>,
@@ -165,8 +174,52 @@ fn option(bytes: &mut Vec<u8>, value: Option<u64>) {
     put(bytes, value.unwrap_or(0));
 }
 
+/// Frozen queue v2/v3 and admission payload v1 layout. A future Options field
+/// requires a new versioned encoder/receipt migration, never changing this one.
+pub(crate) fn encode_options_v2(
+    bytes: &mut Vec<u8>,
+    options: &Options,
+) -> Result<(), ManagerError> {
+    string(bytes, &options.url);
+    string(
+        bytes,
+        options.job_dir.to_str().ok_or(ManagerError::InvalidPath)?,
+    );
+    string(bytes, &options.output_name);
+    bytes.push(u8::from(options.expected_sha256.is_some()));
+    if let Some(hash) = options.expected_sha256 {
+        bytes.extend_from_slice(&hash);
+    }
+    bytes.push(u8::from(options.allow_http));
+    put(bytes, options.checkpoint_bytes);
+    put(bytes, options.max_download_bytes);
+    option(bytes, options.bytes_per_second);
+    bytes.push(options.parallel_connections);
+    string(
+        bytes,
+        options
+            .request_policy
+            .authorization
+            .as_deref()
+            .unwrap_or(""),
+    );
+    string(
+        bytes,
+        options.request_policy.cookie.as_deref().unwrap_or(""),
+    );
+    put(bytes, options.request_policy.redirect_origins.len() as u64);
+    for origin in &options.request_policy.redirect_origins {
+        string(bytes, origin);
+    }
+    bytes.push(u8::from(options.refresh_from.is_some()));
+    if let Some(hash) = options.refresh_from {
+        bytes.extend_from_slice(&hash);
+    }
+    Ok(())
+}
+
 fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
-    let mut bytes = Zeroizing::new(b"FHDQUEUE\x02".to_vec());
+    let mut bytes = Zeroizing::new(b"FHDQUEUE\x03".to_vec());
     let c = &snapshot.config;
     for value in [
         c.max_active as u64,
@@ -183,47 +236,7 @@ fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
     put(&mut bytes, snapshot.jobs.len() as u64);
     for job in &snapshot.jobs {
         put(&mut bytes, job.id.0);
-        string(&mut bytes, &job.options.url);
-        string(
-            &mut bytes,
-            job.options
-                .job_dir
-                .to_str()
-                .ok_or(ManagerError::InvalidPath)?,
-        );
-        string(&mut bytes, &job.options.output_name);
-        bytes.push(u8::from(job.options.expected_sha256.is_some()));
-        if let Some(hash) = job.options.expected_sha256 {
-            bytes.extend_from_slice(&hash);
-        }
-        bytes.push(u8::from(job.options.allow_http));
-        put(&mut bytes, job.options.checkpoint_bytes);
-        put(&mut bytes, job.options.max_download_bytes);
-        option(&mut bytes, job.options.bytes_per_second);
-        bytes.push(job.options.parallel_connections);
-        string(
-            &mut bytes,
-            job.options
-                .request_policy
-                .authorization
-                .as_deref()
-                .unwrap_or(""),
-        );
-        string(
-            &mut bytes,
-            job.options.request_policy.cookie.as_deref().unwrap_or(""),
-        );
-        put(
-            &mut bytes,
-            job.options.request_policy.redirect_origins.len() as u64,
-        );
-        for origin in &job.options.request_policy.redirect_origins {
-            string(&mut bytes, origin);
-        }
-        bytes.push(u8::from(job.options.refresh_from.is_some()));
-        if let Some(hash) = job.options.refresh_from {
-            bytes.extend_from_slice(&hash);
-        }
+        encode_options_v2(&mut bytes, &job.options)?;
         bytes.push(match job.priority {
             Priority::Low => 0,
             Priority::Normal => 1,
@@ -246,6 +259,16 @@ fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
     put(&mut bytes, snapshot.queue.len() as u64);
     for id in &snapshot.queue {
         put(&mut bytes, id.0);
+    }
+    if snapshot.receipts.len() > MAX_RECEIPTS {
+        return Err(ManagerError::ReceiptCapacity);
+    }
+    put(&mut bytes, snapshot.receipts.len() as u64);
+    for receipt in &snapshot.receipts {
+        bytes.extend_from_slice(&receipt.key_hash);
+        bytes.extend_from_slice(&receipt.payload_hash);
+        put(&mut bytes, receipt.job_id.0);
+        bytes.push(u8::from(receipt.removed));
     }
     if bytes.len() > MAX_PLAIN {
         return Err(ManagerError::Capacity);
@@ -307,7 +330,7 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
     }
     let mut r = Reader(plain);
     let version = r.take(9)?;
-    if version != b"FHDQUEUE\x01" && version != b"FHDQUEUE\x02" {
+    if version != b"FHDQUEUE\x01" && version != b"FHDQUEUE\x02" && version != b"FHDQUEUE\x03" {
         return Err(ManagerError::Persistence);
     }
     let config = Config {
@@ -322,7 +345,7 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
         global_bytes_per_second: r.option()?,
     };
     config.validate()?;
-    let saved_last_id = if version == b"FHDQUEUE\x02" {
+    let saved_last_id = if version != b"FHDQUEUE\x01" {
         Some(r.n()?)
     } else {
         None
@@ -355,7 +378,7 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
             request_policy: Default::default(),
             refresh_from: None,
         };
-        if version == b"FHDQUEUE\x02" {
+        if version != b"FHDQUEUE\x01" {
             let auth = r.string(8192)?;
             let cookie = r.string(8192)?;
             let mut origins = Vec::new();
@@ -411,16 +434,42 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
         }
         queue.push(id);
     }
+    let mut receipts = Vec::new();
+    if version == b"FHDQUEUE\x03" {
+        let count = r.bounded(MAX_RECEIPTS as u64)?;
+        receipts.reserve(count);
+        for _ in 0..count {
+            let key_hash = r.take(32)?.try_into().map_err(failure)?;
+            let payload_hash = r.take(32)?.try_into().map_err(failure)?;
+            let job_id = JobId(r.n()?);
+            let removed = r.boolean()?;
+            if job_id.0 == 0
+                || receipts.iter().any(|receipt: &Receipt| {
+                    receipt.key_hash == key_hash || receipt.job_id == job_id
+                })
+                || removed == jobs.iter().any(|job| job.id == job_id)
+            {
+                return Err(ManagerError::Persistence);
+            }
+            receipts.push(Receipt {
+                key_hash,
+                payload_hash,
+                job_id,
+                removed,
+            });
+        }
+    }
     if !r.0.is_empty() {
         return Err(ManagerError::Persistence);
     }
     let maximum = jobs.iter().map(|j| j.id.0).max().unwrap_or(0);
     let last_id = saved_last_id.unwrap_or(maximum);
-    if last_id < maximum {
+    if last_id < maximum || receipts.iter().any(|receipt| receipt.job_id.0 > last_id) {
         return Err(ManagerError::Persistence);
     }
     Ok(Snapshot {
         last_id,
+        receipts,
         config,
         jobs,
         queue,
@@ -431,15 +480,91 @@ fn decode(bytes: &[u8]) -> Result<Snapshot, ManagerError> {
 mod tests {
     use super::*;
     #[test]
+    fn frozen_options_encoding_retains_original_admission_hash() {
+        let options = Options {
+            url: "https://example.test/file?token=one".into(),
+            job_dir: PathBuf::from("/fixed/job"),
+            output_name: "file.bin".into(),
+            expected_sha256: Some([17; 32]),
+            allow_http: false,
+            checkpoint_bytes: 65536,
+            max_download_bytes: 123456789,
+            bytes_per_second: Some(2048),
+            parallel_connections: 4,
+            request_policy: crate::RequestPolicy::new(
+                Some("Bearer example".into()),
+                Some("session=example".into()),
+                vec!["https://cdn.example.test".into()],
+            )
+            .unwrap(),
+            refresh_from: Some([34; 32]),
+        };
+        let mut bytes = b"FHD.admission.payload.v1\0".to_vec();
+        encode_options_v2(&mut bytes, &options).unwrap();
+        bytes.push(2); // High priority
+        let expected = [
+            0x5a, 0xab, 0xc2, 0xf2, 0x02, 0x1e, 0x54, 0xc7, 0xf9, 0x49, 0x04, 0xf9, 0x89, 0xb4,
+            0x1a, 0x50, 0xf1, 0xfc, 0xb1, 0x11, 0x64, 0x3c, 0xa8, 0x57, 0xcf, 0xae, 0x3a, 0xce,
+            0xb8, 0xdf, 0x26, 0x3f,
+        ];
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(&bytes)), expected);
+    }
+
+    #[test]
+    fn version_two_queue_migrates_without_receipts_and_keeps_monotonic_id() {
+        let snapshot = Snapshot {
+            last_id: 37,
+            receipts: vec![],
+            config: Config::default(),
+            jobs: vec![],
+            queue: vec![],
+        };
+        let mut old = encode(&snapshot).unwrap().to_vec();
+        old.truncate(old.len() - 40); // Remove v3 empty receipt count and digest.
+        old[8] = 2;
+        old.extend_from_slice(&Sha256::digest(&old));
+        let restored = decode(&old).unwrap();
+        assert!(restored.receipts.is_empty());
+        assert_eq!(restored.last_id, 37);
+        assert!(decode(&encode(&restored).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn receipt_decoder_rejects_missing_live_jobs_duplicates_and_future_ids() {
+        let receipt = Receipt {
+            key_hash: [1; 32],
+            payload_hash: [2; 32],
+            job_id: JobId(1),
+            removed: false,
+        };
+        let mut snapshot = Snapshot {
+            last_id: 1,
+            receipts: vec![receipt],
+            config: Config::default(),
+            jobs: vec![],
+            queue: vec![],
+        };
+        assert!(decode(&encode(&snapshot).unwrap()).is_err());
+        snapshot.receipts[0].removed = true;
+        assert!(decode(&encode(&snapshot).unwrap()).is_ok());
+        snapshot.receipts.push(snapshot.receipts[0].clone());
+        assert!(decode(&encode(&snapshot).unwrap()).is_err());
+        snapshot.receipts.pop();
+        snapshot.last_id = 0;
+        assert!(decode(&encode(&snapshot).unwrap()).is_err());
+    }
+    #[test]
     fn version_one_queue_is_read_without_inventing_credentials() {
         let snapshot = Snapshot {
             last_id: 0,
+            receipts: vec![],
             config: Config::default(),
             jobs: vec![],
             queue: vec![],
         };
         let mut old = encode(&snapshot).unwrap().to_vec();
         old.truncate(old.len() - 32);
+        old.truncate(old.len() - 8); // v3 receipt count is absent in v1.
         old[8] = 1;
         old.drain(65..73);
         old.extend_from_slice(&Sha256::digest(&old));
@@ -451,6 +576,7 @@ mod tests {
     fn envelope_rejects_changes_and_invalid_lengths() {
         let snapshot = Snapshot {
             last_id: 0,
+            receipts: vec![],
             config: Config::default(),
             jobs: vec![],
             queue: vec![],

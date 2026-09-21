@@ -1,8 +1,9 @@
 //! In-process approval boundary. No listening socket or ambient browser authority.
 use crate::{
-    manager::{JobId, Manager, ManagerError},
+    manager::{JobId, Manager, ManagerError, Priority},
     Options, RequestPolicy,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -19,19 +20,51 @@ struct Proposal {
 /// Owned by the trusted desktop controller, never handed to web content.
 pub struct Inbox {
     pending: VecDeque<Proposal>,
-    recent: VecDeque<String>,
+    source_namespace: String,
     next: u64,
 }
 impl Default for Inbox {
     fn default() -> Self {
         Self {
             pending: VecDeque::new(),
-            recent: VecDeque::new(),
+            source_namespace: "local-ui".into(),
             next: 1,
         }
     }
 }
 impl Inbox {
+    /// Namespace assigned by the trusted controller, not by page-supplied payload.
+    /// Browser adapters must bind it to their authenticated extension/profile.
+    pub fn for_source(source: String) -> Result<Self, ManagerError> {
+        if source.is_empty()
+            || source.len() > 128
+            || !source
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(ManagerError::InvalidOptions);
+        }
+        Ok(Self {
+            source_namespace: source,
+            ..Self::default()
+        })
+    }
+
+    fn receipt_key(&self, request_id: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"FHD.intake.admission.v1\0");
+        for part in [self.source_namespace.as_str(), request_id] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        use std::fmt::Write;
+        let mut key = String::with_capacity(70);
+        key.push_str("inbox-");
+        for byte in hash.finalize() {
+            let _ = write!(key, "{byte:02x}");
+        }
+        key
+    }
     /// Only stages a request. Does not touch disk, DNS or network, or cancel a browser download.
     /// This does not implement authenticated browser transport or SSRF protection.
     pub fn propose(&mut self, request_id: String, url: String) -> Result<ProposalId, ManagerError> {
@@ -51,9 +84,6 @@ impl Inbox {
             } else {
                 Err(ManagerError::DuplicateJob)
             };
-        }
-        if self.recent.contains(&request_id) {
-            return Err(ManagerError::DuplicateJob);
         }
         crate::parse_url(&url, false).map_err(|_| ManagerError::InvalidOptions)?;
         if self.pending.len() >= 64 {
@@ -81,7 +111,8 @@ impl Inbox {
     }
     /// Only call after explicit trusted UI approval, including the destination.
     /// No credentials, HTTP permission, redirect permission or arbitrary path comes from the proposal.
-    /// Success is a durable acknowledgement only when `manager` was opened durably.
+    /// Requires a durable manager. Replay must use the original approved settings.
+    /// Acceptance does not authorize cancellation of an existing browser transfer.
     pub async fn approve(
         &mut self,
         manager: &Manager,
@@ -109,18 +140,40 @@ impl Inbox {
             request_policy: RequestPolicy::default(),
             refresh_from: None,
         };
-        let accepted = manager.enqueue(options).await?;
-        let p = self.pending.remove(index).ok_or(ManagerError::UnknownJob)?;
-        self.recent.push_back(p.source);
-        if self.recent.len() > 256 {
-            self.recent.pop_front();
-        }
+        let receipt_key = self.receipt_key(&proposal.source);
+        let accepted = manager
+            .enqueue_once(receipt_key, options, Priority::Normal)
+            .await?;
+        self.pending.remove(index).ok_or(ManagerError::UnknownJob)?;
         Ok(accepted)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn namespace_is_bounded_and_hashes_each_identifier_separately() {
+        for invalid in ["", "page\norigin", "../source"] {
+            assert!(Inbox::for_source(invalid.into()).is_err());
+        }
+        assert!(Inbox::for_source("a".repeat(129)).is_err());
+        let first = Inbox::for_source("profile-A".into()).unwrap();
+        let again = Inbox::for_source("profile-A".into()).unwrap();
+        let other = Inbox::for_source("profile-B".into()).unwrap();
+        assert_eq!(
+            first.receipt_key("request-1"),
+            again.receipt_key("request-1")
+        );
+        assert_ne!(
+            first.receipt_key("request-1"),
+            other.receipt_key("request-1")
+        );
+        assert_ne!(
+            first.receipt_key("request-1"),
+            first.receipt_key("request-2")
+        );
+        assert_eq!(first.receipt_key("request-1").len(), 70);
+    }
     #[test]
     fn proposal_is_bounded_deduplicated_and_grants_no_request_permissions() {
         let mut inbox = Inbox::default();

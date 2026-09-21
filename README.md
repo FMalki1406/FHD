@@ -41,6 +41,7 @@
 - [الجودة وتأهيل الإطلاق](docs/quality-and-release.md).
 - [قائمة التنفيذ والتبعيات](docs/delivery-backlog.md).
 - [حالة التنفيذ والأدلة](docs/execution-status.md).
+- [قبول الطلبات الدائم ومنع تكرارها](docs/durable-admission.md).
 - [تشغيل مختبر الأعطال](tools/http-lab/README.md).
 - [قواعد عمل الوكلاء](AGENTS.md).
 - [سياسة مراجعة الهندسة والأمان](docs/review-policy.md).

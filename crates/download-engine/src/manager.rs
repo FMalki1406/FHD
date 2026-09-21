@@ -1,8 +1,11 @@
 //! Bounded, process-local ownership of transfers. Call `shutdown` before stopping
 //! the Tokio runtime; dropping the handle requests cancellation but cannot await it.
 
-use crate::queue_store::{QueueStore, SavedJob, Snapshot};
+use crate::queue_store::{
+    encode_options_v2, QueueStore, Receipt, SavedJob, Snapshot, MAX_RECEIPTS,
+};
 use crate::{download_controlled, Bandwidth, Error, Options, Outcome, TrafficControl};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Component, PathBuf},
@@ -16,6 +19,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{Id, JoinHandle, JoinSet},
 };
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JobId(pub u64);
@@ -90,6 +94,11 @@ pub enum ManagerError {
     Persistence,
     SecretStorage,
     QueueLocked,
+    NotDurable,
+    InvalidIdempotencyKey,
+    IdempotencyConflict,
+    PreviouslyRemoved,
+    ReceiptCapacity,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -166,9 +175,65 @@ impl Config {
     }
 }
 
+#[derive(Default)]
+struct AdmissionLedger {
+    last_id: u64,
+    receipts: Vec<Receipt>,
+}
+struct AdmissionHashes {
+    key: [u8; 32],
+    payload: [u8; 32],
+}
+fn admission_hashes(
+    key: &str,
+    options: &Options,
+    priority: Priority,
+) -> Result<AdmissionHashes, ManagerError> {
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(ManagerError::InvalidIdempotencyKey);
+    }
+    validate_options(options)?;
+    if !options.job_dir.is_absolute()
+        || options
+            .job_dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(ManagerError::InvalidPath);
+    }
+    let mut canonical = options.clone();
+    canonical.url = crate::parse_url(&options.url, options.allow_http)
+        .map_err(|_| ManagerError::InvalidOptions)?
+        .to_string();
+    // Stable lexical normalization without querying a path that may have moved
+    // since acceptance. Preserve case, including case-sensitive Windows dirs.
+    canonical.job_dir = options.job_dir.components().collect();
+    let mut bytes = Zeroizing::new(b"FHD.admission.payload.v1\0".to_vec());
+    encode_options_v2(&mut bytes, &canonical)?;
+    bytes.push(match priority {
+        Priority::Low => 0,
+        Priority::Normal => 1,
+        Priority::High => 2,
+    });
+    let payload = Sha256::digest(&bytes).into();
+    let mut hash = Sha256::new();
+    hash.update(b"FHD.admission.key.v1\0");
+    hash.update((key.len() as u64).to_le_bytes());
+    hash.update(key.as_bytes());
+    Ok(AdmissionHashes {
+        key: hash.finalize().into(),
+        payload,
+    })
+}
+
 type Reply<T> = oneshot::Sender<Result<T, ManagerError>>;
 enum Command {
-    Enqueue(Box<Options>, Priority, Reply<JobId>),
+    Enqueue(
+        Box<Options>,
+        Priority,
+        Option<AdmissionHashes>,
+        Reply<JobId>,
+    ),
     SetPriority(JobId, Priority, Reply<()>),
     Pause(JobId, Reply<()>),
     Resume(JobId, Reply<()>),
@@ -185,6 +250,7 @@ pub struct Manager {
     commands: Option<mpsc::Sender<Command>>,
     snapshots: watch::Receiver<Vec<JobSnapshot>>,
     actor: Option<JoinHandle<Result<(), ManagerError>>>,
+    durable: bool,
 }
 
 impl Manager {
@@ -229,6 +295,7 @@ impl Manager {
                         jobs: vec![],
                         queue: vec![],
                         last_id: 0,
+                        receipts: vec![],
                     };
                     store.save(&saved)?;
                     saved
@@ -283,7 +350,17 @@ impl Manager {
                 .position(|queued| queued == id)
                 .unwrap_or(usize::MAX)
         });
-        Self::launch_with_global(runtime, config, jobs, Some(store), global, saved.last_id)
+        Self::launch_with_global(
+            runtime,
+            config,
+            jobs,
+            Some(store),
+            global,
+            AdmissionLedger {
+                last_id: saved.last_id,
+                receipts: saved.receipts,
+            },
+        )
     }
 
     fn launch(
@@ -294,7 +371,14 @@ impl Manager {
     ) -> Result<Self, ManagerError> {
         let global = Bandwidth::new(config.global_bytes_per_second)
             .map_err(|_| ManagerError::InvalidLimits)?;
-        Self::launch_with_global(runtime, config, jobs, store, global, 0)
+        Self::launch_with_global(
+            runtime,
+            config,
+            jobs,
+            store,
+            global,
+            AdmissionLedger::default(),
+        )
     }
 
     fn launch_with_global(
@@ -303,16 +387,18 @@ impl Manager {
         jobs: Vec<(JobId, Job)>,
         store: Option<QueueStore>,
         global: Bandwidth,
-        last_id: u64,
+        ledger: AdmissionLedger,
     ) -> Result<Self, ManagerError> {
         let (commands, receiver) = mpsc::channel(64);
         let (updates, snapshots) = watch::channel(Vec::new());
         publish(&jobs, &updates);
-        let actor = runtime.spawn(run(receiver, updates, config, jobs, store, global, last_id));
+        let durable = store.is_some();
+        let actor = runtime.spawn(run(receiver, updates, config, jobs, store, global, ledger));
         Ok(Self {
             commands: Some(commands),
             snapshots,
             actor: Some(actor),
+            durable,
         })
     }
 
@@ -374,7 +460,36 @@ impl Manager {
         self.commands
             .as_ref()
             .ok_or(ManagerError::Closed)?
-            .send(Command::Enqueue(Box::new(options), priority, reply))
+            .send(Command::Enqueue(Box::new(options), priority, None, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
+    /// Durably admits one immutable caller request. Replay returns its original
+    /// job, conflicts reject changes, and forgotten jobs retain a tombstone.
+    /// The caller must namespace keys by its authenticated source before calling.
+    pub async fn enqueue_once(
+        &self,
+        key: String,
+        options: Options,
+        priority: Priority,
+    ) -> Result<JobId, ManagerError> {
+        if !self.durable {
+            return Err(ManagerError::NotDurable);
+        }
+        let key = Zeroizing::new(key);
+        let hashes = admission_hashes(&key, &options, priority)?;
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::Enqueue(
+                Box::new(options),
+                priority,
+                Some(hashes),
+                reply,
+            ))
             .await
             .map_err(|_| ManagerError::Closed)?;
         result.await.map_err(|_| ManagerError::Closed)?
@@ -643,14 +758,15 @@ async fn save_state(
     jobs: &[(JobId, Job)],
     queue: &VecDeque<JobId>,
     config: &Config,
-    last_id: u64,
+    ledger: &AdmissionLedger,
 ) -> Result<(), ManagerError> {
     let Some(mut owned) = store.take() else {
         return Ok(());
     };
     let snapshot = Snapshot {
         config: config.clone(),
-        last_id,
+        last_id: ledger.last_id,
+        receipts: ledger.receipts.clone(),
         jobs: jobs
             .iter()
             .map(|(id, job)| SavedJob {
@@ -698,7 +814,7 @@ async fn run(
     mut jobs: Vec<(JobId, Job)>,
     mut store: Option<QueueStore>,
     global: Bandwidth,
-    mut last_id: u64,
+    mut ledger: AdmissionLedger,
 ) -> Result<(), ManagerError> {
     let mut queue: VecDeque<_> = jobs.iter().map(|(id, _)| *id).collect();
     let mut workers: JoinSet<Result<Outcome, Error>> = JoinSet::new();
@@ -731,7 +847,7 @@ async fn run(
             }
         }
         if dirty && failure.is_none() {
-            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, &ledger).await {
                 failure = Some(error);
                 closing = true;
                 commands.close();
@@ -763,7 +879,7 @@ async fn run(
             }
             job.state = State::Running;
             job.attempts = job.attempts.saturating_add(1);
-            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config, &ledger).await {
                 failure = Some(error);
                 closing = true;
                 commands.close();
@@ -802,7 +918,7 @@ async fn run(
         publish(&jobs, &updates);
         if closing && workers.is_empty() {
             if dirty && failure.is_none() {
-                if let Err(error) = save_state(&mut store, &jobs, &queue, &config, last_id).await {
+                if let Err(error) = save_state(&mut store, &jobs, &queue, &config, &ledger).await {
                     failure = Some(error);
                 }
             }
@@ -866,11 +982,22 @@ async fn run(
                         let Some(index)=jobs.iter().position(|(key,_)|*key==id)else{let _=reply.send(Err(ManagerError::UnknownJob));continue;};
                         if matches!(jobs[index].1.state,State::Running|State::Pausing){let _=reply.send(Err(ManagerError::InvalidTransition));continue;}
                         jobs.remove(index);queue.retain(|key|*key!=id);
+                        for receipt in &mut ledger.receipts { if receipt.job_id == id { receipt.removed = true; } }
                         dirty=true;acknowledgements.push(Acknowledge::Unit(reply));
                     }
                     None => { closing = true; stop(&mut jobs, &mut queue); dirty = true; }
-                    Some(Command::Enqueue(options, priority, reply)) => {
+                    Some(Command::Enqueue(options, priority, admission, reply)) => {
                         let options = *options;
+                        if let Some(hashes) = &admission {
+                            if store.is_none() { let _ = reply.send(Err(ManagerError::NotDurable)); continue; }
+                            if let Some(receipt) = ledger.receipts.iter().find(|receipt| receipt.key_hash == hashes.key) {
+                                let result = if receipt.payload_hash != hashes.payload { Err(ManagerError::IdempotencyConflict) }
+                                    else if receipt.removed { Err(ManagerError::PreviouslyRemoved) }
+                                    else { Ok(receipt.job_id) };
+                                let _ = reply.send(result); continue;
+                            }
+                            if ledger.receipts.len() >= MAX_RECEIPTS { let _ = reply.send(Err(ManagerError::ReceiptCapacity)); continue; }
+                        }
                         if jobs.len() >= config.max_jobs { let _ = reply.send(Err(ManagerError::Capacity)); continue; }
                         let origin = match origin(&options) { Ok(origin) => origin, Err(error) => { let _ = reply.send(Err(error)); continue; } };
                         let path = options.job_dir.clone();
@@ -880,12 +1007,13 @@ async fn run(
                             Err(_) => { let _ = reply.send(Err(ManagerError::WorkerFailed)); continue; }
                         };
                         if jobs.iter().any(|(_, job)| job.key == key) { let _ = reply.send(Err(ManagerError::DuplicateJob)); continue; }
-                        let Some(next) = last_id.checked_add(1) else { let _ = reply.send(Err(ManagerError::Capacity)); continue; };
-                        last_id = next;
+                        let Some(next) = ledger.last_id.checked_add(1) else { let _ = reply.send(Err(ManagerError::Capacity)); continue; };
+                        ledger.last_id = next;
                         let id = JobId(next);
                         let control = match TrafficControl::with_global(global.clone(), options.bytes_per_second) { Ok(control) => control, Err(_) => { let _ = reply.send(Err(ManagerError::InvalidOptions)); continue; } };
                         jobs.push((id, Job { options, origin, priority, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None, attempts: 0, retry_at: None, control }));
                         queue.push_back(id);
+                        if let Some(hashes) = admission { ledger.receipts.push(Receipt { key_hash: hashes.key, payload_hash: hashes.payload, job_id: id, removed: false }); }
                         acknowledgements.push(Acknowledge::Enqueued(reply, id));
                         dirty = true;
                     }
@@ -957,6 +1085,193 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_fingerprint_covers_every_option_and_uses_separate_key_domain() {
+        let base = options();
+        let original = admission_hashes("source:request-1", &base, Priority::Normal).unwrap();
+        let mut variants = Vec::new();
+        macro_rules! changed {
+            ($field:ident, $value:expr) => {{
+                let mut value = base.clone();
+                value.$field = $value;
+                variants.push(value);
+            }};
+        }
+        changed!(url, "https://example.com/other".into());
+        changed!(job_dir, base.job_dir.with_file_name("other-job"));
+        changed!(output_name, "other.bin".into());
+        changed!(expected_sha256, Some([7; 32]));
+        changed!(allow_http, true);
+        changed!(checkpoint_bytes, 2048);
+        changed!(max_download_bytes, 2048);
+        changed!(bytes_per_second, Some(512));
+        changed!(parallel_connections, 2);
+        changed!(refresh_from, Some([9; 32]));
+        for policy in [
+            crate::RequestPolicy::new(Some("Bearer one".into()), None, vec![]).unwrap(),
+            crate::RequestPolicy::new(None, Some("session=one".into()), vec![]).unwrap(),
+            crate::RequestPolicy::new(None, None, vec!["https://other.example".into()]).unwrap(),
+        ] {
+            changed!(request_policy, policy);
+        }
+        for variant in variants {
+            assert_ne!(
+                original.payload,
+                admission_hashes("source:request-1", &variant, Priority::Normal)
+                    .unwrap()
+                    .payload
+            );
+        }
+        assert_ne!(
+            original.payload,
+            admission_hashes("source:request-1", &base, Priority::High)
+                .unwrap()
+                .payload
+        );
+        let other_key = admission_hashes("source:request-2", &base, Priority::Normal).unwrap();
+        assert_ne!(original.key, other_key.key);
+        assert_eq!(original.payload, other_key.payload);
+        assert_ne!(original.key, original.payload);
+        let mut same_url = base.clone();
+        same_url.url = "https://EXAMPLE.com:443/private?secret=DO_NOT_DISCLOSE".into();
+        assert_eq!(
+            original.payload,
+            admission_hashes("source:request-1", &same_url, Priority::Normal)
+                .unwrap()
+                .payload
+        );
+        for invalid in [
+            "".to_owned(),
+            "x".repeat(129),
+            "has space".into(),
+            "has\nnewline".into(),
+            "غيرascii".into(),
+        ] {
+            assert!(matches!(
+                admission_hashes(&invalid, &base, Priority::Normal),
+                Err(ManagerError::InvalidIdempotencyKey)
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    fn admission_directory(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "fhd-admission-unit-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn lost_reply_still_commits_one_durable_receipt() {
+        let root = admission_directory("lost-reply");
+        let mut input = options();
+        input.url = "http://127.0.0.1:1/unreachable".into();
+        input.allow_http = true;
+        input.job_dir = root.join("job");
+        let manager = Manager::open(root.join("queue"), Config::default())
+            .await
+            .unwrap();
+        let hashes = admission_hashes("source:lost-ack", &input, Priority::Normal).unwrap();
+        let (reply, abandoned) = oneshot::channel();
+        drop(abandoned); // The caller is gone before the actor sees this command.
+        assert!(manager
+            .commands
+            .as_ref()
+            .unwrap()
+            .send(Command::Enqueue(
+                Box::new(input.clone()),
+                Priority::Normal,
+                Some(hashes),
+                reply
+            ))
+            .await
+            .is_ok());
+        manager.set_global_rate(None).await.unwrap(); // FIFO barrier after commit.
+        let id = manager
+            .enqueue_once("source:lost-ack".into(), input.clone(), Priority::Normal)
+            .await
+            .unwrap();
+        assert_eq!(id, JobId(1));
+        manager.shutdown().await.unwrap();
+        let reopened = Manager::open(root.join("queue"), Config::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .enqueue_once("source:lost-ack".into(), input, Priority::Normal)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(reopened.subscribe().borrow().len(), 1);
+        reopened.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn full_receipt_ledger_rejects_new_keys_without_evicting_tombstones() {
+        let root = admission_directory("full-ledger");
+        let mut input = options();
+        input.job_dir = root.join("job");
+        let mut receipts = Vec::new();
+        for index in 0..MAX_RECEIPTS {
+            let hashes =
+                admission_hashes(&format!("source:old-{index}"), &input, Priority::Normal).unwrap();
+            receipts.push(Receipt {
+                key_hash: hashes.key,
+                payload_hash: hashes.payload,
+                job_id: JobId(index as u64 + 1),
+                removed: true,
+            });
+        }
+        let path = root.join("queue");
+        let saved_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = QueueStore::open(&saved_path).unwrap();
+            store
+                .save(&Snapshot {
+                    last_id: MAX_RECEIPTS as u64,
+                    receipts,
+                    config: Config::default(),
+                    jobs: vec![],
+                    queue: vec![],
+                })
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let manager = Manager::open(path, Config::default()).await.unwrap();
+        assert_eq!(
+            manager
+                .enqueue_once("source:new".into(), input.clone(), Priority::Normal)
+                .await,
+            Err(ManagerError::ReceiptCapacity)
+        );
+        assert_eq!(
+            manager
+                .enqueue_once("source:old-0".into(), input, Priority::Normal)
+                .await,
+            Err(ManagerError::PreviouslyRemoved)
+        );
+        assert!(manager.subscribe().borrow().is_empty());
+        manager.shutdown().await.unwrap();
+        let store = QueueStore::open(&root.join("queue")).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().receipts.len(), MAX_RECEIPTS);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn options() -> Options {
         Options {
