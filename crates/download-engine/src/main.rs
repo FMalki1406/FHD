@@ -14,9 +14,17 @@ fn arguments() -> Result<Options, &'static str> {
     let mut expected_sha256 = None;
     let mut max_download_bytes = 100 * 1024 * 1024 * 1024;
     let mut bytes_per_second = None;
+    let mut parallel_connections = 1;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-http" => allow_http = true,
+            "--connections" => {
+                parallel_connections = args
+                    .next()
+                    .ok_or("missing connection count")?
+                    .parse()
+                    .map_err(|_| "invalid connection count")?;
+            }
             "--bytes-per-second" => {
                 bytes_per_second = Some(
                     args.next()
@@ -74,6 +82,7 @@ fn arguments() -> Result<Options, &'static str> {
         checkpoint_bytes,
         max_download_bytes,
         bytes_per_second,
+        parallel_connections,
     })
 }
 

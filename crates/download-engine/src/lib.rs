@@ -12,7 +12,10 @@ use tokio::sync::watch;
 use transfer_store::{url_fingerprint, Identity, Status, Store, StoreError};
 
 pub mod manager;
+mod parallel;
+mod queue_store;
 mod rate;
+pub use rate::{Bandwidth, TrafficControl};
 
 #[derive(Clone)]
 pub struct Options {
@@ -27,6 +30,8 @@ pub struct Options {
     /// Per-transfer response-body consumption cap; None means unlimited.
     /// Network/TLS/OS buffers can read ahead. This is not an exact wire cap.
     pub bytes_per_second: Option<u64>,
+    /// Bounded range workers per file, 1..=8.
+    pub parallel_connections: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +43,8 @@ pub enum Error {
     RedirectOriginChange,
     Network,
     HttpStatus(u16),
+    /// Server requested a cooldown; automatic retry requires an explicit policy.
+    ServerBackoff(u16),
     InvalidHeaders,
     RepresentationChanged,
     ResumeUnsupported,
@@ -250,11 +257,24 @@ async fn request(
 /// verification/publication is a non-cancellable commit once its worker starts.
 pub async fn download(
     options: Options,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     on_checkpoint: impl Fn(u64),
 ) -> Result<Outcome, Error> {
-    let pacing = rate::BodyPacing::new(options.bytes_per_second)?;
-    if options.checkpoint_bytes == 0
+    let pacing = TrafficControl::new(options.bytes_per_second)?;
+    download_controlled(options, cancel, pacing, on_checkpoint).await
+}
+
+/// Supplied traffic control is authoritative and may be updated during transfer.
+/// The options rate is still validated; it initializes only the `download` wrapper.
+pub async fn download_controlled(
+    options: Options,
+    mut cancel: watch::Receiver<bool>,
+    pacing: TrafficControl,
+    on_checkpoint: impl Fn(u64),
+) -> Result<Outcome, Error> {
+    if !rate::valid_limit(options.bytes_per_second)
+        || !(1..=8).contains(&options.parallel_connections)
+        || options.checkpoint_bytes == 0
         || options.checkpoint_bytes > 64 * 1024 * 1024
         || options.max_download_bytes == 0
         || options.max_download_bytes > i64::MAX as u64
@@ -343,7 +363,7 @@ pub async fn download(
     } else {
         None
     };
-    let mut response = request(
+    let response = request(
         &client,
         original.clone(),
         range,
@@ -351,6 +371,12 @@ pub async fn download(
         &mut cancel,
     )
     .await?;
+    if !matches!(response.status().as_u16(), 200 | 206) {
+        if response.headers().contains_key(header::RETRY_AFTER) {
+            return Err(Error::ServerBackoff(response.status().as_u16()));
+        }
+        return Err(Error::HttpStatus(response.status().as_u16()));
+    }
     validate_representation(response.headers())?;
     let final_url_fingerprint = url_fingerprint(response.url().as_str());
     let mut job = Download::new(DownloadId(1)); // Owned locally; no cross-task event channel exists here.
@@ -446,7 +472,30 @@ pub async fn download(
     event(&mut job, Event::ProbeSucceeded)?;
     let mut store = existing.take().ok_or(Error::Storage)?;
     let mut received = start;
-    loop {
+    let use_parallel = options.parallel_connections > 1
+        && total - start > parallel::RANGE_BYTES
+        && store.identity().strong_etag.is_some();
+    let mut response = Some(response);
+    if use_parallel {
+        let result = parallel::transfer(
+            parallel::Plan {
+                client: client.clone(),
+                url: original.clone(),
+                allow_http: options.allow_http,
+                connections: options.parallel_connections,
+                checkpoint_bytes: options.checkpoint_bytes,
+                pacing: pacing.clone(),
+            },
+            store,
+            &mut response,
+            &mut cancel,
+            &on_checkpoint,
+        )
+        .await?;
+        store = result;
+        received = store.len();
+    }
+    while let Some(response) = response.as_mut() {
         let next = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => Err(Error::Cancelled),
@@ -476,23 +525,18 @@ pub async fn download(
         }
         // Bound each disk operation and copied buffer; no whole-file accumulation.
         for bytes in chunk.chunks(pacing.slice_bytes()) {
-            let pacing_cancelled = if let Some(delay) = pacing.delay(bytes.len() as u32) {
-                tokio::select! {
-                    biased;
-                    _ = cancelled(&mut cancel) => true,
-                    _ = tokio::time::sleep(delay) => false,
-                }
-            } else {
-                false
-            };
-            if pacing_cancelled || is_cancelled(&cancel) {
+            let paced = pacing.consume(bytes.len() as u32, &mut cancel).await;
+            if let Some(error) = paced
+                .err()
+                .or_else(|| is_cancelled(&cancel).then_some(Error::Cancelled))
+            {
                 let committed = disk(move || {
                     store.checkpoint()?;
                     Ok(store.committed_len())
                 })
                 .await?;
                 on_checkpoint(committed);
-                return Err(Error::Cancelled);
+                return Err(error);
             }
             let owned = bytes.to_vec();
             let threshold = options.checkpoint_bytes;
@@ -574,6 +618,7 @@ mod tests {
             checkpoint_bytes: 1024,
             max_download_bytes: 1024,
             bytes_per_second: None,
+            parallel_connections: 1,
         };
         let (sender, cancel) = watch::channel(false);
         for opts in [

@@ -218,3 +218,14 @@ test('engine retains the original output binding after a task has completed', as
   assert.deepEqual(await readFile(output), expected);
   await assertNoOutput(path.join(directory, 'different.bin'));
 });
+
+test('engine validates connection bounds and accepts parallel fallback for small files', async t => {
+  const { directory, lab, output } = await setup(t);
+  for (const count of ['0', '9']) {
+    const result = await transfer(directory, `${lab.url}/file`, { extraArgs: ['--connections', count] });
+    assert.equal(result.code, 2);
+    await assert.rejects(stat(directory), { code: 'ENOENT' });
+  }
+  assertComplete(await transfer(directory, `${lab.url}/file`, { extraArgs: ['--connections', '4'] }), false);
+  assert.deepEqual(await readFile(output), expected);
+});

@@ -195,10 +195,14 @@ name = "download-engine"
 version = "0.1.0"
 dependencies = [
  "download-core",
+ "queue-secrets",
  "reqwest",
  "resume-policy",
+ "rusqlite",
+ "sha2",
  "tokio",
  "transfer-store",
+ "zeroize",
 ]
 
 [[package]]
@@ -781,6 +785,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "queue-secrets"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

@@ -109,6 +109,7 @@ impl Server {
             checkpoint_bytes: PREFIX as u64,
             max_download_bytes: TOTAL as u64,
             bytes_per_second: None,
+            parallel_connections: 1,
         }
     }
 }

@@ -4,7 +4,7 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -21,9 +21,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new(bytes: Vec<u8>) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "fhd-rate-{}-{}",
+            "fhd-rate-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -92,6 +94,7 @@ impl Fixture {
             checkpoint_bytes: checkpoint,
             max_download_bytes: 1024 * 1024,
             bytes_per_second: Some(rate),
+            parallel_connections: 1,
         }
     }
 }
@@ -173,4 +176,52 @@ async fn intentional_pacing_longer_than_network_timeout_still_completes() {
     assert!(started.elapsed() >= Duration::from_secs(32));
     assert_eq!(std::fs::read(result.path).unwrap(), bytes);
     drop(owner);
+}
+
+#[tokio::test]
+async fn aggregate_limit_covers_two_real_downloads() {
+    use download_engine::{download_controlled, Bandwidth, TrafficControl};
+    let bytes = vec![b'g'; 8192];
+    let a = Fixture::new(bytes.clone());
+    let b = Fixture::new(bytes.clone());
+    let budget = Bandwidth::new(Some(8192)).unwrap();
+    let ca = TrafficControl::with_global(budget.clone(), None).unwrap();
+    let cb = TrafficControl::with_global(budget, None).unwrap();
+    let (owner, cancel) = watch::channel(false);
+    let start = Instant::now();
+    let (ra, rb) = tokio::join!(
+        download_controlled(a.options(8192, 1024), cancel.clone(), ca, |_| {}),
+        download_controlled(b.options(8192, 1024), cancel, cb, |_| {})
+    );
+    assert!(start.elapsed() >= Duration::from_millis(1900));
+    assert_eq!(std::fs::read(ra.unwrap().path).unwrap(), bytes);
+    assert_eq!(std::fs::read(rb.unwrap().path).unwrap(), bytes);
+    drop(owner);
+}
+
+#[tokio::test]
+async fn active_download_observes_live_job_and_global_changes() {
+    use download_engine::{download_controlled, Bandwidth, TrafficControl};
+    for global_slow in [false, true] {
+        let fixture = Fixture::new(b"live-rate".to_vec());
+        let budget = Bandwidth::new(if global_slow { Some(1) } else { None }).unwrap();
+        let control =
+            TrafficControl::with_global(budget.clone(), if global_slow { None } else { Some(1) })
+                .unwrap();
+        let update = control.clone();
+        let changer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            update.set_job_rate(None).unwrap();
+            budget.set_limit(None).unwrap();
+        });
+        let (owner, cancel) = watch::channel(false);
+        let start = Instant::now();
+        let result = download_controlled(fixture.options(1, 1), cancel, control, |_| {})
+            .await
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(std::fs::read(result.path).unwrap(), b"live-rate");
+        changer.await.unwrap();
+        drop(owner);
+    }
 }

@@ -8,6 +8,10 @@ publish = false
 download-core = { path = "../download-core" }
 resume-policy = { path = "../resume-policy" }
 transfer-store = { path = "../transfer-store" }
+queue-secrets = { path = "../queue-secrets" }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+sha2 = "=0.11.0"
+zeroize = "=1.9.0"
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2"] }
 tokio = { version = "=1.51.4", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 

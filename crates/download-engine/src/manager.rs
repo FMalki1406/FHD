@@ -1,7 +1,8 @@
 //! Bounded, process-local ownership of transfers. Call `shutdown` before stopping
 //! the Tokio runtime; dropping the handle requests cancellation but cannot await it.
 
-use crate::{download, Error, Options, Outcome};
+use crate::queue_store::{QueueStore, SavedJob, Snapshot};
+use crate::{download_controlled, Bandwidth, Error, Options, Outcome, TrafficControl};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Component, PathBuf},
@@ -59,6 +60,7 @@ pub enum State {
     Paused,
     Completed,
     Failed(Error),
+    RetryWaiting,
 }
 
 /// Deliberately excludes URLs, filenames, paths and response headers.
@@ -68,6 +70,9 @@ pub struct JobSnapshot {
     pub priority: Priority,
     pub state: State,
     pub committed_bytes: u64,
+    pub attempts: u8,
+    pub bytes_per_second: Option<u64>,
+    pub parallel_connections: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +87,9 @@ pub enum ManagerError {
     UnknownJob,
     InvalidTransition,
     WorkerFailed,
+    Persistence,
+    SecretStorage,
+    QueueLocked,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -91,12 +99,82 @@ impl std::fmt::Display for ManagerError {
 }
 impl std::error::Error for ManagerError {}
 
+/// The first request counts as an attempt; retry delays release worker slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_attempts: u8,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            max_delay_ms: 30_000,
+        }
+    }
+}
+impl RetryPolicy {
+    pub fn disabled() -> Self {
+        Self {
+            max_attempts: 1,
+            ..Self::default()
+        }
+    }
+    fn delay(self, attempts: u8) -> Duration {
+        Duration::from_millis(
+            self.initial_delay_ms
+                .saturating_mul(1u64 << attempts.saturating_sub(1).min(4))
+                .min(self.max_delay_ms),
+        )
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub max_active: usize,
+    pub max_jobs: usize,
+    pub max_per_origin: usize,
+    pub retry: RetryPolicy,
+    pub global_bytes_per_second: Option<u64>,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_active: 3,
+            max_jobs: 1024,
+            max_per_origin: 2,
+            retry: RetryPolicy::default(),
+            global_bytes_per_second: None,
+        }
+    }
+}
+impl Config {
+    pub(crate) fn validate(&self) -> Result<(), ManagerError> {
+        if !(1..=32).contains(&self.max_active)
+            || !(1..=1024).contains(&self.max_jobs)
+            || self.max_active > self.max_jobs
+            || !(1..=self.max_active).contains(&self.max_per_origin)
+            || !(1..=5).contains(&self.retry.max_attempts)
+            || !(100..=60_000).contains(&self.retry.initial_delay_ms)
+            || !(self.retry.initial_delay_ms..=300_000).contains(&self.retry.max_delay_ms)
+            || !crate::rate::valid_limit(self.global_bytes_per_second)
+        {
+            return Err(ManagerError::InvalidLimits);
+        }
+        Ok(())
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, ManagerError>>;
 enum Command {
     Enqueue(Options, Priority, Reply<JobId>),
     SetPriority(JobId, Priority, Reply<()>),
     Pause(JobId, Reply<()>),
     Resume(JobId, Reply<()>),
+    GlobalRate(Option<u64>, Reply<()>),
+    JobRate(JobId, Option<u64>, Reply<()>),
+    ResumeAll(Reply<()>),
 }
 
 /// One owner; command methods may be used concurrently through shared references.
@@ -104,7 +182,7 @@ enum Command {
 pub struct Manager {
     commands: Option<mpsc::Sender<Command>>,
     snapshots: watch::Receiver<Vec<JobSnapshot>>,
-    actor: Option<JoinHandle<()>>,
+    actor: Option<JoinHandle<Result<(), ManagerError>>>,
 }
 
 impl Manager {
@@ -119,22 +197,159 @@ impl Manager {
         max_jobs: usize,
         max_per_origin: usize,
     ) -> Result<Self, ManagerError> {
-        if !(1..=32).contains(&max_active)
-            || !(1..=1024).contains(&max_jobs)
-            || max_active > max_jobs
-            || !(1..=max_active).contains(&max_per_origin)
-        {
-            return Err(ManagerError::InvalidLimits);
-        }
+        Self::start_configured(Config {
+            max_active,
+            max_jobs,
+            max_per_origin,
+            retry: RetryPolicy::disabled(),
+            global_bytes_per_second: None,
+        })
+    }
+
+    pub fn start_configured(config: Config) -> Result<Self, ManagerError> {
+        config.validate()?;
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| ManagerError::NoRuntime)?;
+        Self::launch(runtime, config, Vec::new(), None)
+    }
+
+    /// Opens an encrypted Windows user-scoped queue. Existing settings prevail;
+    /// nonterminal jobs recover paused and require explicit resume.
+    pub async fn open(path: PathBuf, config: Config) -> Result<Self, ManagerError> {
+        config.validate()?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| ManagerError::NoRuntime)?;
+        let (store, saved) = tokio::task::spawn_blocking(move || {
+            let mut store = QueueStore::open(&path)?;
+            let saved = match store.load()? {
+                Some(saved) => saved,
+                None => {
+                    let saved = Snapshot {
+                        config,
+                        jobs: vec![],
+                        queue: vec![],
+                    };
+                    store.save(&saved)?;
+                    saved
+                }
+            };
+            Ok::<_, ManagerError>((store, saved))
+        })
+        .await
+        .map_err(|_| ManagerError::WorkerFailed)??;
+        let config = saved.config;
+        let global = Bandwidth::new(config.global_bytes_per_second)
+            .map_err(|_| ManagerError::InvalidLimits)?;
+        let mut jobs: Vec<(JobId, Job)> = Vec::new();
+        for saved in saved.jobs {
+            validate_options(&saved.options)?;
+            let path = saved.options.job_dir.clone();
+            let key = tokio::task::spawn_blocking(move || path_key(path))
+                .await
+                .map_err(|_| ManagerError::WorkerFailed)??;
+            if jobs.iter().any(|(_, job)| job.key == key) {
+                return Err(ManagerError::DuplicateJob);
+            }
+            let control =
+                TrafficControl::with_global(global.clone(), saved.options.bytes_per_second)
+                    .map_err(|_| ManagerError::InvalidOptions)?;
+            let state = match saved.state {
+                State::Completed | State::Failed(_) | State::Paused => saved.state,
+                _ => State::Paused,
+            };
+            jobs.push((
+                saved.id,
+                Job {
+                    origin: origin(&saved.options)?,
+                    options: saved.options,
+                    priority: saved.priority,
+                    key,
+                    state,
+                    progress: Arc::new(AtomicU64::new(saved.progress)),
+                    cancel: None,
+                    pause_reply: None,
+                    attempts: saved.attempts,
+                    retry_at: None,
+                    control,
+                },
+            ));
+        }
+        // Queue rank is retained even though recovery requires explicit resume.
+        jobs.sort_by_key(|(id, _)| {
+            saved
+                .queue
+                .iter()
+                .position(|queued| queued == id)
+                .unwrap_or(usize::MAX)
+        });
+        Self::launch_with_global(runtime, config, jobs, Some(store), global)
+    }
+
+    fn launch(
+        runtime: tokio::runtime::Handle,
+        config: Config,
+        jobs: Vec<(JobId, Job)>,
+        store: Option<QueueStore>,
+    ) -> Result<Self, ManagerError> {
+        let global = Bandwidth::new(config.global_bytes_per_second)
+            .map_err(|_| ManagerError::InvalidLimits)?;
+        Self::launch_with_global(runtime, config, jobs, store, global)
+    }
+
+    fn launch_with_global(
+        runtime: tokio::runtime::Handle,
+        config: Config,
+        jobs: Vec<(JobId, Job)>,
+        store: Option<QueueStore>,
+        global: Bandwidth,
+    ) -> Result<Self, ManagerError> {
         let (commands, receiver) = mpsc::channel(64);
         let (updates, snapshots) = watch::channel(Vec::new());
-        let actor = runtime.spawn(run(receiver, updates, max_active, max_jobs, max_per_origin));
+        publish(&jobs, &updates);
+        let actor = runtime.spawn(run(receiver, updates, config, jobs, store, global));
         Ok(Self {
             commands: Some(commands),
             snapshots,
             actor: Some(actor),
         })
+    }
+
+    pub async fn set_global_rate(&self, rate: Option<u64>) -> Result<(), ManagerError> {
+        if !crate::rate::valid_limit(rate) {
+            return Err(ManagerError::InvalidOptions);
+        }
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::GlobalRate(rate, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
+    pub async fn set_job_rate(&self, id: JobId, rate: Option<u64>) -> Result<(), ManagerError> {
+        if !crate::rate::valid_limit(rate) {
+            return Err(ManagerError::InvalidOptions);
+        }
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::JobRate(id, rate, reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
+    }
+
+    /// Resumes all paused/failed jobs atomically, retaining recovered queue order.
+    pub async fn resume_all(&self) -> Result<(), ManagerError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ManagerError::Closed)?
+            .send(Command::ResumeAll(reply))
+            .await
+            .map_err(|_| ManagerError::Closed)?;
+        result.await.map_err(|_| ManagerError::Closed)?
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Vec<JobSnapshot>> {
@@ -204,7 +419,7 @@ impl Manager {
     pub async fn shutdown(mut self) -> Result<(), ManagerError> {
         self.commands.take();
         if let Some(actor) = self.actor.take() {
-            actor.await.map_err(|_| ManagerError::WorkerFailed)?;
+            actor.await.map_err(|_| ManagerError::WorkerFailed)??;
         }
         Ok(())
     }
@@ -219,6 +434,9 @@ struct Job {
     progress: Arc<AtomicU64>,
     cancel: Option<watch::Sender<bool>>,
     pause_reply: Option<Reply<()>>,
+    attempts: u8,
+    retry_at: Option<tokio::time::Instant>,
+    control: TrafficControl,
 }
 
 fn validate_options(options: &Options) -> Result<(), ManagerError> {
@@ -230,6 +448,7 @@ fn validate_options(options: &Options) -> Result<(), ManagerError> {
         || options.checkpoint_bytes > 64 * 1024 * 1024
         || options.max_download_bytes == 0
         || options.max_download_bytes > i64::MAX as u64
+        || !(1..=8).contains(&options.parallel_connections)
         || !crate::rate::valid_limit(options.bytes_per_second)
         || crate::parse_url(&options.url, options.allow_http).is_err()
     {
@@ -299,6 +518,9 @@ fn publish(jobs: &[(JobId, Job)], updates: &watch::Sender<Vec<JobSnapshot>>) {
             priority: job.priority,
             state: job.state.clone(),
             committed_bytes: job.progress.load(Ordering::Relaxed),
+            attempts: job.attempts,
+            bytes_per_second: job.options.bytes_per_second,
+            parallel_connections: job.options.parallel_connections,
         })
         .collect();
     updates.send_if_modified(|current| {
@@ -312,10 +534,14 @@ fn publish(jobs: &[(JobId, Job)], updates: &watch::Sender<Vec<JobSnapshot>>) {
 }
 
 fn stop(jobs: &mut [(JobId, Job)], queue: &mut VecDeque<JobId>) {
-    queue.clear();
+    // Retain queued ordering for an explicit resume-all after reopening.
+    let _ = queue;
     for (_, job) in jobs {
         match job.state {
-            State::Queued => job.state = State::Paused,
+            State::Queued | State::RetryWaiting => {
+                job.state = State::Paused;
+                job.retry_at = None;
+            }
             State::Running => {
                 job.state = State::Pausing;
                 if let Some(cancel) = &job.cancel {
@@ -371,29 +597,122 @@ fn next_eligible(
     selected
 }
 
+fn retryable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Network | Error::HttpStatus(408 | 500 | 502 | 503 | 504)
+    )
+}
+
+async fn save_state(
+    store: &mut Option<QueueStore>,
+    jobs: &[(JobId, Job)],
+    queue: &VecDeque<JobId>,
+    config: &Config,
+) -> Result<(), ManagerError> {
+    let Some(mut owned) = store.take() else {
+        return Ok(());
+    };
+    let snapshot = Snapshot {
+        config: config.clone(),
+        jobs: jobs
+            .iter()
+            .map(|(id, job)| SavedJob {
+                id: *id,
+                options: job.options.clone(),
+                priority: job.priority,
+                state: job.state.clone(),
+                progress: job.progress.load(Ordering::Relaxed),
+                attempts: job.attempts,
+            })
+            .collect(),
+        queue: queue.iter().copied().collect(),
+    };
+    let (owned, result) = tokio::task::spawn_blocking(move || {
+        let result = owned.save(&snapshot);
+        (owned, result)
+    })
+    .await
+    .map_err(|_| ManagerError::WorkerFailed)?;
+    *store = Some(owned);
+    result
+}
+
+enum Acknowledge {
+    Unit(Reply<()>),
+    Enqueued(Reply<JobId>, JobId),
+}
+impl Acknowledge {
+    fn send(self, result: Result<(), ManagerError>) {
+        match self {
+            Self::Unit(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Enqueued(reply, id) => {
+                let _ = reply.send(result.map(|()| id));
+            }
+        }
+    }
+}
+
 async fn run(
     mut commands: mpsc::Receiver<Command>,
     updates: watch::Sender<Vec<JobSnapshot>>,
-    max_active: usize,
-    max_jobs: usize,
-    max_per_origin: usize,
-) {
-    let mut jobs: Vec<(JobId, Job)> = Vec::new();
-    let mut queue = VecDeque::new();
+    mut config: Config,
+    mut jobs: Vec<(JobId, Job)>,
+    mut store: Option<QueueStore>,
+    global: Bandwidth,
+) -> Result<(), ManagerError> {
+    let mut queue: VecDeque<_> = jobs.iter().map(|(id, _)| *id).collect();
     let mut workers: JoinSet<Result<Outcome, Error>> = JoinSet::new();
     let mut owners: HashMap<Id, JobId> = HashMap::new();
     let mut closing = false;
+    let mut failure = None;
+    let mut dirty = true;
+    let mut acknowledgements = Vec::<Acknowledge>::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        // Detect dropped ownership before scheduling another queued job.
         if commands.is_closed() && !closing {
             closing = true;
             commands.close();
             stop(&mut jobs, &mut queue);
+            dirty = true;
         }
-        while !closing && workers.len() < max_active {
-            let Some(index) = next_eligible(&jobs, &queue, max_per_origin) else {
+        if !closing {
+            for (id, job) in &mut jobs {
+                if job.state == State::RetryWaiting
+                    && job
+                        .retry_at
+                        .is_some_and(|at| at <= tokio::time::Instant::now())
+                {
+                    job.state = State::Queued;
+                    job.retry_at = None;
+                    queue.push_back(*id);
+                    dirty = true;
+                }
+            }
+        }
+        if dirty && failure.is_none() {
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+                failure = Some(error);
+                closing = true;
+                commands.close();
+                stop(&mut jobs, &mut queue);
+            } else {
+                // Settings become live only after the durable commit.
+                let _ = global.set_limit(config.global_bytes_per_second);
+                for (_, job) in &jobs {
+                    let _ = job.control.set_job_rate(job.options.bytes_per_second);
+                }
+            }
+            dirty = false;
+        }
+        for ack in acknowledgements.drain(..) {
+            ack.send(failure.map_or(Ok(()), Err));
+        }
+        while !closing && workers.len() < config.max_active {
+            let Some(index) = next_eligible(&jobs, &queue, config.max_per_origin) else {
                 break;
             };
             let Some(id) = queue.remove(index) else {
@@ -405,13 +724,38 @@ async fn run(
             if job.state != State::Queued {
                 continue;
             }
+            job.state = State::Running;
+            job.attempts = job.attempts.saturating_add(1);
+            if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+                failure = Some(error);
+                closing = true;
+                commands.close();
+                stop(&mut jobs, &mut queue);
+                // No worker exists for this just-prepared task.
+                if let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) {
+                    job.state = State::Paused;
+                }
+                break;
+            }
+            if commands.is_closed() {
+                closing = true;
+                stop(&mut jobs, &mut queue);
+                dirty = true;
+                if let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) {
+                    job.state = State::Paused;
+                }
+                break;
+            }
+            let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else {
+                continue;
+            };
             let options = job.options.clone();
             let progress = Arc::clone(&job.progress);
+            let control = job.control.clone();
             let (cancel, receiver) = watch::channel(false);
             job.cancel = Some(cancel);
-            job.state = State::Running;
             let handle = workers.spawn(async move {
-                download(options, receiver, |bytes| {
+                download_controlled(options, receiver, control, |bytes| {
                     progress.store(bytes, Ordering::Relaxed);
                 })
                 .await
@@ -420,6 +764,11 @@ async fn run(
         }
         publish(&jobs, &updates);
         if closing && workers.is_empty() {
+            if dirty && failure.is_none() {
+                if let Err(error) = save_state(&mut store, &jobs, &queue, &config).await {
+                    failure = Some(error);
+                }
+            }
             break;
         }
         tokio::select! {
@@ -431,83 +780,104 @@ async fn run(
                 };
                 if let Some(id) = owners.remove(&task) {
                     if let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) {
+                        let retry = !closing && job.state == State::Running && job.attempts < config.retry.max_attempts && result.as_ref().is_err_and(retryable);
                         finish(job, result);
-                        publish(&jobs, &updates);
-                        if let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) {
-                            if let Some(reply) = job.pause_reply.take() {
-                                let result = if matches!(job.state, State::Failed(_)) { Err(ManagerError::WorkerFailed) } else { Ok(()) };
-                                let _ = reply.send(result);
-                            }
+                        if retry {
+                            job.state = State::RetryWaiting;
+                            job.retry_at = Some(tokio::time::Instant::now() + config.retry.delay(job.attempts));
                         }
+                        if let Some(reply) = job.pause_reply.take() {
+                            if matches!(job.state, State::Failed(_)) { let _ = reply.send(Err(ManagerError::WorkerFailed)); }
+                            else { acknowledgements.push(Acknowledge::Unit(reply)); }
+                        }
+                        dirty = true;
                     }
                 }
             }
             command = commands.recv(), if !closing => {
                 match command {
-                    None => { closing = true; stop(&mut jobs, &mut queue); }
+                    None => { closing = true; stop(&mut jobs, &mut queue); dirty = true; }
                     Some(Command::Enqueue(options, priority, reply)) => {
-                        if jobs.len() >= max_jobs { let _ = reply.send(Err(ManagerError::Capacity)); continue; }
-                        let origin = match origin(&options) {
-                            Ok(origin) => origin,
-                            Err(error) => { let _ = reply.send(Err(error)); continue; }
-                        };
+                        if jobs.len() >= config.max_jobs { let _ = reply.send(Err(ManagerError::Capacity)); continue; }
+                        let origin = match origin(&options) { Ok(origin) => origin, Err(error) => { let _ = reply.send(Err(error)); continue; } };
                         let path = options.job_dir.clone();
-                        let key = tokio::task::spawn_blocking(move || path_key(path)).await;
-                        let key = match key {
+                        let key = match tokio::task::spawn_blocking(move || path_key(path)).await {
                             Ok(Ok(key)) => key,
                             Ok(Err(error)) => { let _ = reply.send(Err(error)); continue; }
                             Err(_) => { let _ = reply.send(Err(ManagerError::WorkerFailed)); continue; }
                         };
-                        if jobs.iter().any(|(_, job)| job.key == key) {
-                            let _ = reply.send(Err(ManagerError::DuplicateJob)); continue;
-                        }
-                        let id = JobId(jobs.len() as u64 + 1);
-                        jobs.push((id, Job { options, origin, priority, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None }));
+                        if jobs.iter().any(|(_, job)| job.key == key) { let _ = reply.send(Err(ManagerError::DuplicateJob)); continue; }
+                        let Some(next) = jobs.iter().map(|(id, _)| id.0).max().unwrap_or(0).checked_add(1) else { let _ = reply.send(Err(ManagerError::Capacity)); continue; };
+                        let id = JobId(next);
+                        let control = match TrafficControl::with_global(global.clone(), options.bytes_per_second) { Ok(control) => control, Err(_) => { let _ = reply.send(Err(ManagerError::InvalidOptions)); continue; } };
+                        jobs.push((id, Job { options, origin, priority, key, state: State::Queued, progress: Arc::new(AtomicU64::new(0)), cancel: None, pause_reply: None, attempts: 0, retry_at: None, control }));
                         queue.push_back(id);
-                        publish(&jobs, &updates);
-                        let _ = reply.send(Ok(id));
+                        acknowledgements.push(Acknowledge::Enqueued(reply, id));
+                        dirty = true;
                     }
                     Some(Command::SetPriority(id, priority, reply)) => {
                         let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
-                        if matches!(job.state, State::Queued | State::Paused | State::Failed(_)) {
+                        if matches!(job.state, State::Queued | State::Paused | State::Failed(_) | State::RetryWaiting) {
                             job.priority = priority;
-                            publish(&jobs, &updates);
-                            let _ = reply.send(Ok(()));
+                            acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
                         } else { let _ = reply.send(Err(ManagerError::InvalidTransition)); }
                     }
                     Some(Command::Pause(id, reply)) => {
                         let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
                         match job.state {
-                            State::Queued => {
-                                queue.retain(|key| *key != id);
-                                job.state = State::Paused;
-                                publish(&jobs, &updates);
-                                let _ = reply.send(Ok(()));
+                            State::Queued | State::RetryWaiting => {
+                                queue.retain(|key| *key != id); job.state = State::Paused; job.retry_at = None;
+                                acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
                             }
                             State::Running => {
-                                job.state = State::Pausing;
-                                job.pause_reply = Some(reply);
+                                job.state = State::Pausing; job.pause_reply = Some(reply);
                                 if let Some(cancel) = &job.cancel { cancel.send_replace(true); }
+                                dirty = true;
                             }
-                            State::Paused => { let _ = reply.send(Ok(())); }
+                            State::Paused => { acknowledgements.push(Acknowledge::Unit(reply)); dirty = true; }
                             _ => { let _ = reply.send(Err(ManagerError::InvalidTransition)); }
                         }
                     }
                     Some(Command::Resume(id, reply)) => {
                         let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
                         if matches!(job.state, State::Paused | State::Failed(_)) {
-                            job.state = State::Queued;
+                            job.state = State::Queued; job.attempts = 0; job.retry_at = None;
+                            queue.retain(|key| *key != id);
                             queue.push_back(id);
-                            publish(&jobs, &updates);
-                            let _ = reply.send(Ok(()));
+                            acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
                         } else { let _ = reply.send(Err(ManagerError::InvalidTransition)); }
+                    }
+                    Some(Command::ResumeAll(reply)) => {
+                        let mut ordered: Vec<JobId> = queue.iter().copied().collect();
+                        for (id, _) in &jobs { if !ordered.contains(id) { ordered.push(*id); } }
+                        for id in ordered {
+                            if let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) {
+                                if matches!(job.state, State::Paused | State::Failed(_)) {
+                                    job.state = State::Queued; job.attempts = 0; job.retry_at = None;
+                                    if !queue.contains(&id) { queue.push_back(id); }
+                                }
+                            }
+                        }
+                        acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
+                    }
+                    Some(Command::GlobalRate(rate, reply)) => {
+                        config.global_bytes_per_second = rate;
+                        acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
+                    }
+                    Some(Command::JobRate(id, rate, reply)) => {
+                        let Some((_, job)) = jobs.iter_mut().find(|(key, _)| *key == id) else { let _ = reply.send(Err(ManagerError::UnknownJob)); continue; };
+                        job.options.bytes_per_second = rate;
+                        acknowledgements.push(Acknowledge::Unit(reply)); dirty = true;
                     }
                 }
             }
             _ = tick.tick() => {}
         }
     }
+    // If a persistence failure occurred, callers get an error and every existing
+    // worker has still drained; the last successful snapshot remains authoritative.
     publish(&jobs, &updates);
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -524,6 +894,7 @@ mod tests {
             checkpoint_bytes: 1024,
             max_download_bytes: 1024,
             bytes_per_second: None,
+            parallel_connections: 1,
         }
     }
 
@@ -537,6 +908,9 @@ mod tests {
             progress: Arc::new(AtomicU64::new(0)),
             cancel: None,
             pause_reply: None,
+            attempts: 0,
+            retry_at: None,
+            control: TrafficControl::new(None).unwrap(),
         }
     }
 
