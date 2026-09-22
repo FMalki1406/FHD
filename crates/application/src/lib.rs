@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod storage;
 
-use fhd_domain::{Job, JobId, JobSpec};
+use fhd_domain::{ByteRange, Generation, Job, JobEvent, JobId, JobSpec};
 use std::{future::Future, pin::Pin};
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -151,6 +151,24 @@ pub enum CommitError {
     Conflict,
     Unavailable,
     Capacity,
+}
+
+/// Durable transfer state. Each call is one transaction; nothing is acknowledged
+/// before commit. Callers apply a domain change in memory only after its commit.
+pub trait TransferRepository: Send + Sync {
+    /// Stores `event.outcome()` only if the stored version, state and generation are
+    /// exactly what the event was decided against; otherwise `Conflict`.
+    fn commit_transition(&self, event: JobEvent) -> PortFuture<'_, Result<(), CommitError>>;
+    /// Records synced ranges of the current generation. Re-committing ranges that are
+    /// already durable is a no-op, so an ambiguous commit can be retried.
+    fn commit_extents(
+        &self,
+        job: JobId,
+        generation: Generation,
+        ranges: Vec<ByteRange>,
+    ) -> PortFuture<'_, Result<(), CommitError>>;
+    /// Every admitted job, rebuilt from durable state only.
+    fn load_jobs(&self) -> PortFuture<'_, Result<Vec<Job>, AppError>>;
 }
 
 pub trait JobRepository: Send + Sync {

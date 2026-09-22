@@ -1,5 +1,6 @@
 use crate::{
-    CommitBatch, DomainError, Generation, JobId, JobSpec, Lease, SegmentId, SegmentMap, SyncTicket,
+    ByteRange, CommitBatch, DomainError, Generation, JobId, JobSpec, Lease, SegmentId, SegmentMap,
+    SyncTicket,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobState {
@@ -140,6 +141,23 @@ impl JobEvent {
         self.outcome
     }
 }
+/// A job as a repository persists it. Only durable ranges survive; `Job::restore` validates.
+#[derive(Clone, Debug)]
+pub struct JobRecord {
+    pub id: JobId,
+    pub spec: JobSpec,
+    pub version: u64,
+    pub state: JobState,
+    pub generation: Generation,
+    pub reason: Option<StopReason>,
+    pub retry_at: Option<u64>,
+    pub stop: Option<StopTarget>,
+    pub replace_on_drain: bool,
+    pub attempts: u8,
+    /// `(total, max_segments)` from this generation's ProbeSucceeded.
+    pub plan: Option<(u64, usize)>,
+    pub durable: Vec<ByteRange>,
+}
 #[derive(Debug)]
 pub struct Job {
     id: JobId,
@@ -185,6 +203,54 @@ impl Job {
             attempts: 0,
             segments: None,
         }
+    }
+    /// Rebuilds a persisted job exactly, without leases or uncommitted bytes. Recovery
+    /// then uses ordinary commands (e.g. Pause, WorkersDrained); there is no restart path.
+    pub fn restore(record: JobRecord) -> Result<Self, DomainError> {
+        use JobState as S;
+        let r = &record;
+        let consistent = r.stop.is_some() == (r.state == S::Stopping)
+            && (!r.replace_on_drain || r.state == S::Stopping)
+            && r.retry_at.is_some() == (r.state == S::RetryWait)
+            && (r.reason.is_some() || !matches!(r.state, S::NeedsAction | S::Failed))
+            && (r.plan.is_some()
+                || !matches!(
+                    r.state,
+                    S::Transferring | S::Verifying | S::Publishing | S::Completed
+                ))
+            && (r.plan.is_some() || r.durable.is_empty())
+            && r.plan.is_none_or(|(total, _)| total <= r.spec.max_bytes());
+        if !consistent {
+            return Err(DomainError::InvalidInput);
+        }
+        let segments = r
+            .plan
+            .map(|(total, maximum)| {
+                SegmentMap::restore(r.id, r.generation, total, maximum, &r.durable)
+            })
+            .transpose()?;
+        if matches!(r.state, S::Verifying | S::Publishing | S::Completed)
+            && !segments.as_ref().is_some_and(SegmentMap::all_durable)
+        {
+            return Err(DomainError::InvalidInput);
+        }
+        Ok(Self {
+            id: record.id,
+            spec: record.spec,
+            state: record.state,
+            generation: record.generation,
+            version: record.version,
+            reason: record.reason,
+            retry_at: record.retry_at,
+            stop: record.stop,
+            replace_on_drain: record.replace_on_drain,
+            attempts: record.attempts,
+            segments,
+        })
+    }
+    /// `(total, max_segments)` a repository needs to rebuild the segment map.
+    pub fn plan(&self) -> Option<(u64, usize)> {
+        self.segments.as_ref().map(|m| (m.total(), m.maximum()))
     }
     pub fn id(&self) -> JobId {
         self.id
@@ -1277,5 +1343,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn record_of(value: &Job) -> JobRecord {
+        let p = value.projection();
+        JobRecord {
+            id: value.id(),
+            spec: value.spec().clone(),
+            version: value.version(),
+            state: p.state,
+            generation: p.generation,
+            reason: p.reason,
+            retry_at: p.retry_at,
+            stop: p.stop,
+            replace_on_drain: p.replace_on_drain,
+            attempts: p.attempts,
+            plan: value.plan(),
+            durable: value
+                .segments()
+                .map(|m| {
+                    m.segments()
+                        .iter()
+                        .filter(|s| s.state() == crate::SegmentState::Durable)
+                        .map(|s| s.range())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn restore_keeps_only_durable_progress_and_recovers_with_ordinary_commands() {
+        let mut value = transferring(10);
+        let first = value.segments().unwrap().segments()[0].id();
+        value.split_pending(first, 4).unwrap();
+        let lease = value.lease_segment(first, 1).unwrap();
+        value.mark_written(lease).unwrap();
+        let ticket = value.prepare_sync().unwrap();
+        let batch = value.acknowledge_sync(ticket).unwrap();
+        value.acknowledge_commit(batch).unwrap();
+        // Uncommitted work at crash time: a live lease on the tail.
+        let tail = value.segments().unwrap().segments()[1].id();
+        value.lease_segment(tail, 2).unwrap();
+
+        let mut restored = Job::restore(record_of(&value)).unwrap();
+        assert_eq!(restored.projection(), value.projection());
+        assert_eq!(restored.version(), value.version());
+        let map = restored.segments().unwrap();
+        assert_eq!(map.durable_bytes(), 4);
+        assert_eq!(
+            map.segments()[1].state(),
+            crate::SegmentState::Pending,
+            "leases do not survive"
+        );
+        restored.handle(JobCommand::Pause).unwrap();
+        restored.handle(JobCommand::WorkersDrained).unwrap();
+        assert_eq!(restored.state(), JobState::Paused);
+        restored.handle(JobCommand::Resume).unwrap();
+        assert_eq!(restored.state(), JobState::Queued);
+    }
+
+    #[test]
+    fn restore_rejects_inconsistent_records() {
+        let value = transferring(10);
+        let good = record_of(&value);
+        let mut cases = Vec::new();
+        let mut r = good.clone();
+        r.state = JobState::Stopping;
+        cases.push(r);
+        let mut r = good.clone();
+        r.stop = Some(StopTarget::Paused);
+        cases.push(r);
+        let mut r = good.clone();
+        r.state = JobState::Verifying;
+        cases.push(r);
+        let mut r = good.clone();
+        r.state = JobState::RetryWait;
+        cases.push(r);
+        let mut r = good.clone();
+        r.state = JobState::NeedsAction;
+        cases.push(r);
+        let mut r = good.clone();
+        r.plan = None;
+        cases.push(r);
+        let mut r = good.clone();
+        r.plan = Some((2048, 4));
+        cases.push(r);
+        let mut r = good.clone();
+        r.durable = vec![ByteRange::new(0, 6).unwrap(), ByteRange::new(5, 8).unwrap()];
+        cases.push(r);
+        let mut r = good.clone();
+        r.durable = vec![ByteRange::new(8, 11).unwrap()];
+        cases.push(r);
+        for case in cases {
+            assert!(Job::restore(case.clone()).is_err(), "{case:?}");
+        }
+        let mut touching = good.clone();
+        touching.durable = vec![ByteRange::new(0, 3).unwrap(), ByteRange::new(3, 6).unwrap()];
+        let restored = Job::restore(touching).unwrap();
+        assert_eq!(restored.segments().unwrap().segments().len(), 2);
+        let mut fragmented = good;
+        fragmented.plan = Some((10, 2));
+        fragmented.durable = vec![ByteRange::new(2, 4).unwrap()];
+        assert_eq!(Job::restore(fragmented).unwrap_err(), DomainError::Capacity);
     }
 }

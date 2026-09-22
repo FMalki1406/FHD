@@ -90,6 +90,12 @@ pub struct CommitBatch {
     selection: Vec<(SegmentId, ByteRange, u64)>,
 }
 impl CommitBatch {
+    pub fn job(&self) -> JobId {
+        self.job
+    }
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
     pub fn ranges(&self) -> &[ByteRange] {
         &self.ranges
     }
@@ -174,6 +180,58 @@ impl SegmentMap {
             next_checkpoint: 1,
             checkpoint: None,
         })
+    }
+    /// Rebuilds a map from persisted durable ranges (ascending, non-overlapping; touching
+    /// ranges merge). Gaps become Pending: nothing uncommitted survives a restart.
+    pub fn restore(
+        job: JobId,
+        generation: Generation,
+        total: u64,
+        maximum: usize,
+        durable: &[ByteRange],
+    ) -> Result<Self, DomainError> {
+        let mut map = Self::new(job, generation, total, maximum)?;
+        let mut merged: Vec<ByteRange> = Vec::with_capacity(durable.len());
+        for range in durable {
+            if range.end() > total {
+                return Err(DomainError::InvalidInput);
+            }
+            match merged.last_mut() {
+                Some(last) if range.start() < last.end() => return Err(DomainError::InvalidInput),
+                Some(last) if range.start() == last.end() => {
+                    *last = ByteRange::new(last.start(), range.end())?
+                }
+                _ => merged.push(*range),
+            }
+        }
+        let mut segments = Vec::with_capacity(merged.len() * 2 + 1);
+        let mut cursor = 0;
+        let mut push = |range: ByteRange, state: SegmentState| {
+            let id = SegmentId(segments.len() as u64 + 1);
+            segments.push(Segment { id, range, state });
+        };
+        for range in merged {
+            if range.start() > cursor {
+                push(
+                    ByteRange::new(cursor, range.start())?,
+                    SegmentState::Pending,
+                );
+            }
+            push(range, SegmentState::Durable);
+            cursor = range.end();
+        }
+        if cursor < total {
+            push(ByteRange::new(cursor, total)?, SegmentState::Pending);
+        }
+        if segments.len() > maximum {
+            return Err(DomainError::Capacity);
+        }
+        map.next_id = segments.len() as u64 + 1;
+        map.segments = segments;
+        Ok(map)
+    }
+    pub fn maximum(&self) -> usize {
+        self.maximum
     }
     pub fn segments(&self) -> &[Segment] {
         &self.segments

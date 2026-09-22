@@ -1,4 +1,4 @@
-//! Durable admission repository, not a vault or a transfer-state repository.
+//! Durable admission and transfer-state repository. Not a vault: no URLs or secrets.
 #![forbid(unsafe_code)]
 
 use fhd_app::{
@@ -15,12 +15,19 @@ use std::{
     time::Duration,
 };
 
-const MIGRATION: &str = include_str!("../migrations/001_admission.sql");
+mod transfer;
+
+const MIGRATIONS: [&str; 2] = [
+    include_str!("../migrations/001_admission.sql"),
+    include_str!("../migrations/002_transfer_state.sql"),
+];
+const LATEST: i64 = MIGRATIONS.len() as i64;
 const APPLICATION_ID: i64 = 1_179_141_169;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-fn migration_checksum() -> [u8; 32] {
-    Sha256::digest(MIGRATION.replace("\r\n", "\n").as_bytes()).into()
+fn migration_checksum(version: i64) -> [u8; 32] {
+    let sql = MIGRATIONS[usize::try_from(version - 1).unwrap_or(usize::MAX)];
+    Sha256::digest(sql.replace("\r\n", "\n").as_bytes()).into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,7 +135,9 @@ fn existing_file(path: &Path) -> Result<bool> {
         Err(_) => Err(PersistenceError::InvalidPath),
     }
 }
-fn validate_schema(db: &Connection, allow_empty: bool) -> Result<()> {
+/// Accepts any known version (1..=LATEST) unless `require_latest`; an older one is
+/// migrated forward. Every applied migration must match its recorded checksum.
+fn validate_schema(db: &Connection, allow_empty: bool, require_latest: bool) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0 && allow_empty {
         let tables: i64 = db.query_row(
@@ -140,22 +149,30 @@ fn validate_schema(db: &Connection, allow_empty: bool) -> Result<()> {
             return Ok(());
         }
     }
-    if version != 1 {
+    if !(1..=LATEST).contains(&version) || (require_latest && version != LATEST) {
         return Err(PersistenceError::UnsupportedVersion);
     }
     let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     if app != APPLICATION_ID {
         return Err(PersistenceError::Corrupt);
     }
-    let checksum: Vec<u8> = db
-        .query_row(
-            "SELECT checksum FROM schema_migrations WHERE version=1",
-            [],
-            |r| r.get(0),
-        )
+    let recorded: i64 = db
+        .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
         .map_err(|_| PersistenceError::Corrupt)?;
-    if checksum.as_slice() != migration_checksum().as_slice() {
+    if recorded != version {
         return Err(PersistenceError::Corrupt);
+    }
+    for applied in 1..=version {
+        let checksum: Vec<u8> = db
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=?1",
+                [applied],
+                |r| r.get(0),
+            )
+            .map_err(|_| PersistenceError::Corrupt)?;
+        if checksum.as_slice() != migration_checksum(applied).as_slice() {
+            return Err(PersistenceError::Corrupt);
+        }
     }
     Ok(())
 }
@@ -213,7 +230,7 @@ impl SqliteRepository {
         if exists {
             let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             reader.pragma_update(None, "trusted_schema", "OFF")?;
-            validate_schema(&reader, true)?;
+            validate_schema(&reader, true, false)?;
         }
         let mut db = Connection::open_with_flags(
             &path,
@@ -229,18 +246,25 @@ impl SqliteRepository {
         if mode != "wal" {
             return Err(PersistenceError::Unavailable);
         }
-        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let mut version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
-            validate_schema(&db, true)?;
+            validate_schema(&db, true, false)?;
+        } else {
+            validate_schema(&db, false, false)?;
+        }
+        // Forward only, one transaction per step. A newer binary never downgrades.
+        while version < LATEST {
+            let next = version + 1;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(MIGRATION)?;
+            tx.execute_batch(MIGRATIONS[usize::try_from(version).unwrap_or(usize::MAX)])?;
             tx.execute(
-                "INSERT INTO schema_migrations(version,checksum) VALUES(1,?1)",
-                [migration_checksum().as_slice()],
+                "INSERT INTO schema_migrations(version,checksum) VALUES(?1,?2)",
+                params![next, migration_checksum(next).as_slice()],
             )?;
             tx.commit()?;
+            version = next;
         }
-        validate_schema(&db, false)?;
+        validate_schema(&db, false, true)?;
         let jobs: i64 = db.query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))?;
         let receipts: i64 =
             db.query_row("SELECT count(*) FROM command_receipts", [], |r| r.get(0))?;
@@ -253,7 +277,7 @@ impl SqliteRepository {
             db.query_row("SELECT last_id FROM sequence WHERE singleton=1", [], |r| {
                 r.get(0)
             })?;
-        if invalid != 0 || orphan != 0 || sequence < 0 {
+        if invalid != 0 || orphan != 0 || sequence < 0 || !transfer::consistent(&db)? {
             return Err(PersistenceError::Corrupt);
         }
         #[cfg(unix)]
@@ -299,6 +323,9 @@ impl SqliteRepository {
             let receipt = load_receipt(&tx, key)?.ok_or(PersistenceError::Missing)?;
             if receipt.removed() { return Err(PersistenceError::Removed); }
             let id = signed_id(receipt.job())?;
+            // Active transfers own their state and extents; only a settled job may go.
+            let active: bool = tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM job_state WHERE job_id=?1 AND state NOT IN ({}))", transfer::REMOVABLE_CODES), [id], |r| r.get(0))?;
+            if active { return Err(PersistenceError::Conflict); }
             if tx.execute("DELETE FROM jobs WHERE id=?1 AND version=?2", params![id, version])? != 1 { return Err(PersistenceError::Conflict); }
             if tx.execute("UPDATE command_receipts SET removed=1 WHERE principal=?1 AND key_hash=?2 AND removed=0", params![key.principal().get().to_le_bytes().as_slice(), key.digest().as_slice()])? != 1 { return Err(PersistenceError::Corrupt); }
             tx.commit()?;

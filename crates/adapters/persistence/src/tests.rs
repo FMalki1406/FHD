@@ -300,3 +300,367 @@ async fn redirected_parent_is_allowed_but_private_leaf_symlink_is_rejected() {
         Err(PersistenceError::InvalidPath)
     ));
 }
+
+mod transfer_state {
+    use super::*;
+    use fhd_app::TransferRepository;
+    use fhd_domain::{ByteRange, Job, JobCommand, SegmentState, StopReason};
+
+    async fn step(repo: &SqliteRepository, job: &mut Job, command: JobCommand) {
+        for event in job.decide(command).unwrap() {
+            repo.commit_transition(event.clone()).await.unwrap();
+            job.apply(&event).unwrap();
+        }
+    }
+    async fn loaded(repo: &SqliteRepository, id: JobId) -> Job {
+        repo.load_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id() == id)
+            .unwrap()
+    }
+    /// Admitted job, probed as 10 bytes, with [0,4) committed durable.
+    async fn partly_durable(repo: &SqliteRepository) -> Job {
+        let id = add(repo, 1).await.unwrap();
+        let mut job = loaded(repo, id).await;
+        assert_eq!((job.state(), job.version()), (JobState::Queued, 0));
+        step(repo, &mut job, JobCommand::Start).await;
+        step(
+            repo,
+            &mut job,
+            JobCommand::ProbeSucceeded {
+                total: 10,
+                max_segments: 4,
+            },
+        )
+        .await;
+        let first = job.segments().unwrap().segments()[0].id();
+        job.split_pending(first, 4).unwrap();
+        let lease = job.lease_segment(first, 1).unwrap();
+        job.mark_written(lease).unwrap();
+        let ticket = job.prepare_sync().unwrap();
+        let batch = job.acknowledge_sync(ticket).unwrap();
+        let ranges = batch.ranges().to_vec();
+        repo.commit_extents(batch.job(), batch.generation(), ranges.clone())
+            .await
+            .unwrap();
+        // An ambiguous commit is retried with the same ranges.
+        repo.commit_extents(batch.job(), batch.generation(), ranges)
+            .await
+            .unwrap();
+        job.acknowledge_commit(batch).unwrap();
+        job
+    }
+
+    #[tokio::test]
+    async fn version_one_database_migrates_forward_once() {
+        let directory = Directory::new();
+        fs::create_dir(&directory.0).unwrap();
+        let db = Connection::open(directory.0.join("admission.sqlite")).unwrap();
+        db.execute_batch(MIGRATIONS[0]).unwrap();
+        db.execute(
+            "INSERT INTO schema_migrations(version,checksum) VALUES(1,?1)",
+            [migration_checksum(1).as_slice()],
+        )
+        .unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+                .await
+                .unwrap();
+            let (version, applied) = repo
+                .run(|inner| {
+                    let v: i64 = inner
+                        .db
+                        .pragma_query_value(None, "user_version", |r| r.get(0))?;
+                    let n: i64 =
+                        inner
+                            .db
+                            .query_row("SELECT count(*) FROM schema_migrations", [], |r| {
+                                r.get(0)
+                            })?;
+                    Ok((v, n))
+                })
+                .await
+                .unwrap();
+            assert_eq!((version, applied), (LATEST, LATEST));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_progress_survives_reopen_and_nothing_else_does() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        // Written but never committed: must not survive.
+        let tail = job.segments().unwrap().segments()[1].id();
+        let lease = job.lease_segment(tail, 2).unwrap();
+        job.mark_written(lease).unwrap();
+        let expected = job.projection();
+        let id = job.id();
+        drop(repo);
+
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut restored = loaded(&repo, id).await;
+        assert_eq!(restored.projection(), expected);
+        assert_eq!(restored.version(), 2);
+        let states: Vec<_> = restored
+            .segments()
+            .unwrap()
+            .segments()
+            .iter()
+            .map(|s| (s.range().start(), s.state()))
+            .collect();
+        assert_eq!(
+            states,
+            vec![(0, SegmentState::Durable), (4, SegmentState::Pending)]
+        );
+        step(&repo, &mut restored, JobCommand::Pause).await;
+        step(&repo, &mut restored, JobCommand::WorkersDrained).await;
+        assert_eq!(loaded(&repo, id).await.state(), JobState::Paused);
+    }
+
+    #[tokio::test]
+    async fn stale_events_and_foreign_extents_conflict() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        let pause = job.decide(JobCommand::Pause).unwrap().remove(0);
+        let fail = job
+            .decide(JobCommand::Fail {
+                reason: StopReason::Policy,
+            })
+            .unwrap()
+            .remove(0);
+        repo.commit_transition(pause.clone()).await.unwrap();
+        job.apply(&pause).unwrap();
+        assert_eq!(
+            repo.commit_transition(fail).await,
+            Err(CommitError::Conflict)
+        );
+        let generation = job.generation();
+        for ranges in [
+            vec![ByteRange::new(2, 6).unwrap()],
+            vec![ByteRange::new(6, 8).unwrap(), ByteRange::new(7, 9).unwrap()],
+        ] {
+            assert_eq!(
+                repo.commit_extents(job.id(), generation, ranges).await,
+                Err(CommitError::Conflict)
+            );
+        }
+        assert_eq!(
+            repo.commit_extents(
+                job.id(),
+                generation.next().unwrap(),
+                vec![ByteRange::new(4, 6).unwrap()]
+            )
+            .await,
+            Err(CommitError::Conflict)
+        );
+        assert_eq!(loaded(&repo, job.id()).await.projection(), job.projection());
+    }
+
+    #[tokio::test]
+    async fn new_representation_drops_old_extents_and_removal_cascades() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        step(&repo, &mut job, JobCommand::RepresentationChanged).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        assert_eq!((job.state(), job.generation().get()), (JobState::Queued, 2));
+        let restored = loaded(&repo, job.id()).await;
+        assert_eq!(restored.projection(), job.projection());
+        assert!(restored.segments().is_none());
+        async fn rows(repo: &SqliteRepository) -> (i64, i64) {
+            repo.run(|inner| {
+                let e: i64 = inner
+                    .db
+                    .query_row("SELECT count(*) FROM extents", [], |r| r.get(0))?;
+                let s: i64 = inner
+                    .db
+                    .query_row("SELECT count(*) FROM job_state", [], |r| r.get(0))?;
+                Ok((e, s))
+            })
+            .await
+            .unwrap()
+        }
+        assert_eq!(rows(&repo).await, (0, 1));
+        repo.remove(key(1), job.version()).await.unwrap();
+        assert_eq!(rows(&repo).await, (0, 0));
+        assert!(repo.load_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durability_claim_beyond_repository_is_refused() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        let tail = job.segments().unwrap().segments()[1].id();
+        let lease = job.lease_segment(tail, 2).unwrap();
+        job.mark_written(lease).unwrap();
+        let ticket = job.prepare_sync().unwrap();
+        let batch = job.acknowledge_sync(ticket).unwrap();
+        // Skips commit_extents: a buggy coordinator acknowledging in memory only.
+        job.acknowledge_commit(batch).unwrap();
+        let event = job
+            .decide(JobCommand::AllSegmentsDurable)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repo.commit_transition(event).await,
+            Err(CommitError::Conflict)
+        );
+        assert_eq!(
+            loaded(&repo, job.id()).await.state(),
+            JobState::Transferring
+        );
+    }
+
+    #[tokio::test]
+    async fn extents_outside_current_generation_fail_closed_on_open() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let job = partly_durable(&repo).await;
+        let id = signed_id(job.id()).unwrap();
+        repo.run(move |inner| {
+            inner.db.execute(
+                "INSERT INTO extents(job_id,generation,start,end_excl) VALUES(?1,7,4,6)",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(repo);
+        assert!(matches!(
+            SqliteRepository::open(directory.0.clone(), Limits::default()).await,
+            Err(PersistenceError::Corrupt)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reprobe_keeps_stored_plan_so_reload_still_works() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        step(&repo, &mut job, JobCommand::Pause).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        // Paused: the drain is over, so no more extents may land.
+        assert_eq!(
+            repo.commit_extents(
+                job.id(),
+                job.generation(),
+                vec![ByteRange::new(4, 6).unwrap()]
+            )
+            .await,
+            Err(CommitError::Conflict)
+        );
+        step(&repo, &mut job, JobCommand::Resume).await;
+        step(&repo, &mut job, JobCommand::Start).await;
+        step(
+            &repo,
+            &mut job,
+            JobCommand::ProbeSucceeded {
+                total: 10,
+                max_segments: 2,
+            },
+        )
+        .await;
+        assert_eq!(job.plan(), Some((10, 4)));
+        drop(repo);
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let restored = loaded(&repo, job.id()).await;
+        assert_eq!(restored.plan(), Some((10, 4)));
+        assert_eq!(restored.projection(), job.projection());
+    }
+
+    #[tokio::test]
+    async fn extents_that_restore_could_not_rebuild_are_refused() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let job = partly_durable(&repo).await;
+        let (id, generation) = (job.id(), job.generation());
+        // durable [0,4) [6,7) plus gaps [4,6) [7,10): four segments, the maximum.
+        repo.commit_extents(id, generation, vec![ByteRange::new(6, 7).unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.commit_extents(id, generation, vec![ByteRange::new(8, 9).unwrap()])
+                .await,
+            Err(CommitError::Conflict)
+        );
+        assert_eq!(
+            repo.commit_extents(id, generation, vec![ByteRange::new(4, 7).unwrap()])
+                .await,
+            Err(CommitError::Conflict),
+            "superset of a durable extent"
+        );
+        assert_eq!(
+            loaded(&repo, id).await.segments().unwrap().durable_bytes(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn active_job_cannot_be_removed() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        assert_eq!(
+            repo.remove(key(1), job.version()).await,
+            Err(PersistenceError::Conflict)
+        );
+        step(&repo, &mut job, JobCommand::Pause).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        repo.remove(key(1), job.version()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_file_commits_and_restores_as_complete() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let id = add(&repo, 1).await.unwrap();
+        let mut job = loaded(&repo, id).await;
+        step(&repo, &mut job, JobCommand::Start).await;
+        step(
+            &repo,
+            &mut job,
+            JobCommand::ProbeSucceeded {
+                total: 0,
+                max_segments: 1,
+            },
+        )
+        .await;
+        step(&repo, &mut job, JobCommand::AllSegmentsDurable).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        assert_eq!(job.state(), JobState::Verifying);
+        drop(repo);
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(loaded(&repo, id).await.projection(), job.projection());
+    }
+}
