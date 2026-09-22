@@ -268,8 +268,11 @@ async fn cancellation_keeps_durable_prefix_but_reopening_cannot_append_unknown_d
     let lab = Lab::new();
     let options = lab.options("hold");
     let (owner, cancel) = watch::channel(false);
+    // A hang guard, not a latency claim: the cancellation only starts once the
+    // transfer has reported PREFIX bytes, and on a loaded machine (the whole suite
+    // runs its test binaries in parallel) getting there can take seconds.
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         download(options.clone(), cancel, |bytes| {
             if bytes >= PREFIX as u64 {
                 owner.send_replace(true);
