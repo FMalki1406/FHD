@@ -29,6 +29,8 @@ pub enum StopReason {
     Network,
     Policy,
     Unknown,
+    /// Something else already occupies the destination name.
+    Destination,
 }
 /// Where a stopping job lands once workers, writer lanes and checkpoints drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -560,12 +562,20 @@ impl Job {
                 }
                 self.reason = None;
                 self.attempts = 0;
-                S::Queued
+                if self.all_durable() {
+                    S::Verifying
+                } else {
+                    S::Queued
+                }
             }
             (S::Failed, C::Resume) => {
                 self.reason = None;
                 self.attempts = 0;
-                S::Queued
+                if self.all_durable() {
+                    S::Verifying
+                } else {
+                    S::Queued
+                }
             }
             (
                 S::Queued | S::Probing | S::Transferring | S::Verifying | S::Publishing,
@@ -772,6 +782,7 @@ mod tests {
         // '.' rejected, 'x' rejected as PublishInProgress, '=' accepted no-op, otherwise the state:
         // Q P T S p(aused) R N V B(publishing) C(ancelling) F D(completed) X(cancelled).
         // Fixture: drained empty map (all durable), Stopping{Paused}, reason Network.
+        // All durable is why Resume from Paused/NeedsAction/Failed reaches Verifying.
         let rows = [
             "P.p=C............",
             ".TS=CS.SSSS......",
@@ -779,11 +790,11 @@ mod tests {
             "..=SC=.SSSSp.....",
             "..=VC...........Q",
             "..pQC.......Q....",
-            "..=QC...........Q",
+            "..=VC...........Q",
             "..p=C...NF...B...",
             "..x=x...N.....D..",
             "..=.=..........X.",
-            "..=QC...........Q",
+            "..=VC...........Q",
             ".................",
             ".................",
         ];
@@ -1518,5 +1529,44 @@ mod tests {
         value.handle(JobCommand::WorkersDrained).unwrap();
         assert_eq!(value.validator(), None);
         assert!(value.segments().is_none());
+    }
+
+    #[test]
+    fn resume_verifies_instead_of_refetching_a_complete_file() {
+        for (reason, resumable) in [
+            (StopReason::Destination, true),
+            (StopReason::Storage, true),
+            (StopReason::Integrity, false),
+        ] {
+            let mut value = transferring(10);
+            let lease = first_lease(&mut value);
+            value.mark_written(lease).unwrap();
+            let ticket = value.prepare_sync().unwrap();
+            let batch = value.acknowledge_sync(ticket).unwrap();
+            value.acknowledge_commit(batch).unwrap();
+            value.handle(JobCommand::RequireAction { reason }).unwrap();
+            value.handle(JobCommand::WorkersDrained).unwrap();
+            assert_eq!(value.state(), JobState::NeedsAction);
+            match resumable {
+                true => {
+                    value.handle(JobCommand::Resume).unwrap();
+                    assert_eq!(value.state(), JobState::Verifying, "{reason:?}");
+                }
+                false => assert_eq!(
+                    value.handle(JobCommand::Resume).unwrap_err(),
+                    DomainError::InvalidTransition
+                ),
+            }
+        }
+        // Incomplete work still goes back through the queue.
+        let mut value = transferring(10);
+        value
+            .handle(JobCommand::RequireAction {
+                reason: StopReason::Network,
+            })
+            .unwrap();
+        value.handle(JobCommand::WorkersDrained).unwrap();
+        value.handle(JobCommand::Resume).unwrap();
+        assert_eq!(value.state(), JobState::Queued);
     }
 }

@@ -7,9 +7,9 @@ use crate::{
     CancellationToken,
 };
 use fhd_app::{
-    storage::{PartSpec, SegmentFile, SegmentStore, StorageError},
+    storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
     transport::{Transport, TransportError},
-    CommitError, DurableExtent, TransferRepository,
+    CommitError, Destinations, DurableExtent, PublishIntent, TransferRepository,
 };
 use fhd_domain::{
     ByteRange, DomainError, ErrorClass, Job, JobCommand, JobState, Lease, RetryDecision,
@@ -48,19 +48,22 @@ impl CoordinatorConfig {
     }
 }
 
+/// Publication retries are bounded: the destination name never changes here.
+const MAX_PUBLISH_ATTEMPTS: u32 = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+
 pub enum Control {
     Pause,
     Cancel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEnd {
     /// The job rests in this state; the scheduler decides what happens next.
     Settled(JobState),
-    /// Every byte durable and the whole file verified; the job stays in Verifying
-    /// until publication (which needs a durable PublishIntent) is implemented.
-    Verified([u8; 32]),
+    /// Verified and published at this path; the job is Completed.
+    Published(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,10 +88,17 @@ enum Failure {
     Panicked,
 }
 
+/// The ports one coordinator drives.
+#[derive(Clone)]
+pub struct Ports {
+    pub repository: Arc<dyn TransferRepository>,
+    pub store: Arc<dyn SegmentStore>,
+    pub transport: Arc<dyn Transport>,
+    pub destinations: Arc<dyn Destinations>,
+}
+
 pub struct Coordinator {
-    repository: Arc<dyn TransferRepository>,
-    store: Arc<dyn SegmentStore>,
-    transport: Arc<dyn Transport>,
+    ports: Ports,
     buffers: BufferPool,
     clock: Arc<dyn Clock>,
     config: CoordinatorConfig,
@@ -112,9 +122,7 @@ async fn step(
 
 impl Coordinator {
     pub fn new(
-        repository: Arc<dyn TransferRepository>,
-        store: Arc<dyn SegmentStore>,
-        transport: Arc<dyn Transport>,
+        ports: Ports,
         buffers: BufferPool,
         clock: Arc<dyn Clock>,
         config: CoordinatorConfig,
@@ -125,9 +133,7 @@ impl Coordinator {
             return Err(RunError::InvalidConfig);
         }
         Ok(Self {
-            repository,
-            store,
-            transport,
+            ports,
             buffers,
             clock,
             config,
@@ -138,7 +144,7 @@ impl Coordinator {
     /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.
     /// Part-file cleanup for Cancelling is not implemented yet; the record completes.
     pub async fn recover(&self, mut job: Job) -> Result<Job, RunError> {
-        let repository = self.repository.as_ref();
+        let repository = self.ports.repository.as_ref();
         match job.state() {
             JobState::Probing | JobState::Transferring | JobState::Verifying => {
                 step(repository, &mut job, JobCommand::Pause).await?;
@@ -161,7 +167,10 @@ impl Coordinator {
         job: Job,
         control: mpsc::Receiver<Control>,
     ) -> Result<SessionEnd, RunError> {
-        if !matches!(job.state(), JobState::Queued | JobState::Verifying) {
+        if !matches!(
+            job.state(),
+            JobState::Queued | JobState::Verifying | JobState::Publishing
+        ) {
             return Err(RunError::NotRunnable(job.state()));
         }
         let mut session = Session {
@@ -206,10 +215,13 @@ struct Session<'c> {
 
 impl Session<'_> {
     async fn step(&mut self, command: JobCommand) -> Result<(), RunError> {
-        step(self.c.repository.as_ref(), &mut self.job, command).await
+        step(self.c.ports.repository.as_ref(), &mut self.job, command).await
     }
 
     async fn drive(&mut self) -> Result<SessionEnd, RunError> {
+        if self.job.state() == JobState::Publishing {
+            return self.resume_publish().await;
+        }
         if self.job.state() == JobState::Verifying {
             self.open_part().await?;
             return self.verify().await;
@@ -225,7 +237,7 @@ impl Session<'_> {
                     self.on_control(control).await?;
                     return self.finish().await;
                 }
-                probe = self.c.transport.probe(self.source) => break probe,
+                probe = self.c.ports.transport.probe(self.source) => break probe,
             }
         };
         let probe = match probe {
@@ -279,11 +291,12 @@ impl Session<'_> {
             PartSpec::new(self.job.id(), self.job.generation(), total).map_err(RunError::Domain)?;
         let extents = self
             .c
+            .ports
             .repository
             .durable_extents(self.job.id())
             .await
             .map_err(|_| RunError::Repository)?;
-        let store = self.c.store.clone();
+        let store = self.c.ports.store.clone();
         let directory = self.c.directory.clone();
         let opened =
             tokio::task::spawn_blocking(move || -> Result<Box<dyn SegmentFile>, StorageError> {
@@ -311,7 +324,7 @@ impl Session<'_> {
                     StopReason::Storage
                 };
                 let command = JobCommand::RequireAction { reason };
-                if self.job.state() == JobState::Verifying {
+                if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {
                     self.step(command).await?;
                 } else {
                     self.stop_with(command).await?;
@@ -422,7 +435,7 @@ impl Session<'_> {
                 .clone()
                 .ok_or(RunError::Writer(WriterError::Closed))?;
             let task = fetch(
-                self.c.transport.clone(),
+                self.c.ports.transport.clone(),
                 self.source,
                 writer,
                 self.c.buffers.clone(),
@@ -598,6 +611,7 @@ impl Session<'_> {
         loop {
             match self
                 .c
+                .ports
                 .repository
                 .commit_extents(batch.job(), batch.generation(), extents.clone())
                 .await
@@ -667,7 +681,7 @@ impl Session<'_> {
             .verify(self.job.spec().expected_sha256(), &self.io)
             .await
         {
-            Ok(digest) => Ok(SessionEnd::Verified(digest)),
+            Ok(digest) => self.publish(digest).await,
             Err(error) => {
                 let reason = if error == WriterError::Storage(StorageError::Integrity) {
                     StopReason::Integrity
@@ -678,6 +692,134 @@ impl Session<'_> {
                 Ok(SessionEnd::Settled(self.job.state()))
             }
         }
+    }
+
+    /// Records the intent, then renames without replacing. A conflict or a crash is
+    /// reconciled against the destination, never by overwriting it.
+    async fn publish(&mut self, digest: [u8; 32]) -> Result<SessionEnd, RunError> {
+        let size = self.job.plan().map_or(0, |(total, _)| total);
+        let previous = self
+            .c
+            .ports
+            .repository
+            .publish_intent(self.job.id())
+            .await
+            .map_err(|_| RunError::Repository)?;
+        let attempt = previous.map_or(1, |intent| intent.attempt().saturating_add(1));
+        let intent =
+            PublishIntent::new(self.job.id(), self.job.generation(), attempt, size, digest);
+        self.c
+            .ports
+            .repository
+            .record_publish_intent(intent)
+            .await
+            .map_err(RunError::Commit)?;
+        self.step(JobCommand::VerificationPassed).await?;
+        self.attempt_publish(intent).await
+    }
+
+    /// Restarted while Publishing: the rename may or may not have happened.
+    async fn resume_publish(&mut self) -> Result<SessionEnd, RunError> {
+        let Some(intent) = self
+            .c
+            .ports
+            .repository
+            .publish_intent(self.job.id())
+            .await
+            .map_err(|_| RunError::Repository)?
+        else {
+            // Publishing without a recorded intent: nothing proves what was renamed.
+            self.step(JobCommand::RequireAction {
+                reason: StopReason::Storage,
+            })
+            .await?;
+            return Ok(SessionEnd::Settled(self.job.state()));
+        };
+        self.attempt_publish(intent).await
+    }
+
+    async fn attempt_publish(&mut self, intent: PublishIntent) -> Result<SessionEnd, RunError> {
+        if intent.generation() != self.job.generation() {
+            // An intent of an older representation proves nothing about these bytes.
+            return self.publish_blocked(StopReason::Storage).await;
+        }
+        if intent.attempt() > MAX_PUBLISH_ATTEMPTS {
+            return self.publish_blocked(StopReason::Destination).await;
+        }
+        let destination = self
+            .c
+            .ports
+            .destinations
+            .resolve(self.job.spec().destination())
+            .map_err(|_| RunError::Repository)?;
+        match self.occupant(&destination, intent.size()).await? {
+            // Our own bytes: the rename happened before the crash.
+            Some(Occupant::File { size, digest })
+                if size == intent.size() && digest == intent.digest() =>
+            {
+                self.step(JobCommand::PublishCommitted).await?;
+                return Ok(SessionEnd::Published(destination));
+            }
+            Some(_) => return self.publish_blocked(StopReason::Destination).await,
+            None => {}
+        }
+        // A handle opened in this session never verified these bytes; a handle
+        // reopened after a crash must prove them again before any rename.
+        let reopened = self.writer.is_none();
+        if reopened {
+            self.open_part().await?;
+        }
+        let Some(writer) = self.writer.clone() else {
+            return Ok(SessionEnd::Settled(self.job.state()));
+        };
+        if reopened {
+            if writer.sync(&self.io).await.is_err() {
+                return self.publish_blocked(StopReason::Storage).await;
+            }
+            match writer
+                .verify(self.job.spec().expected_sha256(), &self.io)
+                .await
+            {
+                Ok(digest) if digest == intent.digest() => {}
+                Ok(_) | Err(WriterError::Storage(StorageError::Integrity)) => {
+                    return self.publish_blocked(StopReason::Integrity).await
+                }
+                Err(_) => return self.publish_blocked(StopReason::Storage).await,
+            }
+        }
+        match writer.publish(destination.clone(), &self.io).await {
+            Ok(path) => {
+                self.step(JobCommand::PublishCommitted).await?;
+                Ok(SessionEnd::Published(path))
+            }
+            // Lost a race for the name, or an unrelated file appeared meanwhile.
+            Err(WriterError::Storage(StorageError::Conflict)) => {
+                self.publish_blocked(StopReason::Destination).await
+            }
+            Err(_) => self.publish_blocked(StopReason::Storage).await,
+        }
+    }
+
+    async fn occupant(
+        &mut self,
+        destination: &std::path::Path,
+        expected_size: u64,
+    ) -> Result<Option<Occupant>, RunError> {
+        let store = self.c.ports.store.clone();
+        let path = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || store.inspect(&path, expected_size))
+            .await
+            .map_err(|_| RunError::Writer(WriterError::WorkerFailed))?
+            .map_err(RunError::Storage)
+    }
+
+    /// Records why publication stopped. Publishing and Verifying both accept
+    /// RequireAction directly, so the job never rests in a running state.
+    async fn publish_blocked(&mut self, reason: StopReason) -> Result<SessionEnd, RunError> {
+        if matches!(self.job.state(), JobState::Publishing | JobState::Verifying) {
+            self.step(JobCommand::RequireAction { reason }).await?;
+        }
+        Ok(SessionEnd::Settled(self.job.state()))
     }
 
     /// Stops workers and waits for the writer thread; accepted writes finish first.

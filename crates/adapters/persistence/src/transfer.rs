@@ -1,6 +1,8 @@
 //! Transfer-state transactions: one row of projection per job plus its durable extents.
 use super::{app_error, decode_spec, signed_id, PersistenceError, Result, SqliteRepository};
-use fhd_app::{AppError, CommitError, DurableExtent, PortFuture, TransferRepository};
+use fhd_app::{
+    AppError, CommitError, DurableExtent, PortFuture, PublishIntent, TransferRepository,
+};
 use fhd_domain::{
     ByteRange, Generation, Job, JobCommand, JobEvent, JobId, JobRecord, JobState, StopReason,
     StopTarget,
@@ -22,7 +24,7 @@ const STATES: [JobState; 13] = [
     JobState::Completed,
     JobState::Cancelled,
 ];
-const REASONS: [StopReason; 7] = [
+const REASONS: [StopReason; 8] = [
     StopReason::SourceChanged,
     StopReason::Authentication,
     StopReason::Storage,
@@ -30,6 +32,7 @@ const REASONS: [StopReason; 7] = [
     StopReason::Network,
     StopReason::Policy,
     StopReason::Unknown,
+    StopReason::Destination,
 ];
 fn state_code(state: JobState) -> i64 {
     match state {
@@ -65,6 +68,7 @@ fn reason_code(reason: StopReason) -> i64 {
         StopReason::Network => 4,
         StopReason::Policy => 5,
         StopReason::Unknown => 6,
+        StopReason::Destination => 7,
     }
 }
 fn reason_of(code: i64) -> Result<StopReason> {
@@ -274,6 +278,11 @@ impl SqliteRepository {
             }
             if replaced {
                 tx.execute("DELETE FROM extents WHERE job_id=?1", [id])?;
+                tx.execute("DELETE FROM publish_intents WHERE job_id=?1", [id])?;
+            }
+            // A published job needs no intent; the record itself says Completed.
+            if event.command() == JobCommand::PublishCommitted {
+                tx.execute("DELETE FROM publish_intents WHERE job_id=?1", [id])?;
             }
             let durable: u64 = extents(&tx, id, generation)?
                 .iter()
@@ -376,6 +385,67 @@ impl SqliteRepository {
                     ],
                 )?;
             }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn intent(&self, job: JobId) -> Result<Option<PublishIntent>> {
+        self.run(move |inner| {
+            let id = signed_id(job)?;
+            let row: Option<(i64, i64, i64, Vec<u8>)> = inner
+                .db
+                .query_row(
+                    "SELECT generation,attempt,size,digest FROM publish_intents WHERE job_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((generation, attempt, size, digest)) = row else {
+                return Ok(None);
+            };
+            Ok(Some(PublishIntent::new(
+                job,
+                Generation::new(loaded(generation)?).map_err(|_| PersistenceError::Corrupt)?,
+                u32::try_from(attempt).map_err(|_| PersistenceError::Corrupt)?,
+                loaded(size)?,
+                digest.try_into().map_err(|_| PersistenceError::Corrupt)?,
+            )))
+        })
+        .await
+    }
+
+    async fn intend_publish(&self, intent: PublishIntent) -> Result<()> {
+        self.run(move |intent_inner| {
+            let inner = intent_inner;
+            let id = signed_id(intent.job())?;
+            let tx = inner
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = current(&tx, id)?;
+            // Only a verified job of this generation may be published.
+            if now.state != JobState::Verifying
+                || now.generation != stored(intent.generation().get())?
+                || now
+                    .plan
+                    .is_none_or(|(total, _)| loaded(total) != Ok(intent.size()))
+            {
+                return Err(PersistenceError::Conflict);
+            }
+            tx.execute(
+                "INSERT INTO publish_intents(job_id,generation,attempt,size,digest) \
+                 VALUES(?1,?2,?3,?4,?5) ON CONFLICT(job_id) DO UPDATE SET \
+                 generation=excluded.generation,attempt=excluded.attempt,\
+                 size=excluded.size,digest=excluded.digest",
+                params![
+                    id,
+                    stored(intent.generation().get())?,
+                    i64::from(intent.attempt()),
+                    stored(intent.size())?,
+                    intent.digest().as_slice()
+                ],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -533,6 +603,18 @@ impl TransferRepository for SqliteRepository {
         job: JobId,
     ) -> PortFuture<'_, std::result::Result<Vec<DurableExtent>, AppError>> {
         Box::pin(async move { self.current_extents(job).await.map_err(app_error) })
+    }
+    fn record_publish_intent(
+        &self,
+        intent: PublishIntent,
+    ) -> PortFuture<'_, std::result::Result<(), CommitError>> {
+        Box::pin(async move { self.intend_publish(intent).await.map_err(commit_error) })
+    }
+    fn publish_intent(
+        &self,
+        job: JobId,
+    ) -> PortFuture<'_, std::result::Result<Option<PublishIntent>, AppError>> {
+        Box::pin(async move { self.intent(job).await.map_err(app_error) })
     }
     fn load_jobs(&self) -> PortFuture<'_, std::result::Result<Vec<Job>, AppError>> {
         Box::pin(async move { self.jobs().await.map_err(app_error) })

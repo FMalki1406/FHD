@@ -73,7 +73,25 @@ impl std::fmt::Display for StorageError {
 }
 impl std::error::Error for StorageError {}
 
+/// What already occupies a destination path, for publish reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Occupant {
+    /// A regular file whose digest was computed because its size matched.
+    File { size: u64, digest: [u8; 32] },
+    /// A regular file of another size: never ours, and not worth hashing.
+    OtherSize,
+    /// A directory, link or device: never publishable over.
+    NotAFile,
+}
+
 pub trait SegmentStore: Send + Sync {
+    /// `None` when the destination is free. Hashes only a file of exactly
+    /// `expected_size`, so a large stranger is never read. Never follows links.
+    fn inspect(
+        &self,
+        destination: &Path,
+        expected_size: u64,
+    ) -> Result<Option<Occupant>, StorageError>;
     /// Caller supplies an app-owned directory, never a browser-controlled path.
     fn create(
         &self,

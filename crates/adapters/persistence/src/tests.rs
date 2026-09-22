@@ -303,7 +303,7 @@ async fn redirected_parent_is_allowed_but_private_leaf_symlink_is_rejected() {
 
 mod transfer_state {
     use super::*;
-    use fhd_app::{DurableExtent, TransferRepository};
+    use fhd_app::{DurableExtent, PublishIntent, TransferRepository};
     use fhd_domain::{ByteRange, Job, JobCommand, SegmentState, StopReason};
 
     /// Test digest derived from the range; real digests come from hashing synced bytes.
@@ -710,5 +710,59 @@ mod transfer_state {
             "stale version"
         );
         assert_eq!(loaded(&repo, job.id()).await.validator(), Some([5; 32]));
+    }
+
+    #[tokio::test]
+    async fn publish_intent_needs_a_verified_job_and_dies_with_its_generation() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        let intent = |job: &Job, attempt| {
+            PublishIntent::new(job.id(), job.generation(), attempt, 10, [7; 32])
+        };
+        // Transferring is not verified yet.
+        assert_eq!(
+            repo.record_publish_intent(intent(&job, 1)).await,
+            Err(CommitError::Conflict)
+        );
+        let tail = job.segments().unwrap().segments()[1].id();
+        let lease = job.lease_segment(tail, 2).unwrap();
+        job.mark_written(lease).unwrap();
+        let ticket = job.prepare_sync().unwrap();
+        let batch = job.acknowledge_sync(ticket).unwrap();
+        let ranges: Vec<_> = batch
+            .ranges()
+            .iter()
+            .map(|r| ext(r.start(), r.end()))
+            .collect();
+        repo.commit_extents(batch.job(), batch.generation(), ranges)
+            .await
+            .unwrap();
+        job.acknowledge_commit(batch).unwrap();
+        step(&repo, &mut job, JobCommand::AllSegmentsDurable).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        assert_eq!(job.state(), JobState::Verifying);
+        repo.record_publish_intent(intent(&job, 1)).await.unwrap();
+        assert_eq!(
+            repo.publish_intent(job.id()).await.unwrap(),
+            Some(intent(&job, 1))
+        );
+        // A wrong size is not this job's verified file.
+        assert_eq!(
+            repo.record_publish_intent(PublishIntent::new(
+                job.id(),
+                job.generation(),
+                2,
+                11,
+                [7; 32]
+            ))
+            .await,
+            Err(CommitError::Conflict)
+        );
+        step(&repo, &mut job, JobCommand::Pause).await;
+        step(&repo, &mut job, JobCommand::ReplaceRepresentation).await;
+        assert_eq!(repo.publish_intent(job.id()).await.unwrap(), None);
     }
 }

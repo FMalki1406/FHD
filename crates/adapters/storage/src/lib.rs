@@ -1,6 +1,6 @@
 //! Single-owner positional storage. Blocking methods belong on the writer thread.
 #![forbid(unsafe_code)]
-use fhd_app::storage::{PartSpec, SegmentFile, SegmentStore, StorageError};
+use fhd_app::storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError};
 use fhd_domain::ByteRange;
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,6 +15,19 @@ const MAX_EXTENTS: usize = 262144;
 const BUFFER: usize = 64 * 1024;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// One resolution for publishing and for inspecting: the parent is canonicalised
+/// and the leaf validated, so both always name the same file.
+fn resolve_destination(destination: &Path) -> Result<PathBuf, StorageError> {
+    let destination = std::path::absolute(destination).map_err(io)?;
+    let parent = destination
+        .parent()
+        .ok_or(StorageError::InvalidInput)?
+        .canonicalize()
+        .map_err(io)?;
+    let leaf = destination.file_name().ok_or(StorageError::InvalidInput)?;
+    validate_leaf(leaf)?;
+    Ok(parent.join(leaf))
+}
 fn io(error: std::io::Error) -> StorageError {
     StorageError::Io(error.kind())
 }
@@ -132,6 +145,45 @@ fn identity(spec: PartSpec, sealed: bool) -> [u8; META_LEN] {
 #[derive(Default)]
 pub struct FileStorage;
 impl SegmentStore for FileStorage {
+    /// Reconciliation only, never the byte path: resolves the destination exactly as
+    /// `publish` does, follows no link, and hashes only a file of the expected size.
+    fn inspect(
+        &self,
+        destination: &Path,
+        expected_size: u64,
+    ) -> Result<Option<Occupant>, StorageError> {
+        let destination = resolve_destination(destination)?;
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io(error)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Ok(Some(Occupant::NotAFile));
+        }
+        if metadata.len() != expected_size {
+            return Ok(Some(Occupant::OtherSize));
+        }
+        let mut file = File::open(&destination).map_err(io)?;
+        let mut buffer = [0; BUFFER];
+        let mut hash = Sha256::new();
+        let mut size = 0u64;
+        loop {
+            let read = file.read(&mut buffer).map_err(io)?;
+            if read == 0 {
+                break;
+            }
+            size = size.checked_add(read as u64).ok_or(StorageError::Bounds)?;
+            hash.update(&buffer[..read]);
+        }
+        if size != expected_size {
+            return Ok(Some(Occupant::OtherSize));
+        }
+        Ok(Some(Occupant::File {
+            size,
+            digest: hash.finalize().into(),
+        }))
+    }
     fn create(&self, path: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError> {
         Ok(Box::new(FilePart::open_inner(path, spec, true)?))
     }
@@ -399,15 +451,7 @@ impl SegmentFile for FilePart {
         if !self.synchronized || !self.complete() {
             return Err(StorageError::InvalidState);
         }
-        let destination = std::path::absolute(destination).map_err(io)?;
-        let parent = destination
-            .parent()
-            .ok_or(StorageError::InvalidInput)?
-            .canonicalize()
-            .map_err(io)?;
-        let leaf = destination.file_name().ok_or(StorageError::InvalidInput)?;
-        validate_leaf(leaf)?;
-        let destination = parent.join(leaf);
+        let destination = resolve_destination(destination)?;
         match fs::symlink_metadata(&destination) {
             Ok(_) => return Err(StorageError::Conflict),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -441,7 +485,7 @@ impl SegmentFile for FilePart {
             }
         }
         self.file.sync_all().map_err(io)?;
-        sync_directory(&parent)?;
+        sync_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
         sync_directory(&self.directory)?;
         self.poisoned = false;
         Ok(destination)

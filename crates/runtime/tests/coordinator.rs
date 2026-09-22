@@ -5,12 +5,13 @@ use fhd_domain::{
 };
 use fhd_runtime::{
     buffers::BufferPool,
-    coordinator::{Clock, Control, Coordinator, CoordinatorConfig, RunError, SessionEnd},
+    coordinator::{Clock, Control, Coordinator, CoordinatorConfig, Ports, RunError, SessionEnd},
 };
 use fhd_testkit::transfer::{
-    digest, FetchFault, MemoryStore, MemoryTransfers, ScriptedTransport, StoreFaults,
+    digest, FetchFault, FixedDestination, MemoryStore, MemoryTransfers, ScriptedTransport,
+    StoreFaults,
 };
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 
 struct FixedClock;
@@ -33,6 +34,7 @@ struct Rig {
     transport: Arc<ScriptedTransport>,
     coordinator: Coordinator,
     id: JobId,
+    destination: PathBuf,
 }
 fn config() -> CoordinatorConfig {
     CoordinatorConfig {
@@ -66,10 +68,14 @@ fn rig_with(
     )
     .unwrap();
     repo.admit(&Job::new(id, spec));
+    let destination = std::env::temp_dir().join("fhd-test-destination.bin");
     let coordinator = Coordinator::new(
-        repo.clone(),
-        Arc::new(store.clone()),
-        transport.clone(),
+        Ports {
+            repository: repo.clone(),
+            store: Arc::new(store.clone()),
+            transport: transport.clone(),
+            destinations: Arc::new(FixedDestination(destination.clone())),
+        },
         // One 256 KiB block per connection: a stalled connection keeps only its own.
         BufferPool::new(1024 * 1024).unwrap(),
         Arc::new(FixedClock),
@@ -83,6 +89,7 @@ fn rig_with(
         transport,
         coordinator,
         id,
+        destination,
     }
 }
 impl Rig {
@@ -131,9 +138,13 @@ impl Rig {
 async fn parallel_transfer_writes_exact_bytes_and_verifies() {
     let content = body(100_003);
     let rig = rig(&content, true, None);
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     let job = rig.job().await;
-    assert_eq!(job.state(), JobState::Verifying);
+    assert_eq!(job.state(), JobState::Completed);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
     assert_eq!(rig.durable().await, content.len() as u64);
     assert_eq!(rig.store.bytes(rig.id, job.generation()).unwrap(), content);
     assert!(rig.transport.fetches() >= 4, "used parallel connections");
@@ -151,7 +162,10 @@ async fn parallel_transfer_writes_exact_bytes_and_verifies() {
 async fn server_without_ranges_uses_one_connection() {
     let content = body(20_000);
     let rig = rig(&content, false, None);
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     assert_eq!(rig.transport.fetches(), 1);
 }
 
@@ -176,7 +190,10 @@ async fn transient_failure_waits_then_resumes_keeping_durable_bytes() {
     assert!(rig.durable().await < content.len() as u64);
     rig.command(JobCommand::RetryDue { now_tick: at }).await;
     let before = rig.transport.fetches();
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     assert_eq!(
         rig.store
             .bytes(rig.id, rig.job().await.generation())
@@ -205,7 +222,10 @@ async fn pause_mid_transfer_persists_progress_and_resume_completes() {
     let kept = rig.durable().await;
     assert!(kept > 0 && kept < content.len() as u64);
     rig.command(JobCommand::Resume).await;
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
 }
 
 #[tokio::test]
@@ -231,7 +251,10 @@ async fn representation_change_restarts_under_a_new_generation() {
     let job = rig.job().await;
     assert_eq!(job.generation().get(), 2);
     assert_eq!(rig.durable().await, 0, "old generation extents are gone");
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
 }
 
 #[tokio::test]
@@ -334,7 +357,10 @@ async fn unavailable_extent_commit_is_retried_idempotently() {
         "an unconfirmed transition aborts the session"
     );
     assert_eq!(rig.repo.state(rig.id), Some(JobState::Queued));
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
 }
 
 #[tokio::test]
@@ -351,17 +377,26 @@ async fn odd_split_never_exceeds_the_segment_budget() {
             ..config()
         },
     );
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     assert!(rig.job().await.segments().unwrap().segments().len() <= 4);
 }
 
 #[tokio::test]
-async fn corruption_found_while_reverifying_needs_action() {
+async fn corruption_found_after_a_blocked_publish_needs_action() {
     let content = body(20_000);
     let rig = rig(&content, true, None);
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    // Publication is blocked by a stranger, so the job waits with everything durable.
+    rig.store.place(rig.destination.clone(), body(3_000));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
     let generation = rig.job().await.generation();
     rig.store.corrupt(rig.id, generation, 12_345);
+    rig.command(JobCommand::Resume).await;
     assert_eq!(
         rig.run().await,
         Ok(SessionEnd::Settled(JobState::NeedsAction))
@@ -385,7 +420,10 @@ async fn power_loss_keeps_only_synced_bytes_and_resume_is_exact() {
     // Everything not synced disappears; committed extents must still rehash.
     rig.store.crash();
     rig.command(JobCommand::Resume).await;
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     assert_eq!(
         rig.store
             .bytes(rig.id, rig.job().await.generation())
@@ -397,9 +435,14 @@ async fn power_loss_keeps_only_synced_bytes_and_resume_is_exact() {
 #[test]
 fn buffer_budget_below_one_block_per_connection_is_rejected() {
     let result = Coordinator::new(
-        Arc::new(MemoryTransfers::default()),
-        Arc::new(MemoryStore::default()),
-        Arc::new(ScriptedTransport::new(vec![], true, 1)),
+        Ports {
+            repository: Arc::new(MemoryTransfers::default()),
+            store: Arc::new(MemoryStore::default()),
+            transport: Arc::new(ScriptedTransport::new(vec![], true, 1)),
+            destinations: Arc::new(FixedDestination(
+                std::env::temp_dir().join("fhd-unused.bin"),
+            )),
+        },
         BufferPool::new(512 * 1024).unwrap(),
         Arc::new(FixedClock),
         config(),
@@ -430,7 +473,10 @@ async fn same_size_replacement_never_mixes_representations() {
     let job = rig.job().await;
     assert_eq!(job.generation().get(), 2);
     assert_eq!(rig.durable().await, 0);
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&new))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
     assert_eq!(
         rig.store
             .bytes(rig.id, rig.job().await.generation())
@@ -460,5 +506,77 @@ async fn server_without_validator_restarts_from_zero_on_resume() {
     // No validator: existing bytes cannot be trusted, so a new generation starts.
     assert_eq!(rig.run().await, Ok(SessionEnd::Settled(JobState::Queued)));
     assert_eq!(rig.job().await.generation().get(), 2);
-    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
+}
+
+#[tokio::test]
+async fn crash_between_rename_and_commit_completes_without_republishing() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    // The rename happened, then the process died before committing Completed.
+    rig.store.place(rig.destination.clone(), content.clone());
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
+    assert_eq!(rig.job().await.state(), JobState::Completed);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+}
+
+#[tokio::test]
+async fn foreign_file_at_the_destination_is_never_overwritten() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    let stranger = body(4_000);
+    rig.store.place(rig.destination.clone(), stranger.clone());
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    let job = rig.job().await;
+    assert_eq!(job.reason(), Some(StopReason::Destination));
+    assert_eq!(job.state(), JobState::NeedsAction);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), stranger);
+}
+
+#[tokio::test]
+async fn crash_before_the_rename_republishes_after_reproving_the_bytes() {
+    let content = body(25_000);
+    let rig = rig(&content, true, None);
+    // A blocked destination leaves a durable intent with the job settled.
+    rig.store.block(rig.destination.clone());
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    rig.store.free(&rig.destination);
+    // Everything is durable, so resuming goes straight to verification.
+    rig.command(JobCommand::Resume).await;
+    assert_eq!(rig.job().await.state(), JobState::Verifying);
+    // Publishing began and the process died before the rename.
+    rig.command(JobCommand::VerificationPassed).await;
+    assert_eq!(rig.job().await.state(), JobState::Publishing);
+    let fetches = rig.transport.fetches();
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
+    assert_eq!(rig.job().await.state(), JobState::Completed);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+    assert_eq!(rig.transport.fetches(), fetches, "no bytes fetched again");
+}
+
+#[tokio::test]
+async fn a_non_file_holding_the_name_blocks_publication() {
+    let content = body(12_000);
+    let rig = rig(&content, true, None);
+    rig.store.block(rig.destination.clone());
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    assert_eq!(rig.job().await.reason(), Some(StopReason::Destination));
 }

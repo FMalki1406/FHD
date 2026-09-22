@@ -23,6 +23,7 @@ enum Command {
     Sync(Reply<()>),
     Hash(ByteRange, Reply<[u8; 32]>),
     Verify(Option<[u8; 32]>, Reply<[u8; 32]>),
+    Publish(std::path::PathBuf, Reply<std::path::PathBuf>),
 }
 
 /// One dedicated OS writer for a part; workers only send owned bounded buffers.
@@ -108,6 +109,19 @@ impl Writer {
                             };
                             if let Err(error) = result {
                                 failure = Some(error);
+                            }
+                            let _ = reply.send(result);
+                        }
+                        // A destination conflict is a verdict, not a broken lane.
+                        Command::Publish(destination, reply) => {
+                            let result = match failure {
+                                Some(error) => Err(error),
+                                None => file.publish(&destination).map_err(WriterError::Storage),
+                            };
+                            if let Err(error) = result.as_ref() {
+                                if *error != WriterError::Storage(StorageError::Conflict) {
+                                    failure = Some(*error);
+                                }
                             }
                             let _ = reply.send(result);
                         }
@@ -204,6 +218,17 @@ impl Writer {
     ) -> Result<[u8; 32], WriterError> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Verify(expected, reply), cancel).await?;
+        result.await.map_err(|_| WriterError::WorkerFailed)?
+    }
+    /// Atomic no-replace publication, after every write and the verification.
+    pub async fn publish(
+        &self,
+        destination: std::path::PathBuf,
+        cancel: &CancellationToken,
+    ) -> Result<std::path::PathBuf, WriterError> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::Publish(destination, reply), cancel)
+            .await?;
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }
     pub async fn shutdown(mut self) -> Result<(), WriterError> {

@@ -3,7 +3,7 @@
 pub mod storage;
 pub mod transport;
 
-use fhd_domain::{ByteRange, Generation, Job, JobEvent, JobId, JobSpec};
+use fhd_domain::{ByteRange, DestinationRef, Generation, Job, JobEvent, JobId, JobSpec};
 use std::{future::Future, pin::Pin};
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -173,6 +173,55 @@ impl DurableExtent {
     }
 }
 
+/// Recorded before a publish attempt so a crash between renaming and committing
+/// can be reconciled instead of guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishIntent {
+    job: JobId,
+    generation: Generation,
+    attempt: u32,
+    size: u64,
+    digest: [u8; 32],
+}
+impl PublishIntent {
+    pub fn new(
+        job: JobId,
+        generation: Generation,
+        attempt: u32,
+        size: u64,
+        digest: [u8; 32],
+    ) -> Self {
+        Self {
+            job,
+            generation,
+            attempt,
+            size,
+            digest,
+        }
+    }
+    pub fn job(self) -> JobId {
+        self.job
+    }
+    pub fn generation(self) -> Generation {
+        self.generation
+    }
+    pub fn attempt(self) -> u32 {
+        self.attempt
+    }
+    pub fn size(self) -> u64 {
+        self.size
+    }
+    pub fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+/// Resolves an opaque destination reference to a path the storage adapter may use.
+/// The adapter, not this port, enforces the path policy (§10.7).
+pub trait Destinations: Send + Sync {
+    fn resolve(&self, destination: DestinationRef) -> Result<std::path::PathBuf, AppError>;
+}
+
 /// Durable transfer state. Each call is one transaction; nothing is acknowledged
 /// before commit. Callers apply a domain change in memory only after its commit.
 pub trait TransferRepository: Send + Sync {
@@ -191,6 +240,13 @@ pub trait TransferRepository: Send + Sync {
     fn load_jobs(&self) -> PortFuture<'_, Result<Vec<Job>, AppError>>;
     /// Durable extents of the job's current generation, ascending, for storage recovery.
     fn durable_extents(&self, job: JobId) -> PortFuture<'_, Result<Vec<DurableExtent>, AppError>>;
+    /// Records the intent before renaming. Replaces any earlier attempt of this job.
+    fn record_publish_intent(
+        &self,
+        intent: PublishIntent,
+    ) -> PortFuture<'_, Result<(), CommitError>>;
+    fn publish_intent(&self, job: JobId)
+        -> PortFuture<'_, Result<Option<PublishIntent>, AppError>>;
 }
 
 pub trait JobRepository: Send + Sync {

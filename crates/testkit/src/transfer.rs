@@ -1,12 +1,14 @@
 //! In-memory transfer ports with the same acceptance rules as the real adapters,
 //! plus fault injection. Deterministic and test-only.
 use fhd_app::{
-    storage::{PartSpec, SegmentFile, SegmentStore, StorageError},
+    storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
     transport::{ByteStream, Probe, Transport, TransportError},
-    AppError, CommitError, DurableExtent, PortFuture, TransferRepository,
+    AppError, CommitError, Destinations, DurableExtent, PortFuture, PublishIntent,
+    TransferRepository,
 };
 use fhd_domain::{
-    ByteRange, Generation, Job, JobCommand, JobEvent, JobId, JobRecord, JobState, SourceRef,
+    ByteRange, DestinationRef, Generation, Job, JobCommand, JobEvent, JobId, JobRecord, JobState,
+    SourceRef,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -38,6 +40,7 @@ fn overlaps(a: ByteRange, b: ByteRange) -> bool {
 struct Stored {
     record: JobRecord,
     extents: Vec<DurableExtent>,
+    intent: Option<PublishIntent>,
 }
 #[derive(Default)]
 pub struct MemoryTransfers {
@@ -67,6 +70,7 @@ impl MemoryTransfers {
             Stored {
                 record,
                 extents: vec![],
+                intent: None,
             },
         );
     }
@@ -142,6 +146,7 @@ impl TransferRepository for MemoryTransfers {
             }
             if replaced {
                 stored.extents.clear();
+                stored.intent = None;
             }
             let r = &mut stored.record;
             r.version = event.version();
@@ -152,6 +157,10 @@ impl TransferRepository for MemoryTransfers {
             r.stop = o.stop;
             r.replace_on_drain = o.replace_on_drain;
             r.attempts = o.attempts;
+            if event.command() == JobCommand::PublishCommitted {
+                stored.intent = None;
+            }
+            let r = &mut stored.record;
             r.plan = plan;
             r.validator = validator;
             Ok(())
@@ -212,6 +221,32 @@ impl TransferRepository for MemoryTransfers {
             Ok(out)
         })
     }
+    fn record_publish_intent(
+        &self,
+        intent: PublishIntent,
+    ) -> PortFuture<'_, Result<(), CommitError>> {
+        Box::pin(async move {
+            let mut jobs = self.jobs.lock().unwrap();
+            let stored = jobs.get_mut(&intent.job()).ok_or(CommitError::Conflict)?;
+            if stored.record.state != JobState::Verifying
+                || stored.record.generation != intent.generation()
+                || stored
+                    .record
+                    .plan
+                    .is_none_or(|(total, _)| total != intent.size())
+            {
+                return Err(CommitError::Conflict);
+            }
+            stored.intent = Some(intent);
+            Ok(())
+        })
+    }
+    fn publish_intent(
+        &self,
+        job: JobId,
+    ) -> PortFuture<'_, Result<Option<PublishIntent>, AppError>> {
+        Box::pin(async move { Ok(self.jobs.lock().unwrap().get(&job).and_then(|s| s.intent)) })
+    }
     fn durable_extents(&self, job: JobId) -> PortFuture<'_, Result<Vec<DurableExtent>, AppError>> {
         Box::pin(async move {
             Ok(self
@@ -238,10 +273,13 @@ struct FileData {
     durable: Vec<u8>,
 }
 type Files = HashMap<(JobId, Generation), Arc<Mutex<FileData>>>;
+type Published = HashMap<PathBuf, Vec<u8>>;
 /// Files outlive handles, like a disk across process restarts.
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     files: Arc<Mutex<Files>>,
+    published: Arc<Mutex<Published>>,
+    blocked: Arc<Mutex<Vec<PathBuf>>>,
     faults: Arc<Mutex<StoreFaults>>,
 }
 impl MemoryStore {
@@ -268,17 +306,66 @@ impl MemoryStore {
             file.live = file.durable.clone();
         }
     }
+    /// Bytes already at a destination path.
+    pub fn published(&self, path: &Path) -> Option<Vec<u8>> {
+        self.published.lock().unwrap().get(path).cloned()
+    }
+    /// Places foreign (or identical) content at a destination before a publish.
+    pub fn place(&self, path: PathBuf, bytes: Vec<u8>) {
+        self.published.lock().unwrap().insert(path, bytes);
+    }
+    /// Occupies a destination with something that is not a regular file.
+    pub fn block(&self, path: PathBuf) {
+        self.blocked.lock().unwrap().push(path);
+    }
+    /// Frees a destination previously blocked or occupied.
+    pub fn free(&self, path: &Path) {
+        self.blocked.lock().unwrap().retain(|p| p != path);
+        self.published.lock().unwrap().remove(path);
+    }
     fn handle(&self, spec: PartSpec, data: Arc<Mutex<FileData>>) -> Box<dyn SegmentFile> {
         Box::new(MemoryFile {
             spec,
             data,
             coverage: vec![],
             synced: false,
+            verified: false,
             faults: self.faults.clone(),
+            published: self.published.clone(),
+            blocked: self.blocked.clone(),
         })
     }
 }
 impl SegmentStore for MemoryStore {
+    fn inspect(
+        &self,
+        destination: &Path,
+        expected_size: u64,
+    ) -> Result<Option<Occupant>, StorageError> {
+        if self
+            .blocked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == destination)
+        {
+            return Ok(Some(Occupant::NotAFile));
+        }
+        Ok(self
+            .published
+            .lock()
+            .unwrap()
+            .get(destination)
+            .map(|bytes| {
+                if bytes.len() as u64 != expected_size {
+                    return Occupant::OtherSize;
+                }
+                Occupant::File {
+                    size: bytes.len() as u64,
+                    digest: digest(bytes),
+                }
+            }))
+    }
     fn create(&self, _: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError> {
         let mut files = self.files.lock().unwrap();
         let key = (spec.job(), spec.generation());
@@ -310,7 +397,10 @@ struct MemoryFile {
     data: Arc<Mutex<FileData>>,
     coverage: Vec<(u64, u64)>,
     synced: bool,
+    verified: bool,
     faults: Arc<Mutex<StoreFaults>>,
+    published: Arc<Mutex<Published>>,
+    blocked: Arc<Mutex<Vec<PathBuf>>>,
 }
 impl MemoryFile {
     fn cover(&mut self, start: u64, end: u64) {
@@ -356,6 +446,7 @@ impl SegmentFile for MemoryFile {
         self.data.lock().unwrap().live[offset as usize..end as usize].copy_from_slice(bytes);
         self.cover(offset, end);
         self.synced = false;
+        self.verified = false;
         Ok(())
     }
     fn sync(&mut self) -> Result<(), StorageError> {
@@ -392,10 +483,32 @@ impl SegmentFile for MemoryFile {
         if expected.is_some_and(|e| e != actual) {
             return Err(StorageError::Integrity);
         }
+        self.verified = true;
         Ok(actual)
     }
-    fn publish(&mut self, _: &Path) -> Result<PathBuf, StorageError> {
-        Err(StorageError::Unsupported)
+    /// Atomic no-replace: an occupied destination is a conflict, never an overwrite.
+    /// Like the real adapter, only a verified, synced, complete file may be published.
+    fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError> {
+        if !self.complete() || !self.synced || !self.verified {
+            return Err(StorageError::InvalidState);
+        }
+        if self
+            .blocked
+            .lock()
+            .unwrap()
+            .contains(&destination.to_path_buf())
+        {
+            return Err(StorageError::Conflict);
+        }
+        let mut published = self.published.lock().unwrap();
+        if published.contains_key(destination) {
+            return Err(StorageError::Conflict);
+        }
+        published.insert(
+            destination.to_path_buf(),
+            self.data.lock().unwrap().live.clone(),
+        );
+        Ok(destination.to_path_buf())
     }
 }
 
@@ -528,5 +641,13 @@ impl ByteStream for ScriptedStream {
             self.delivered += limit;
             Ok(limit)
         })
+    }
+}
+
+/// Maps every destination reference to one path under a test directory.
+pub struct FixedDestination(pub PathBuf);
+impl Destinations for FixedDestination {
+    fn resolve(&self, _: DestinationRef) -> Result<PathBuf, AppError> {
+        Ok(self.0.clone())
     }
 }
