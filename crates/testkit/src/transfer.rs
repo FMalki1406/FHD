@@ -2,7 +2,7 @@
 //! plus fault injection. Deterministic and test-only.
 use fhd_app::{
     storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
-    transport::{ByteStream, Probe, Transport, TransportError},
+    transport::{ByteStream, OriginId, Probe, Transport, TransportError},
     AppError, CommitError, Destinations, DurableExtent, PortFuture, PublishIntent,
     TransferRepository,
 };
@@ -562,6 +562,7 @@ pub enum FetchFault {
     },
 }
 pub struct ScriptedTransport {
+    origin: OriginId,
     body: Mutex<Arc<Vec<u8>>>,
     ranges: bool,
     chunk: usize,
@@ -573,6 +574,7 @@ pub struct ScriptedTransport {
 impl ScriptedTransport {
     pub fn new(body: Vec<u8>, ranges: bool, chunk: usize) -> Self {
         Self {
+            origin: OriginId::new([0; 16]),
             body: Mutex::new(Arc::new(body)),
             ranges,
             chunk: chunk.max(1),
@@ -581,6 +583,13 @@ impl ScriptedTransport {
             changed: Mutex::new(false),
             fetches: AtomicUsize::new(0),
         }
+    }
+    /// Places this transport's sources on a distinct origin, for scheduling tests.
+    pub fn on_origin(mut self, tag: u8) -> Self {
+        let mut bytes = [0; 16];
+        bytes[0] = tag;
+        self.origin = OriginId::new(bytes);
+        self
     }
     pub fn fail_probe(&self, error: TransportError) {
         self.probe_faults.lock().unwrap().push_back(error);
@@ -607,6 +616,9 @@ impl ScriptedTransport {
     }
 }
 impl Transport for ScriptedTransport {
+    fn origin(&self, _: SourceRef) -> OriginId {
+        self.origin
+    }
     fn probe(&self, _: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>> {
         Box::pin(async move {
             if let Some(error) = self.probe_faults.lock().unwrap().pop_front() {

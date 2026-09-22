@@ -68,8 +68,10 @@ pub enum Code {
     CheckpointCommitted,
     BufferPressure,
     PolicyRejected,
+    /// A command arrived for a job nobody here owns; it changed nothing.
+    CommandIgnored,
 }
-const CODE_COUNT: usize = 14;
+const CODE_COUNT: usize = 15;
 impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -87,6 +89,7 @@ impl Code {
             Self::CheckpointCommitted => "STORE-COMMITTED",
             Self::BufferPressure => "BUFFER-PRESSURE",
             Self::PolicyRejected => "POLICY-REJECTED",
+            Self::CommandIgnored => "CMD-IGNORED",
         }
     }
 }

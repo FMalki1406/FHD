@@ -284,6 +284,7 @@ dependencies = [
  "bytes",
  "fhd-app",
  "fhd-domain",
+ "getrandom 0.4.3",
  "reqwest",
  "sha2",
  "tokio",

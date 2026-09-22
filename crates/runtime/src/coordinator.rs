@@ -3,13 +3,14 @@
 //! A checkpoint is prepare_sync → sync → hash each range → commit extents → ack.
 use crate::{
     buffers::{BufferPool, MAX_BUFFER},
+    origin::OriginGovernor,
     writer::{Writer, WriterError},
     CancellationToken,
 };
 use fhd_app::{
     storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
-    transport::{Transport, TransportError},
-    CommitError, Destinations, DurableExtent, PublishIntent, TransferRepository,
+    transport::{OriginId, Transport, TransportError},
+    CommitError, Destinations, DurableExtent, PortFuture, PublishIntent, TransferRepository,
 };
 use fhd_domain::{
     ByteRange, DomainError, ErrorClass, Job, JobCommand, JobState, Lease, RetryDecision,
@@ -31,6 +32,12 @@ use tokio::{
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
     fn jitter(&self) -> u64;
+    /// Waits until this wall-clock millisecond. The default reads `now_ms` once and
+    /// waits the difference on the runtime timer; a test clock overrides it.
+    fn sleep_until(&self, deadline_ms: u64) -> PortFuture<'_, ()> {
+        let wait = deadline_ms.saturating_sub(self.now_ms());
+        Box::pin(tokio::time::sleep(Duration::from_millis(wait)))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +113,9 @@ pub struct Coordinator {
     clock: Arc<dyn Clock>,
     config: CoordinatorConfig,
     directory: PathBuf,
+    /// Told how each origin behaved. Admission is the scheduler's call, not a
+    /// session's: a session that already started keeps the grant it was given.
+    governor: Option<Arc<OriginGovernor>>,
 }
 
 async fn step(
@@ -141,7 +151,28 @@ impl Coordinator {
             clock,
             config,
             directory,
+            governor: None,
         })
+    }
+
+    /// Reports every origin outcome to this governor. Without one the coordinator
+    /// still runs; only per-origin governing is then nobody's job.
+    pub fn with_governor(mut self, governor: Arc<OriginGovernor>) -> Self {
+        self.governor = Some(governor);
+        self
+    }
+
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
+    pub fn config(&self) -> CoordinatorConfig {
+        self.config
+    }
+
+    /// The origin a job's source belongs to, as the transport adapter groups them.
+    pub fn origin_of(&self, job: &Job) -> OriginId {
+        self.ports.transport.origin(job.spec().source())
     }
 
     /// Applies one command through the same decide → commit → apply path the
@@ -204,15 +235,36 @@ impl Coordinator {
         job: Job,
         control: mpsc::Receiver<Control>,
     ) -> Result<SessionEnd, RunError> {
+        let origin = self.origin_of(&job);
+        self.run_with(job, control, self.config.connections, origin)
+            .await
+            .1
+    }
+
+    /// Runs a session limited to `connections`, under the origin the caller admitted
+    /// it against, and hands the job back however it ended: the scheduler decides
+    /// what happens next, and needs the final state even when the session failed.
+    pub async fn run_with(
+        &self,
+        job: Job,
+        control: mpsc::Receiver<Control>,
+        connections: usize,
+        origin: OriginId,
+    ) -> (Job, Result<SessionEnd, RunError>) {
+        let state = job.state();
+        if connections == 0 || connections > self.config.connections {
+            return (job, Err(RunError::InvalidConfig));
+        }
         if !matches!(
-            job.state(),
+            state,
             JobState::Queued | JobState::Verifying | JobState::Publishing
         ) {
-            return Err(RunError::NotRunnable(job.state()));
+            return (job, Err(RunError::NotRunnable(state)));
         }
         let mut session = Session {
             c: self,
             source: job.spec().source(),
+            origin,
             job,
             control,
             control_open: true,
@@ -223,18 +275,19 @@ impl Coordinator {
             io: CancellationToken::new(),
             unsynced: 0,
             storage_failed: false,
-            connections: self.config.connections,
+            connections,
             next_worker: 0,
         };
         let result = session.drive().await;
         session.close().await;
-        result
+        (session.job, result)
     }
 }
 
 struct Session<'c> {
     c: &'c Coordinator,
     source: SourceRef,
+    origin: OriginId,
     job: Job,
     control: mpsc::Receiver<Control>,
     control_open: bool,
@@ -303,6 +356,10 @@ impl Session<'_> {
         if changed {
             self.step(JobCommand::RepresentationChanged).await?;
             return self.finish().await;
+        }
+        // The origin answered: whatever it did before no longer counts against it.
+        if let Some(governor) = &self.c.governor {
+            governor.succeeded(self.origin, self.c.clock.now_ms());
         }
         if !probe.ranges() {
             self.connections = 1;
@@ -602,6 +659,16 @@ impl Session<'_> {
                 };
                 report(&self.job, code, 0, Duration::ZERO);
                 let now = self.c.clock.now_ms();
+                // The governor decides what the origin may be asked next, for every
+                // job on it; the retry policy only decides when this job asks again.
+                if let Some(governor) = &self.c.governor {
+                    match error {
+                        TransportError::Throttled { retry_after_ms } => {
+                            governor.throttled(self.origin, retry_after_ms, now)
+                        }
+                        _ => governor.failed(self.origin, now),
+                    }
+                }
                 let (class, deadline) = match error {
                     TransportError::Throttled { retry_after_ms } => (
                         ErrorClass::Throttled,

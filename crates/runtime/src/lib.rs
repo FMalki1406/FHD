@@ -2,5 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod buffers;
 pub mod coordinator;
+pub mod origin;
+pub mod scheduler;
 pub mod writer;
 pub use tokio_util::sync::CancellationToken;

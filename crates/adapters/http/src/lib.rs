@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use fhd_app::{
-    transport::{ByteStream, Probe, Transport, TransportError},
+    transport::{ByteStream, OriginId, Probe, Transport, TransportError},
     PortFuture,
 };
 use fhd_domain::{resume::StrongEtag, ByteRange, SourceRef, StopReason};
@@ -24,6 +24,8 @@ const MAX_URL: usize = 16_384;
 const MAX_FIELD: usize = 8192;
 /// Domain label so a validator digest is never confused with any other digest.
 const VALIDATOR_LABEL: &[u8] = b"FHD.representation.validator.v1\0";
+const ORIGIN_LABEL: &[u8] = b"FHD.transport.origin.v1\0";
+const UNBOUND_LABEL: &[u8] = b"FHD.transport.unbound-source.v1\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingError {
@@ -357,6 +359,34 @@ fn strong_validator(headers: &HeaderMap) -> Option<String> {
     std::str::from_utf8(value).ok().map(str::to_owned)
 }
 
+/// Fresh per process. The origin space is small and enumerable, so an unsalted
+/// digest of a hostname is invertible by dictionary and linkable between machines;
+/// with this, a key means something only inside the process that made it.
+fn salt() -> &'static [u8; 32] {
+    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        // A failure here would mean no entropy at all; refusing to start beats
+        // grouping origins under a predictable key.
+        getrandom::fill(&mut bytes).expect("operating system entropy");
+        bytes
+    })
+}
+
+/// Same scheme, host and port hash alike; an unbound source hashes its own id, so
+/// it never shares a governor bucket with a real origin.
+fn origin_digest(label: &[u8], value: &[u8]) -> OriginId {
+    let mut hash = Sha256::new();
+    hash.update(salt());
+    hash.update(label);
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value);
+    let full: [u8; 32] = hash.finalize().into();
+    let mut short = [0u8; 16];
+    short.copy_from_slice(&full[..16]);
+    OriginId::new(short)
+}
+
 fn validator_digest(etag: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(VALIDATOR_LABEL);
@@ -367,9 +397,11 @@ fn validator_digest(etag: &str) -> [u8; 32] {
 
 /// Status to outcome. Retry-After in seconds becomes a throttle delay.
 fn status_error(status: StatusCode, headers: &HeaderMap) -> TransportError {
+    // Capped at a day: a hostile or broken Retry-After must not park work for years.
     let retry_after_ms = single(headers, header::RETRY_AFTER)
         .and_then(digits)
-        .and_then(|seconds| seconds.checked_mul(1000));
+        .and_then(|seconds| seconds.checked_mul(1000))
+        .map(|ms| ms.min(86_400_000));
     match status.as_u16() {
         408 | 425 | 500 | 502 | 504 => TransportError::Transient,
         429 | 503 => TransportError::Throttled { retry_after_ms },
@@ -382,6 +414,15 @@ fn status_error(status: StatusCode, headers: &HeaderMap) -> TransportError {
 }
 
 impl Transport for HttpTransport {
+    fn origin(&self, source: SourceRef) -> OriginId {
+        match self.binding(source) {
+            Some(binding) => origin_digest(
+                ORIGIN_LABEL,
+                binding.url.origin().ascii_serialization().as_bytes(),
+            ),
+            None => origin_digest(UNBOUND_LABEL, &source.get().to_le_bytes()),
+        }
+    }
     fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>> {
         Box::pin(async move {
             let binding = self

@@ -4,6 +4,35 @@
 use crate::PortFuture;
 use fhd_domain::{ByteRange, SourceRef, StopReason};
 
+/// Opaque grouping key for a source's origin (scheme, host, port). The runtime
+/// governs per-origin limits by comparing these; it can never read a host from one.
+///
+/// Adapter contract: derive it by a domain-separated hash keyed with a secret the
+/// process makes at startup. The origin space is small enough to enumerate, so an
+/// unsalted digest would be invertible by anyone holding a log of it. Keyed, a value
+/// is comparable inside one process and meaningless outside it — which is all the
+/// governor needs. It is not an anonymity guarantee against whoever holds the key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OriginId([u8; 16]);
+impl OriginId {
+    pub fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    pub fn get(self) -> [u8; 16] {
+        self.0
+    }
+}
+impl std::fmt::Debug for OriginId {
+    /// Short and opaque: enough to tell two origins apart in a log, never a host.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "origin:{:02x}{:02x}{:02x}{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3]
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
     total: u64,
@@ -58,6 +87,10 @@ pub trait ByteStream: Send {
 
 /// Dropping a returned future or stream cancels the request.
 pub trait Transport: Send + Sync {
+    /// The origin this source belongs to, for per-origin limits. Must be stable for
+    /// the life of the source binding and equal only for the same scheme, host and
+    /// port; an unknown source gets a key of its own, never a shared bucket.
+    fn origin(&self, source: SourceRef) -> OriginId;
     fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>>;
     /// `validator` is the representation the caller's bytes belong to, as reported by
     /// the probe. The adapter must refuse (`RepresentationChanged`) if what it would
