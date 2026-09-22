@@ -208,6 +208,8 @@ struct FilePart {
     synchronized: bool,
     verified: Option<[u8; 32]>,
     sealed: bool,
+    published: bool,
+    cancelled: bool,
     poisoned: bool,
     #[cfg(test)]
     fault: Option<Fault>,
@@ -283,6 +285,8 @@ impl FilePart {
             synchronized: create,
             verified: None,
             sealed,
+            published: false,
+            cancelled: false,
             poisoned: false,
             #[cfg(test)]
             fault: None,
@@ -445,6 +449,27 @@ impl SegmentFile for FilePart {
         self.verified = Some(digest);
         Ok(digest)
     }
+    /// Only after this handle published, so the bytes still exist under their
+    /// final name; otherwise the caller must cancel, which is a different decision.
+    fn discard(&mut self) -> Result<(), StorageError> {
+        if !self.published && !self.cancelled {
+            return Err(StorageError::InvalidState);
+        }
+        // Order matters: the part first, then its sidecar, so no metadata ever
+        // claims a generation whose bytes are already gone.
+        self.poisoned = true;
+        for path in [self.path.clone(), self.path.with_extension("meta")] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io(error)),
+            }
+        }
+        sync_directory(&self.directory)
+    }
+    fn abandon(&mut self) {
+        self.cancelled = true;
+    }
     fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError> {
         self.healthy()?;
         let expected = self.verified.ok_or(StorageError::InvalidState)?;
@@ -487,6 +512,7 @@ impl SegmentFile for FilePart {
         self.file.sync_all().map_err(io)?;
         sync_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
         sync_directory(&self.directory)?;
+        self.published = true;
         self.poisoned = false;
         Ok(destination)
     }
@@ -555,6 +581,36 @@ mod tests {
         assert_eq!(part.verify(Some(hash(b"abcdef"))).unwrap(), hash(b"abcdef"));
         part.publish(&directory.output()).unwrap();
         assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
+    }
+    #[test]
+    fn a_part_is_released_only_after_publication_or_abandonment() {
+        let directory = Directory::new();
+        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        part.verify(None).unwrap();
+        // Unpublished bytes are never thrown away by mistake.
+        assert_eq!(part.discard(), Err(StorageError::InvalidState));
+        assert!(directory.part().join("1-1.part").exists());
+        part.publish(&directory.output()).unwrap();
+        part.discard().unwrap();
+        // The published name still holds the bytes; the part and its sidecar are gone.
+        assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
+        assert!(!directory.part().join("1-1.part").exists());
+        assert!(!directory.part().join("1-1.meta").exists());
+        // The handle is finished for real work, and releasing twice is harmless.
+        assert_eq!(part.sync(), Err(StorageError::InvalidState));
+        assert_eq!(part.write_at(0, b"x"), Err(StorageError::InvalidState));
+        part.discard().unwrap();
+
+        // A cancelled transfer may drop bytes it never published.
+        let directory = Directory::new();
+        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        part.abandon();
+        part.discard().unwrap();
+        assert!(!directory.part().join("1-1.part").exists());
     }
     #[test]
     fn file_length_and_zero_hash_never_authorize_unwritten_holes() {

@@ -120,6 +120,24 @@ fn resuming(state: &Directory, destination: PathBuf, connections: usize) -> Engi
         ..config(state, destination, connections)
     }
 }
+/// Total size of everything still under the engine's parts directory.
+fn part_bytes(state: &Directory) -> u64 {
+    fn walk(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => walk(&entry.path()),
+                // owner.lock and similar bookkeeping are not payload.
+                Ok(metadata) if metadata.len() > 4096 => metadata.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+    walk(&state.0.join("parts"))
+}
 fn expected_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -143,6 +161,8 @@ async fn downloads_verifies_and_publishes_over_real_adapters() {
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(engine.state().await.unwrap(), JobState::Completed);
+    // The part is released: its bytes live under the final name now.
+    assert_eq!(part_bytes(&state), 0, "part file left behind");
     assert!(served.load(Ordering::Relaxed) > 1, "used several requests");
 
     // One owner at a time: release the state directory before reopening it.
@@ -339,4 +359,66 @@ async fn a_destination_on_another_volume_is_refused_before_downloading() {
     assert!(Engine::open(settings, "http://127.0.0.1:1/file")
         .await
         .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_job_leaves_no_part_behind() {
+    let body = content(4 * 1024 * 1024);
+    let (port, served) = serve(body, 0);
+    let state = Directory::new("cancel");
+    let destination = state.0.join("cancelled.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (control, receiver) = mpsc::channel(1);
+    let run = engine.run(receiver);
+    let cancel = async {
+        while served.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        control.send(Control::Cancel).await.unwrap();
+    };
+    let (outcome, ()) = tokio::join!(run, cancel);
+    match outcome.unwrap() {
+        SessionEnd::Settled(JobState::Cancelled) => {}
+        // Publication can win the race; then the part is released the other way.
+        SessionEnd::Published(_) => {}
+        other => panic!("unexpected outcome {other:?}"),
+    }
+    assert_eq!(part_bytes(&state), 0, "cancelled work keeps nothing");
+    assert!(!destination.exists() || std::fs::metadata(&destination).unwrap().len() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
+    let body = content(2 * 1024 * 1024);
+    let (port, _) = serve(body.clone(), 0);
+    let state = Directory::new("reconcile");
+    let destination = state.0.join("done.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // First run publishes and releases its part.
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert_eq!(
+        engine.run(receiver).await.unwrap(),
+        SessionEnd::Published(destination.clone())
+    );
+    drop(engine);
+
+    // A second request for the same bytes to the same name finds them already
+    // there: it reconciles instead of republishing, and keeps no part either.
+    let mut second = config(&state, destination.clone(), 2);
+    second.max_bytes = 63 * 1024 * 1024;
+    let engine = Engine::open(second, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert_eq!(
+        engine.run(receiver).await.unwrap(),
+        SessionEnd::Published(destination.clone())
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
+    assert_eq!(part_bytes(&state), 0, "reconciled publish left a part");
 }

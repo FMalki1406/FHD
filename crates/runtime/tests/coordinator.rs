@@ -146,7 +146,11 @@ async fn parallel_transfer_writes_exact_bytes_and_verifies() {
     assert_eq!(job.state(), JobState::Completed);
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
     assert_eq!(rig.durable().await, content.len() as u64);
-    assert_eq!(rig.store.bytes(rig.id, job.generation()).unwrap(), content);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+    assert!(
+        rig.store.bytes(rig.id, job.generation()).is_none(),
+        "the part is released once its bytes live under the final name"
+    );
     assert!(rig.transport.fetches() >= 4, "used parallel connections");
     // Every committed extent carries the digest of exactly its own bytes.
     for extent in rig.repo.durable_extents(rig.id).await.unwrap() {
@@ -194,12 +198,7 @@ async fn transient_failure_waits_then_resumes_keeping_durable_bytes() {
         rig.run().await,
         Ok(SessionEnd::Published(rig.destination.clone()))
     );
-    assert_eq!(
-        rig.store
-            .bytes(rig.id, rig.job().await.generation())
-            .unwrap(),
-        content
-    );
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
     // Only the missing ranges are fetched again.
     assert!(rig.transport.fetches() - before < 4 + 64);
 }
@@ -424,12 +423,7 @@ async fn power_loss_keeps_only_synced_bytes_and_resume_is_exact() {
         rig.run().await,
         Ok(SessionEnd::Published(rig.destination.clone()))
     );
-    assert_eq!(
-        rig.store
-            .bytes(rig.id, rig.job().await.generation())
-            .unwrap(),
-        content
-    );
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
 }
 
 #[test]
@@ -477,12 +471,7 @@ async fn same_size_replacement_never_mixes_representations() {
         rig.run().await,
         Ok(SessionEnd::Published(rig.destination.clone()))
     );
-    assert_eq!(
-        rig.store
-            .bytes(rig.id, rig.job().await.generation())
-            .unwrap(),
-        new
-    );
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), new);
 }
 
 #[tokio::test]

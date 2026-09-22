@@ -15,7 +15,13 @@ use fhd_domain::{
     ByteRange, DomainError, ErrorClass, Job, JobCommand, JobState, Lease, RetryDecision,
     RetryPolicy, SegmentState, SourceRef, StopReason,
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use fhd_telemetry::{emit, Code, Event};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     sync::mpsc,
     task::{Id, JoinSet},
@@ -138,8 +144,6 @@ impl Coordinator {
         })
     }
 
-    /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.
-    /// Part-file cleanup for Cancelling is not implemented yet; the record completes.
     /// Applies one command through the same decide → commit → apply path the
     /// coordinator uses, so callers never invent a second protocol.
     pub async fn command(&self, mut job: Job, command: JobCommand) -> Result<Job, RunError> {
@@ -147,6 +151,30 @@ impl Coordinator {
         Ok(job)
     }
 
+    /// Drops a job's part through its own handle, for cases with no live writer:
+    /// a publish reconciled from the destination, or a cancelled job being settled.
+    /// Best effort: an orphan left behind is reported, never fatal.
+    async fn drop_part(&self, job: &Job) {
+        let Some((total, _)) = job.plan() else {
+            return;
+        };
+        let Ok(spec) = PartSpec::new(job.id(), job.generation(), total) else {
+            return;
+        };
+        let store = self.ports.store.clone();
+        let directory = self.directory.clone();
+        let removed = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let mut file = store.open(&directory, spec)?;
+            file.abandon();
+            file.discard()
+        })
+        .await;
+        if !matches!(removed, Ok(Ok(()))) {
+            emit(Event::new(Code::StorageFailed).for_job(job.id().get(), job.generation().get()));
+        }
+    }
+
+    /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.
     pub async fn recover(&self, mut job: Job) -> Result<Job, RunError> {
         let repository = self.ports.repository.as_ref();
         match job.state() {
@@ -157,7 +185,12 @@ impl Coordinator {
                 }
             }
             JobState::Stopping => step(repository, &mut job, JobCommand::WorkersDrained).await?,
-            JobState::Cancelling => step(repository, &mut job, JobCommand::CleanupFinished).await?,
+            JobState::Cancelling => {
+                // A cancellation interrupted by a crash still keeps nothing.
+                self.drop_part(&job).await;
+                let repository = self.ports.repository.as_ref();
+                step(repository, &mut job, JobCommand::CleanupFinished).await?;
+            }
             _ => {}
         }
         Ok(job)
@@ -215,6 +248,15 @@ struct Session<'c> {
     storage_failed: bool,
     connections: usize,
     next_worker: u64,
+}
+
+/// Numbers only: a job id, a generation, a byte count and a duration.
+fn report(job: &Job, code: Code, value: u64, elapsed: Duration) {
+    emit(
+        Event::new(code)
+            .for_job(job.id().get(), job.generation().get())
+            .with_measurement(value, elapsed),
+    );
 }
 
 impl Session<'_> {
@@ -547,10 +589,18 @@ impl Session<'_> {
 
     async fn on_transport_error(&mut self, error: TransportError) -> Result<(), RunError> {
         let command = match error {
-            TransportError::RepresentationChanged => JobCommand::RepresentationChanged,
+            TransportError::RepresentationChanged => {
+                report(&self.job, Code::SourceChanged, 0, Duration::ZERO);
+                JobCommand::RepresentationChanged
+            }
             TransportError::UserAction(reason) => JobCommand::RequireAction { reason },
             TransportError::Fatal(reason) => JobCommand::Fail { reason },
             TransportError::Transient | TransportError::Throttled { .. } => {
+                let code = match error {
+                    TransportError::Throttled { .. } => Code::RequestThrottled,
+                    _ => Code::ReadTimeout,
+                };
+                report(&self.job, code, 0, Duration::ZERO);
                 let now = self.c.clock.now_ms();
                 let (class, deadline) = match error {
                     TransportError::Throttled { retry_after_ms } => (
@@ -577,6 +627,7 @@ impl Session<'_> {
     }
 
     async fn on_storage_failure(&mut self) -> Result<(), RunError> {
+        report(&self.job, Code::StorageFailed, 0, Duration::ZERO);
         self.storage_failed = true;
         self.stop_with(JobCommand::RequireAction {
             reason: StopReason::Storage,
@@ -592,6 +643,7 @@ impl Session<'_> {
             .writer
             .clone()
             .ok_or(RunError::Writer(WriterError::Closed))?;
+        let started = Instant::now();
         let ticket = self.job.prepare_sync().map_err(RunError::Domain)?;
         if writer.sync(&self.io).await.is_err() {
             self.job.abandon_checkpoint().map_err(RunError::Domain)?;
@@ -635,6 +687,12 @@ impl Session<'_> {
         self.job
             .acknowledge_commit(batch)
             .map_err(RunError::Domain)?;
+        report(
+            &self.job,
+            Code::CheckpointCommitted,
+            self.job.projection().durable_bytes,
+            started.elapsed(),
+        );
         self.unsynced = 0;
         Ok(())
     }
@@ -669,7 +727,11 @@ impl Session<'_> {
                 }
                 self.step(JobCommand::WorkersDrained).await?;
             }
-            JobState::Cancelling => self.step(JobCommand::CleanupFinished).await?,
+            JobState::Cancelling => {
+                // Cancelled work keeps nothing: the part goes before the record does.
+                self.release_part(true).await;
+                self.step(JobCommand::CleanupFinished).await?;
+            }
             _ => {}
         }
         if self.job.state() == JobState::Verifying {
@@ -769,6 +831,9 @@ impl Session<'_> {
                 if size == intent.size() && digest == intent.digest() =>
             {
                 self.step(JobCommand::PublishCommitted).await?;
+                // This handle never published, but the bytes are at the destination.
+                self.release_part(true).await;
+                report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
                 return Ok(SessionEnd::Published(destination));
             }
             Some(_) => return self.publish_blocked(StopReason::Destination).await,
@@ -801,6 +866,8 @@ impl Session<'_> {
         match writer.publish(destination.clone(), &self.io).await {
             Ok(path) => {
                 self.step(JobCommand::PublishCommitted).await?;
+                self.release_part(false).await;
+                report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
                 Ok(SessionEnd::Published(path))
             }
             // Lost a race for the name, or an unrelated file appeared meanwhile.
@@ -831,6 +898,21 @@ impl Session<'_> {
             self.step(JobCommand::RequireAction { reason }).await?;
         }
         Ok(SessionEnd::Settled(self.job.state()))
+    }
+
+    /// Drops the part file: after publication its bytes live under the final name,
+    /// and for a cancelled job they are not wanted. Best effort: a part left behind
+    /// is recorded, never fatal, and the orphan stays visible to the repository.
+    async fn release_part(&mut self, abandon: bool) {
+        // The lane owns the file while it lives, so it must do the releasing;
+        // only a session without one falls back to a standalone handle.
+        let Some(writer) = self.writer.clone() else {
+            self.c.drop_part(&self.job).await;
+            return;
+        };
+        if writer.discard(abandon, &self.io).await.is_err() {
+            report(&self.job, Code::StorageFailed, 0, Duration::ZERO);
+        }
     }
 
     /// Stops workers and waits for the writer thread; accepted writes finish first.

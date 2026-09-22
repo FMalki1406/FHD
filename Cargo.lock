@@ -267,6 +267,7 @@ dependencies = [
  "fhd-telemetry",
  "sha2",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -306,6 +307,7 @@ version = "0.1.0"
 dependencies = [
  "fhd-app",
  "fhd-domain",
+ "fhd-telemetry",
  "fhd-testkit",
  "tokio",
  "tokio-util",

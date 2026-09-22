@@ -333,6 +333,10 @@ impl MemoryStore {
             faults: self.faults.clone(),
             published: self.published.clone(),
             blocked: self.blocked.clone(),
+            files: self.files.clone(),
+            published_once: false,
+            abandoned: false,
+            discarded: false,
         })
     }
 }
@@ -401,8 +405,19 @@ struct MemoryFile {
     faults: Arc<Mutex<StoreFaults>>,
     published: Arc<Mutex<Published>>,
     blocked: Arc<Mutex<Vec<PathBuf>>>,
+    files: Arc<Mutex<Files>>,
+    published_once: bool,
+    abandoned: bool,
+    discarded: bool,
 }
 impl MemoryFile {
+    /// Like the real adapter, a discarded handle refers to a file that is gone.
+    fn usable(&self) -> Result<(), StorageError> {
+        if self.discarded {
+            return Err(StorageError::InvalidState);
+        }
+        Ok(())
+    }
     fn cover(&mut self, start: u64, end: u64) {
         self.coverage.push((start, end));
         self.coverage.sort_unstable();
@@ -428,6 +443,7 @@ impl SegmentFile for MemoryFile {
         self.spec
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        self.usable()?;
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(StorageError::Bounds)?;
@@ -450,6 +466,7 @@ impl SegmentFile for MemoryFile {
         Ok(())
     }
     fn sync(&mut self) -> Result<(), StorageError> {
+        self.usable()?;
         if self.faults.lock().unwrap().fail_sync {
             return Err(StorageError::Io(std::io::ErrorKind::Other));
         }
@@ -486,9 +503,27 @@ impl SegmentFile for MemoryFile {
         self.verified = true;
         Ok(actual)
     }
+    /// Same rule as the real adapter: nothing is removed unless it was published
+    /// or explicitly abandoned.
+    fn discard(&mut self) -> Result<(), StorageError> {
+        self.usable()?;
+        if !self.published_once && !self.abandoned {
+            return Err(StorageError::InvalidState);
+        }
+        self.discarded = true;
+        self.files
+            .lock()
+            .unwrap()
+            .remove(&(self.spec.job(), self.spec.generation()));
+        Ok(())
+    }
+    fn abandon(&mut self) {
+        self.abandoned = true;
+    }
     /// Atomic no-replace: an occupied destination is a conflict, never an overwrite.
     /// Like the real adapter, only a verified, synced, complete file may be published.
     fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError> {
+        self.usable()?;
         if !self.complete() || !self.synced || !self.verified {
             return Err(StorageError::InvalidState);
         }
@@ -508,6 +543,7 @@ impl SegmentFile for MemoryFile {
             destination.to_path_buf(),
             self.data.lock().unwrap().live.clone(),
         );
+        self.published_once = true;
         Ok(destination.to_path_buf())
     }
 }

@@ -24,6 +24,10 @@ enum Command {
     Hash(ByteRange, Reply<[u8; 32]>),
     Verify(Option<[u8; 32]>, Reply<[u8; 32]>),
     Publish(std::path::PathBuf, Reply<std::path::PathBuf>),
+    Discard {
+        abandon: bool,
+        reply: Reply<()>,
+    },
 }
 
 /// One dedicated OS writer for a part; workers only send owned bounded buffers.
@@ -110,6 +114,21 @@ impl Writer {
                             if let Err(error) = result {
                                 failure = Some(error);
                             }
+                            let _ = reply.send(result);
+                        }
+                        // Terminal: the part is gone and the lane is finished with it.
+                        Command::Discard { abandon, reply } => {
+                            let result = match failure {
+                                Some(error) => Err(error),
+                                None => {
+                                    if abandon {
+                                        file.abandon();
+                                    }
+                                    file.discard().map_err(WriterError::Storage)
+                                }
+                            };
+                            // The file is gone either way: the lane is finished with it.
+                            failure = Some(result.err().unwrap_or(WriterError::Closed));
                             let _ = reply.send(result);
                         }
                         // A destination conflict is a verdict, not a broken lane.
@@ -228,6 +247,17 @@ impl Writer {
     ) -> Result<std::path::PathBuf, WriterError> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Publish(destination, reply), cancel)
+            .await?;
+        result.await.map_err(|_| WriterError::WorkerFailed)?
+    }
+    /// Removes the part file: after publication, or with `abandon` for a cancelled job.
+    pub async fn discard(
+        &self,
+        abandon: bool,
+        cancel: &CancellationToken,
+    ) -> Result<(), WriterError> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::Discard { abandon, reply }, cancel)
             .await?;
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }

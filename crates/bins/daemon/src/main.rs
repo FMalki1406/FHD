@@ -2,7 +2,7 @@
 //! Ctrl+C pauses durably rather than killing the transfer.
 #![forbid(unsafe_code)]
 
-use fhd_daemon::{absolute, read_url, Engine, EngineConfig, EngineError, Intent};
+use fhd_daemon::{absolute, read_url, Engine, EngineConfig, EngineError, Intent, StderrEvents};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -64,6 +64,8 @@ fn parse() -> Result<EngineConfig, &'static str> {
 
 #[tokio::main]
 async fn main() {
+    // Engine events go to standard error; the published path goes to standard output.
+    let _ = tracing::subscriber::set_global_default(StderrEvents);
     let config = match parse() {
         Ok(config) => config,
         Err(message) => {

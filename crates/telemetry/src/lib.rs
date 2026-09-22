@@ -225,6 +225,15 @@ impl Recorder {
     }
 }
 
+/// Emits one allowlisted event without keeping a record of it. For components
+/// that report but do not own diagnostics storage.
+pub fn emit(event: Event) {
+    tracing::event!(target: "fhd", tracing::Level::INFO,
+        code = event.code.as_str(),
+        job_id = event.job_id, generation = event.generation,
+        value = event.value, elapsed_ms = event.elapsed_ms);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

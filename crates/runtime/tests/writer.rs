@@ -20,6 +20,7 @@ enum Operation {
     Write(u64, usize),
     Sync,
     Hash,
+    Discard,
     Drop,
 }
 #[derive(Clone, Copy)]
@@ -52,6 +53,8 @@ struct FakeFile {
     data: Option<Arc<Mutex<Vec<u8>>>>,
     gate: Option<Arc<Gate>>,
     entered: Option<tokio::sync::oneshot::Sender<()>>,
+    abandoned: bool,
+    discarded: bool,
 }
 impl FakeFile {
     fn observe(&self, operation: Operation) {
@@ -110,6 +113,17 @@ impl SegmentFile for FakeFile {
     fn publish(&mut self, _: &Path) -> Result<PathBuf, StorageError> {
         Err(StorageError::Unsupported)
     }
+    fn discard(&mut self) -> Result<(), StorageError> {
+        self.observe(Operation::Discard);
+        if !self.abandoned {
+            return Err(StorageError::InvalidState);
+        }
+        self.discarded = true;
+        Ok(())
+    }
+    fn abandon(&mut self) {
+        self.abandoned = true;
+    }
 }
 fn spec() -> PartSpec {
     PartSpec::new(JobId::new(1).unwrap(), Generation::initial(), 1024).unwrap()
@@ -124,6 +138,8 @@ fn fixture(fault: Fault) -> (FakeFile, Log) {
             data: None,
             gate: None,
             entered: None,
+            abandoned: false,
+            discarded: false,
         },
         log,
     )
@@ -180,6 +196,54 @@ async fn accepted_commands_drain_fifo_on_one_thread_after_callers_drop_replies()
     let worker_thread = entries[0].1;
     assert_ne!(worker_thread, thread::current().id());
     assert!(entries.iter().all(|entry| entry.1 == worker_thread));
+}
+
+#[tokio::test]
+async fn abandoned_discard_removes_the_part_and_finishes_the_lane() {
+    let (file, log) = fixture(Fault::None);
+    let writer = Writer::start(Box::new(file), 1).unwrap();
+    let pool = BufferPool::new(8).unwrap();
+    let cancel = CancellationToken::new();
+    let buffer = pool.acquire(8, &cancel).await.unwrap();
+    writer.write(spec(), 0, buffer, &cancel).await.unwrap();
+    writer.discard(true, &cancel).await.unwrap();
+    // The file is gone, so nothing may be written or synced to it afterwards.
+    let buffer = pool.acquire(8, &cancel).await.unwrap();
+    assert_eq!(
+        writer.write(spec(), 8, buffer, &cancel).await,
+        Err(WriterError::Closed)
+    );
+    assert_eq!(pool.in_use(), 0);
+    assert_eq!(writer.sync(&cancel).await, Err(WriterError::Closed));
+    assert_eq!(writer.shutdown().await, Err(WriterError::Closed));
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>(),
+        [Operation::Write(0, 8), Operation::Discard, Operation::Drop]
+    );
+}
+
+#[tokio::test]
+async fn discarding_unpublished_bytes_is_refused_and_leaves_no_second_attempt() {
+    let (file, log) = fixture(Fault::None);
+    let writer = Writer::start(Box::new(file), 1).unwrap();
+    let cancel = CancellationToken::new();
+    let refusal = WriterError::Storage(StorageError::InvalidState);
+    // The storage port decides; the lane only carries the verdict back.
+    assert_eq!(writer.discard(false, &cancel).await, Err(refusal));
+    assert_eq!(writer.discard(true, &cancel).await, Err(refusal));
+    assert_eq!(writer.shutdown().await, Err(refusal));
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>(),
+        [Operation::Discard, Operation::Drop]
+    );
 }
 
 #[tokio::test]

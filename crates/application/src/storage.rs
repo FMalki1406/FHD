@@ -116,6 +116,13 @@ pub trait SegmentFile: Send {
     /// Requires a synchronized, verified file and a durable PublishIntent in the
     /// repository. Atomic no-replace is mandatory; unsupported filesystems fail.
     fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError>;
+    /// Removes this generation's part file. Legitimate only after publication (the
+    /// published name holds the bytes) or after `abandon`. The handle is unusable
+    /// afterwards, so the caller drops it.
+    fn discard(&mut self) -> Result<(), StorageError>;
+    /// Declares the transfer abandoned (cancelled), which permits `discard` to
+    /// remove bytes that were never published.
+    fn abandon(&mut self);
 }
 
 #[cfg(test)]

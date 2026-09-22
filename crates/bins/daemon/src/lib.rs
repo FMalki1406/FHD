@@ -371,6 +371,55 @@ impl Engine {
     }
 }
 
+/// Prints the engine's allowlisted events to standard error. They carry only
+/// codes and numbers, so there is nothing to redact; anything else in the process
+/// would need its own review before being logged.
+pub struct StderrEvents;
+/// The engine's event shape. Anything else in the process is not printed here,
+/// whatever target it claims.
+const ALLOWED: [&str; 5] = ["code", "job_id", "generation", "value", "elapsed_ms"];
+struct Fields(String);
+impl Fields {
+    fn put(&mut self, field: &tracing::field::Field, value: std::fmt::Arguments<'_>) {
+        use std::fmt::Write;
+        if !ALLOWED.contains(&field.name()) {
+            return;
+        }
+        let text: String = value
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        let _ = write!(self.0, " {}={text}", field.name());
+    }
+}
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.put(field, format_args!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.put(field, format_args!("{value}"));
+    }
+}
+impl tracing::Subscriber for StderrEvents {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "fhd"
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        eprintln!("event{}", fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 /// Reads a URL from standard input so signed links never appear in a process list.
 pub fn read_url(mut input: impl std::io::Read) -> Result<String, EngineError> {
     use std::io::Read;
