@@ -229,6 +229,8 @@ impl Recorder {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    // Tests emitting through the recorder callsite run one at a time; see the capture test.
+    static CALLSITE: Mutex<()> = Mutex::new(());
 
     #[test]
     fn redaction_applies_to_display_debug_and_rejects_oversized_values() {
@@ -251,6 +253,7 @@ mod tests {
     }
     #[test]
     fn record_storage_and_metric_cardinality_are_bounded() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|e| e.into_inner());
         assert!(Recorder::new(0).is_err());
         assert!(Recorder::new(4097).is_err());
         let mut recorder = Recorder::new(2).unwrap();
@@ -271,6 +274,7 @@ mod tests {
     }
     #[test]
     fn sequence_exhaustion_does_not_evict_or_mutate_metrics() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|e| e.into_inner());
         let mut recorder = Recorder::new(1).unwrap();
         recorder.record(Event::new(Code::JobAccepted)).unwrap();
         recorder.sequence = u64::MAX;
@@ -307,9 +311,13 @@ mod tests {
     }
     #[test]
     fn actual_tracing_subscriber_receives_safe_codes_and_redacted_wrappers() {
+        // A concurrent first registration can cache "never" from a pre-subscriber
+        // snapshot; exclude it, then rebuild with this subscriber installed.
+        let _serial = CALLSITE.lock().unwrap_or_else(|e| e.into_inner());
         let captured = Arc::new(Mutex::new(String::new()));
         let subscriber = Capture(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             let credential = Credential::new("DO_NOT_LOG_ME".into()).unwrap();
             tracing::event!(tracing::Level::INFO, credential = ?credential);
             let mut recorder = Recorder::new(2).unwrap();

@@ -126,6 +126,24 @@ impl SegmentMap {
     pub fn has_pending_checkpoint(&self) -> bool {
         self.checkpoint.is_some()
     }
+    pub fn has_unsynced(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s.state, SegmentState::Written { .. }))
+    }
+    /// Gives up written-but-uncommitted bytes so they are fetched again. Only for a
+    /// drain that cannot sync (failed storage); never while a checkpoint is pending.
+    pub fn discard_unsynced(&mut self) -> Result<(), DomainError> {
+        if self.checkpoint.is_some() {
+            return Err(DomainError::CheckpointPending);
+        }
+        for segment in &mut self.segments {
+            if matches!(segment.state, SegmentState::Written { .. }) {
+                segment.state = SegmentState::Pending;
+            }
+        }
+        Ok(())
+    }
 
     pub fn new(
         job: JobId,

@@ -29,13 +29,23 @@ lease يحمل المهمة والجيل ومعرف الجزء والعامل و
 
 ## Job والأحداث
 
-الحالات الاثنتا عشرة تشمل Queued وProbing وTransferring وPausing وPaused وRetryWait وNeedsAction وVerifying وPublishing وCompleted وCancelling وCancelled. قرار الانتقال مركزي داخل Job الجديد، ويعيد أحداثًا بترتيب version وهوية وجيل وحالة سابقة وتالية.
+الحالات الثلاث عشرة تطابق §5.2 من الوثيقة المعمارية (النسخة 4): Queued وProbing وTransferring وStopping وPaused وRetryWait وNeedsAction وVerifying وPublishing وCancelling وFailed، والنهائيتان Completed وCancelled. Failed غير نهائية ويقبل Resume محاولة جديدة. قرار الانتقال مركزي داخل Job، ويعيد أحداثًا بترتيب version وهوية وجيل وحالة سابقة وتالية. الأمر المقبول الذي لا يغير شيئًا (مثل Pause لمهمة متوقفة) يعيد قائمة أحداث فارغة بدل خطأ، فلا تنتج النقرات المكررة أحداثًا.
+
+**Stopping{then}** هو المخرج الوحيد من Probing وTransferring لغير الاكتمال: Pause وPreempt وRetry وRequireAction وFail وRepresentationChanged وAllSegmentsDurable كلها تدخل Stopping وتحفظ الوجهة في `stop_target`. لا تُؤجر أجزاء جديدة أثناء Stopping، ولا يكتمل WorkersDrained مع lease نشط أو checkpoint معلق. الأسباب المتزامنة ترفع الشدة فقط: Failed > NeedsAction > RetryWait > Paused > Queued > Verifying، وأول سبب في الرتبة نفسها يبقى، وRetryWait يأخذ الموعد الأبعد. Resume أثناء Stopping{Paused} يحولها إلى Queued أو Verifying إن كان كل شيء متينًا. RepresentationChanged يؤجل رفع الجيل وإزالة الخريطة إلى لحظة التصريف، ويمنع Resume من القفز إلى تحقق بايتات التمثيل القديم.
 
 المسار الصحيح للتطبيق: `decide` دون تعديل → حفظ الحدث والتغييرات المرتبطة بمعاملة → `apply` بعد الإقرار. apply يرفض حدثًا مكررًا أو خارج الترتيب أو من مهمة/جيل آخر، ولا يعدل الحالة عند الرفض. `handle` اختصار متعمد للمحاكاة يطبق فورًا؛ لا يستخدم مباشرة على الحالة المنشورة قبل commit. الأحداث خاصة الإنشاء؛ codec/repository موثوقان لإعادة بناء السجل لم ينفذا بعد.
 
-لا تدخل Verifying حتى تكون جميع الأجزاء Durable. النجاح في التحقق يسمح Publishing، وPublishCommitted فقط يسمح Completed. إلغاء Publishing مرفوض لأن عملية النشر تحتاج مصالحة بدل ادعاء إيقاف commit جارٍ. Pausing/Cancelling لا تنتهيان مع lease نشط أو checkpoint معلق؛ يمكن تصريف إقرار sync/commit أو إبطاله بعد المصالحة ثم إكمال الانتقال.
+لا تدخل Verifying حتى تكون جميع الأجزاء Durable. Pause أثناء Verifying يعيدها إلى Paused ويُعاد التحقق لاحقًا. النجاح في التحقق يسمح Publishing، وPublishCommitted فقط يسمح Completed. إلغاء Publishing وإيقافها مرفوضان لأن النشر يحتاج مصالحة بدل ادعاء إيقاف commit جارٍ. **كل Cancel يمر بـ Cancelling**، حتى من Queued وPaused وRetryWait وNeedsAction وFailed، لأن ملفات part تحتاج تنظيفًا؛ CleanupFinished وحده ينهيها إلى Cancelled ويتطلب تصريف العمال وcheckpoint. `removable` يحدد الحالات التي يجوز للمستودع حذف سجلها.
 
-SourceChanged وIntegrity لا يسمحان RetryApproved عاديًا يحتفظ بالأجزاء القديمة؛ يحتاجان ReplaceRepresentation من حالة متوقفة، مما يرفع الجيل ويزيل خريطة العمل من نموذج المهمة. التحقق الحقيقي من ETag وسياق الطلب قبل إعلان تغير المورد ما زال في المحول/التكامل القادم.
+**الحدث يحمل نتيجته:** كل JobEvent يتضمن `JobProjection` كاملًا (الحالة، الجيل، السبب، موعد الإعادة، وجهة Stopping، علم استبدال التمثيل، المحاولات، البايتات المتينة). `apply` يعيد التنفيذ ويرفض الحدث إذا اختلف أي حقل، لا الحالة وحدها؛ فتقدم الأجزاء بين decide وapply لا يمرر حدثًا وجهته الداخلية تغيرت. المستودع يحفظ هذا الإسقاط، فتصبح وجهة Stopping قابلة للاستعادة بعد التعطل.
+
+**التصريف ينتظر آخر commit:** WorkersDrained يتطلب لا lease نشطًا ولا checkpoint معلقًا **ولا جزءًا Written غير متين**، إلا عند استبدال التمثيل. إذا تعذرت المزامنة (قرص معطل) يستدعي المنسق `discard_unsynced` لإعادة تلك الأجزاء إلى Pending وتنزيلها لاحقًا بدل تعليق المهمة؛ التقدم المتين لا يمس. Cancelling تنتهي بـ CleanupFinished بعد السكون فقط، و`cleanup_ready` يحدد متى يجوز لمحول التخزين حذف ملفات part.
+
+**المحاولات:** Start يزيد `attempts`، وأي Resume من المستخدم أو ReplaceRepresentation يصفّره؛ RetryDue لا يصفّره، فيستطيع RetryPolicy إعلان النفاد.
+
+**اختلافات موثقة عن نص §5.2:** عدم تطابق البصمة في Verifying ينتج NeedsAction{Integrity}، ويرفع الجيل ويصفر الأجزاء عند ReplaceRepresentation لا فورًا؛ الأثر نفسه لأن Resume العادي مرفوض لهذا السبب. ReplaceRepresentation مسموح أيضًا من Paused وFailed، وFail من Verifying ينتج Failed. AllSegmentsDurable من Transferring فقط. Pause وCancel أثناء Publishing يرجعان `PublishInProgress` لا خطأ انتقال عامًا. عُدّل §5.2 ليطابق ذلك.
+
+SourceChanged وIntegrity لا يسمحان Resume عاديًا يحتفظ بالأجزاء القديمة؛ يحتاجان ReplaceRepresentation من حالة متوقفة، مما يرفع الجيل ويزيل خريطة العمل من نموذج المهمة. التحقق الحقيقي من ETag وسياق الطلب قبل إعلان تغير المورد ما زال في المحول/التكامل القادم.
 
 ## الإعادة الحتمية
 
@@ -43,10 +53,11 @@ RetryPolicy نوع محقق، مع حد محاولات وتأخير أساسي �
 
 ## أدلة الاختبارات المكتوبة وحدودها
 
-- جدول صريح لكل 12 حالة × 14 أمرًا (168 زوجًا)، مع اختبارات حراس منفصلة للنطاقات المتينة والعمال وcheckpoint والوقت.
+- جدول صريح لكل 13 حالة × 17 أمرًا (221 زوجًا) بأربع نتائج: انتقال، no-op مقبول، رفض، PublishInProgress. مثبّته خريطة فارغة؛ الفروع التي تعتمد على تقدم الأجزاء تغطيها اختبارات مستقلة؛ مع اختبارات حراس منفصلة للنطاقات المتينة والعمال وcheckpoint والوقت.
 - اختبارات خصائص حتمية على 96 حجمًا، وتقسيم متكرر حتى وحدات بايتية، واعتماد الأجزاء بترتيب عكسي؛ تحقق التغطية ومجموع الأطوال وعدم التداخل والتقدم.
 - رفض محاولة قديمة وجيل قديم وتقسيم جزء نشط وتذكرة checkpoint أجنبية باختيار مختلف، واعتماد جزء لاحق دون انتظار عامل سابق.
 - Written وSynced لا تزيدان durable bytes قبل commit؛ إقرار متأخر لتذكرة أبطلت يرفض؛ يمكن إعادة checkpoint بعد مصالحة محاكية.
-- انتظار Pause لتصريف checkpoint؛ منع التحقق المبكر وتكرار replay؛ jitter حتمي واحترام Retry-After وحدود الفائض.
+- رفض حدث انحرف إسقاطه بين decide وapply؛ منع التصريف مع بايتات غير متينة ومخرج discard_unsynced؛ إلغاء أثناء Stopping لا يسمح بالتنظيف قبل السكون؛ Pause/Resume أثناء التحقق؛ استبدال التمثيل تحت هدف Failed؛ حدود ProbeSucceeded؛ رتابة ترتيب الشدة؛ 400 تسلسل عشوائي حتمي (xorshift، 60 خطوة) تتحقق أن decide لا يعدل، وأن الإسقاط يطابق الحدث، وأن الحالات المستقرة لا تحمل عملًا حيًا أو بايتات غير متينة. ليس proptest مع تقليص؛ إضافة proptest تحتاج مراجعة اعتمادية؛
+- كل مخرج خطأ ينتظر العمال وcheckpoint ولا يؤجر عملًا جديدًا؛ ترتيب شدة الأسباب المتزامنة؛ Resume أثناء الإيقاف؛ تأجيل استبدال الجيل حتى التصريف؛ مرور كل إلغاء بالتنظيف؛ منع التحقق المبكر وتكرار replay؛ jitter حتمي واحترام Retry-After وحدود الفائض.
 
 هذه اختبارات بلا IO ولا بديل لاختبارات انهيار المحولات، ولا تدعي تشغيل proptest أو fuzzing. SegmentMap يستخدم Vec وخوارزميات محدودة لكنها خطية، وقرار Job يأخذ لقطة داخلية؛ لا دليل بعد على ملاءمتها لأقصى أحجام الخريطة أو أهداف CPU. يلزم benchmark قبل تحويلها لمسار كثيف. ما زالت Representation الغنية، استعادة extents من repository، group commit الحقيقي، العامل المستقل والكاتب وbuffer pool وIPC والسياسات والتنقيح المتكامل مراحل منفصلة.
