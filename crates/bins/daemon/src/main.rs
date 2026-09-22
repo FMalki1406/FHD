@@ -2,14 +2,18 @@
 //! Ctrl+C pauses durably rather than killing the transfer.
 #![forbid(unsafe_code)]
 
-use fhd_daemon::{absolute, read_url, Engine, EngineConfig, EngineError, Intent, StderrEvents};
+use fhd_daemon::{
+    absolute, read_requests, Engine, EngineConfig, EngineError, Intent, JobOutcome, StderrEvents,
+};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 fn usage() -> &'static str {
     "usage: fhd-engine <state-directory> <destination-file> [--connections N] \
-     [--max-bytes N] [--sha256 HEX] [--allow-http] [--resume]   (URL on stdin)"
+     [--engine-connections N] [--max-active N] [--max-bytes N] [--sha256 HEX] \
+     [--allow-http] [--resume]   (one URL per line on stdin, each optionally \
+     followed by a tab and its own destination file)"
 }
 
 fn parse() -> Result<EngineConfig, &'static str> {
@@ -20,6 +24,8 @@ fn parse() -> Result<EngineConfig, &'static str> {
         state_directory: absolute(&state_directory).map_err(|_| "invalid state directory")?,
         destination: absolute(&destination).map_err(|_| "invalid destination")?,
         connections: 4,
+        engine_connections: 8,
+        max_active: 4,
         expected_sha256: None,
         max_bytes: 100 * 1024 * 1024 * 1024,
         allow_http: false,
@@ -53,6 +59,20 @@ fn parse() -> Result<EngineConfig, &'static str> {
                 }
                 config.expected_sha256 = Some(digest);
             }
+            "--engine-connections" => {
+                config.engine_connections = args
+                    .next()
+                    .ok_or("missing engine connection count")?
+                    .parse()
+                    .map_err(|_| "invalid engine connection count")?
+            }
+            "--max-active" => {
+                config.max_active = args
+                    .next()
+                    .ok_or("missing active job count")?
+                    .parse()
+                    .map_err(|_| "invalid active job count")?
+            }
             "--allow-http" => config.allow_http = true,
             // Releasing a stopped job is the operator's decision, never automatic.
             "--resume" => config.intent = Intent::Resume,
@@ -73,14 +93,21 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let url = match read_url(std::io::stdin()) {
-        Ok(url) => url,
+    let requests = match read_requests(std::io::stdin(), &config.destination) {
+        Ok(requests) => requests,
         Err(_) => {
-            eprintln!("expected a URL on stdin");
+            eprintln!("expected one URL per line on stdin");
             std::process::exit(2);
         }
     };
-    let engine = match Engine::open(config, &url).await {
+    // A checksum on the command line belongs to a single request; several requests
+    // would each need their own, which this entry point does not take yet.
+    if requests.len() > 1 && config.expected_sha256.is_some() {
+        eprintln!("ENGINE-INVALID-INPUT");
+        std::process::exit(2);
+    }
+    let several = requests.len() > 1;
+    let engine = match Engine::open_many(config, requests).await {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{}", code(&error));
@@ -99,6 +126,38 @@ async fn main() {
         }
         std::future::pending::<()>().await;
     });
+    if several {
+        let (_keep, commands) = mpsc::channel(4);
+        match engine.run_all(commands).await {
+            Ok(outcomes) => {
+                let mut failed = false;
+                for (index, outcome) in outcomes {
+                    match outcome {
+                        JobOutcome::Published(path) => {
+                            println!("{index} published {}", path.display())
+                        }
+                        JobOutcome::Settled(state) => {
+                            failed |= state != fhd_domain::JobState::Completed;
+                            println!("{index} stopped in {state:?}");
+                        }
+                        JobOutcome::NeedsDecision(reason) => {
+                            failed = true;
+                            println!("{index} {}", code(&EngineError::NeedsDecision(reason)));
+                        }
+                        JobOutcome::Failed(error) => {
+                            failed = true;
+                            println!("{index} {}", code(&EngineError::Run(error)));
+                        }
+                    }
+                }
+                std::process::exit(if failed { 1 } else { 0 });
+            }
+            Err(error) => {
+                eprintln!("{}", code(&error));
+                std::process::exit(2);
+            }
+        }
+    }
     match engine.run(receiver).await {
         Ok(SessionEnd::Published(path)) => println!("published {}", path.display()),
         Ok(SessionEnd::Settled(state)) => {

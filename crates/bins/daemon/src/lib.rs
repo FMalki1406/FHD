@@ -15,10 +15,13 @@ use fhd_persistence::{Limits, PersistenceError, SqliteRepository};
 use fhd_runtime::{
     buffers::BufferPool,
     coordinator::{Clock, Control, Coordinator, CoordinatorConfig, Ports, RunError, SessionEnd},
+    origin::{OriginGovernor, OriginLimits},
+    scheduler::{Command, Scheduler, SchedulerConfig},
 };
 use fhd_storage::FileStorage;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -56,17 +59,15 @@ impl Clock for SystemClock {
     }
 }
 
-/// One destination per reference, fixed when the job was accepted.
-struct FixedDestinations {
-    reference: DestinationRef,
-    path: PathBuf,
-}
+/// One destination per reference, fixed when the job was accepted. A reference
+/// this run never admitted resolves to nothing: the map is the whole authority.
+struct FixedDestinations(HashMap<DestinationRef, PathBuf>);
 impl Destinations for FixedDestinations {
     fn resolve(&self, destination: DestinationRef) -> Result<PathBuf, AppError> {
-        if destination != self.reference {
-            return Err(AppError::InvalidInput);
-        }
-        Ok(self.path.clone())
+        self.0
+            .get(&destination)
+            .cloned()
+            .ok_or(AppError::InvalidInput)
     }
 }
 
@@ -97,23 +98,52 @@ pub struct EngineConfig {
     /// Application-owned directory for the database and the part files.
     pub state_directory: PathBuf,
     pub destination: PathBuf,
+    /// Connections one job may use.
     pub connections: usize,
+    /// Connections across every job, and how many jobs run at once. The defaults
+    /// make a single-request run behave exactly as it did before there was a queue.
+    pub engine_connections: usize,
+    pub max_active: usize,
     pub expected_sha256: Option<[u8; 32]>,
     pub max_bytes: u64,
     pub allow_http: bool,
     pub intent: Intent,
 }
 
-/// A single-job engine: enough to download, verify and publish end to end.
-/// No scheduler, no IPC, and no reference store yet: the caller supplies the URL
-/// again on every run, so no URL or credential is written to disk.
+/// One thing to fetch and where it lands. The operator names every destination:
+/// nothing is derived from a URL, so no server can choose a path.
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub url: String,
+    pub destination: PathBuf,
+    pub expected_sha256: Option<[u8; 32]>,
+}
+
+/// How one request ended. A job needing a decision does not fail its neighbours.
+#[derive(Debug)]
+pub enum JobOutcome {
+    Published(PathBuf),
+    Settled(JobState),
+    NeedsDecision(Option<StopReason>),
+    Failed(RunError),
+}
+
+/// Enough engine to download, verify and publish end to end, for one request or
+/// several under one set of caps. No IPC and no reference store yet: the caller
+/// supplies each URL again on every run, so no URL or credential is written to disk.
 pub struct Engine {
     repository: Arc<SqliteRepository>,
-    coordinator: Coordinator,
-    key: ReceiptKey,
-    spec: JobSpec,
+    coordinator: Arc<Coordinator>,
+    scheduler: Scheduler,
+    requests: Vec<Admitted>,
     intent: Intent,
     id: std::sync::Mutex<Option<fhd_domain::JobId>>,
+}
+
+/// What one request became once it had an identity.
+struct Admitted {
+    key: ReceiptKey,
+    spec: JobSpec,
 }
 
 fn digest(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -184,136 +214,260 @@ fn same_volume(state: &Path, destination: &Path) -> Result<bool, EngineError> {
 }
 
 impl Engine {
+    /// One request, the common case: the caller keeps the old shape.
     pub async fn open(config: EngineConfig, url: &str) -> Result<Self, EngineError> {
+        let request = Request {
+            url: url.to_owned(),
+            destination: config.destination.clone(),
+            expected_sha256: config.expected_sha256,
+        };
+        Self::open_many(config, vec![request]).await
+    }
+
+    /// Several requests under one set of caps: one database, one connection budget,
+    /// one governor. Each request keeps its own destination and its own checksum.
+    pub async fn open_many(
+        config: EngineConfig,
+        requests: Vec<Request>,
+    ) -> Result<Self, EngineError> {
         if !config.state_directory.is_absolute()
-            || !config.destination.is_absolute()
             || !(1..=16).contains(&config.connections)
+            || !(1..=64).contains(&config.engine_connections)
+            || config.connections > config.engine_connections
+            || !(1..=64).contains(&config.max_active)
+            || requests.is_empty()
+            || requests.len() > 256
         {
             return Err(EngineError::InvalidInput);
         }
-        // The engine owns this tree and creates it; the destination is the user's.
+        // The engine owns this tree and creates it; the destinations are the user's.
         own_directory(&config.state_directory)?;
         own_directory(&config.state_directory.join("parts"))?;
-        if !same_volume(&config.state_directory, &config.destination)? {
-            return Err(EngineError::CrossVolume);
-        }
         let repository = Arc::new(
             SqliteRepository::open(config.state_directory.join("state"), Limits::default())
                 .await
                 .map_err(EngineError::Persistence)?,
         );
         let transport = HttpTransport::new(HttpConfig::default()).map_err(EngineError::Binding)?;
-        // The binding, not just the URL: an http permission changes what may be sent.
-        let source = SourceRef::new(reference(
-            b"FHD.source.v1\0",
-            &[url.as_bytes(), &[u8::from(config.allow_http)]],
-        ))
-        .map_err(|_| EngineError::InvalidInput)?;
-        let destination = DestinationRef::new(reference(
-            b"FHD.destination.v1\0",
-            &[config.destination.to_string_lossy().as_bytes()],
-        ))
-        .map_err(|_| EngineError::InvalidInput)?;
-        transport
-            .bind(
-                source,
-                SourceBinding::new(url, None, None, config.allow_http, vec![])
-                    .map_err(EngineError::Binding)?,
-            )
-            .map_err(EngineError::Binding)?;
-        let spec = JobSpec::new(
-            source,
-            destination,
-            config.expected_sha256,
-            Priority::Normal,
-            config.max_bytes,
-        )
-        .map_err(|_| EngineError::InvalidInput)?;
-        let buffers = BufferPool::new(config.connections * 256 * 1024)
+        let mut destinations = HashMap::new();
+        let mut admitted = Vec::with_capacity(requests.len());
+        for request in &requests {
+            if !request.destination.is_absolute() {
+                return Err(EngineError::InvalidInput);
+            }
+            if !same_volume(&config.state_directory, &request.destination)? {
+                return Err(EngineError::CrossVolume);
+            }
+            // The binding, not just the URL: an http permission changes what may be sent.
+            let source = SourceRef::new(reference(
+                b"FHD.source.v1\0",
+                &[request.url.as_bytes(), &[u8::from(config.allow_http)]],
+            ))
             .map_err(|_| EngineError::InvalidInput)?;
-        let coordinator = Coordinator::new(
-            Ports {
-                repository: repository.clone(),
-                store: Arc::new(FileStorage),
-                transport: Arc::new(transport),
-                destinations: Arc::new(FixedDestinations {
-                    reference: destination,
-                    path: config.destination.clone(),
-                }),
+            let destination = DestinationRef::new(reference(
+                b"FHD.destination.v1\0",
+                &[request.destination.to_string_lossy().as_bytes()],
+            ))
+            .map_err(|_| EngineError::InvalidInput)?;
+            // Two requests landing on one name would race for it; refuse up front.
+            if destinations
+                .insert(destination, request.destination.clone())
+                .is_some()
+            {
+                return Err(EngineError::InvalidInput);
+            }
+            transport
+                .bind(
+                    source,
+                    SourceBinding::new(&request.url, None, None, config.allow_http, vec![])
+                        .map_err(EngineError::Binding)?,
+                )
+                .map_err(EngineError::Binding)?;
+            admitted.push(Admitted {
+                key: ReceiptKey::new(
+                    Principal::new(1).map_err(EngineError::Admission)?,
+                    // The whole request: the same URL elsewhere is another job.
+                    digest(
+                        b"FHD.request.v1\0",
+                        &[
+                            request.url.as_bytes(),
+                            request.destination.to_string_lossy().as_bytes(),
+                            &request.expected_sha256.unwrap_or_default(),
+                            &config.max_bytes.to_le_bytes(),
+                            &[u8::from(config.allow_http)],
+                        ],
+                    ),
+                ),
+                spec: JobSpec::new(
+                    source,
+                    destination,
+                    request.expected_sha256,
+                    Priority::Normal,
+                    config.max_bytes,
+                )
+                .map_err(|_| EngineError::InvalidInput)?,
+            });
+        }
+        let buffers = BufferPool::new(config.engine_connections * 256 * 1024)
+            .map_err(|_| EngineError::InvalidInput)?;
+        let governor = Arc::new(
+            OriginGovernor::new(OriginLimits {
+                connections: config.engine_connections,
+                ..OriginLimits::default()
+            })
+            .map_err(|_| EngineError::InvalidInput)?,
+        );
+        let coordinator = Arc::new(
+            Coordinator::new(
+                Ports {
+                    repository: repository.clone(),
+                    store: Arc::new(FileStorage),
+                    transport: Arc::new(transport),
+                    destinations: Arc::new(FixedDestinations(destinations)),
+                },
+                buffers,
+                Arc::new(SystemClock),
+                CoordinatorConfig {
+                    connections: config.connections,
+                    max_segments: 1024,
+                    min_segment: 1024 * 1024,
+                    checkpoint_bytes: 8 * 1024 * 1024,
+                    writer_capacity: 16,
+                    retry: RetryPolicy::new(5, 1000, 60_000)
+                        .map_err(|_| EngineError::InvalidInput)?,
+                },
+                config.state_directory.join("parts"),
+            )
+            .map_err(EngineError::Run)?
+            .with_governor(governor.clone()),
+        );
+        let scheduler = Scheduler::new(
+            coordinator.clone(),
+            governor,
+            SchedulerConfig {
+                max_active: config.max_active,
+                connections: config.engine_connections,
+                per_job: config.connections,
             },
-            buffers,
-            Arc::new(SystemClock),
-            CoordinatorConfig {
-                connections: config.connections,
-                max_segments: 1024,
-                min_segment: 1024 * 1024,
-                checkpoint_bytes: 8 * 1024 * 1024,
-                writer_capacity: 16,
-                retry: RetryPolicy::new(5, 1000, 60_000).map_err(|_| EngineError::InvalidInput)?,
-            },
-            config.state_directory.join("parts"),
         )
         .map_err(EngineError::Run)?;
         Ok(Self {
             repository,
             coordinator,
-            key: ReceiptKey::new(
-                Principal::new(1).map_err(EngineError::Admission)?,
-                // The whole request: the same URL to another destination is another job.
-                digest(
-                    b"FHD.request.v1\0",
-                    &[
-                        url.as_bytes(),
-                        config.destination.to_string_lossy().as_bytes(),
-                        &config.expected_sha256.unwrap_or_default(),
-                        &config.max_bytes.to_le_bytes(),
-                        &[u8::from(config.allow_http)],
-                    ],
-                ),
-            ),
-            spec,
+            scheduler,
+            requests: admitted,
             intent: config.intent,
             id: std::sync::Mutex::new(None),
         })
     }
 
     /// Admits the request (replaying an earlier one with the same key) and settles
-    /// whatever state it is in: recovery first, then one session.
-    pub async fn run(&self, control: mpsc::Receiver<Control>) -> Result<SessionEnd, EngineError> {
-        let id = AddDownload::new(self.repository.as_ref(), &LocalOperator, &LocalOperator)
-            .execute(self.key, self.spec.clone())
-            .await
-            .map_err(EngineError::Admission)?;
+    /// whatever state it is in: recovery first, then one session under the queue.
+    pub async fn run(
+        &self,
+        mut control: mpsc::Receiver<Control>,
+    ) -> Result<SessionEnd, EngineError> {
+        let ids = self.admit().await?;
+        let (id, _) = *ids.first().ok_or(EngineError::InvalidInput)?;
         *self.id.lock().map_err(|_| EngineError::InvalidInput)? = Some(id);
-        let job = self.load(id).await?;
+        // The job has an identity now, so a control has something to name.
+        let (commands, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(control) = control.recv().await {
+                let command = match control {
+                    Control::Pause => Command::Pause(id),
+                    Control::Cancel => Command::Cancel(id),
+                };
+                if commands.send(command).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut outcomes = self.drive(ids, receiver).await?;
+        match outcomes.pop().map(|(_, outcome)| outcome) {
+            Some(JobOutcome::Published(path)) => Ok(SessionEnd::Published(path)),
+            Some(JobOutcome::Settled(state)) => Ok(SessionEnd::Settled(state)),
+            Some(JobOutcome::NeedsDecision(reason)) => Err(EngineError::NeedsDecision(reason)),
+            Some(JobOutcome::Failed(error)) => Err(EngineError::Run(error)),
+            None => Err(EngineError::InvalidInput),
+        }
+    }
+
+    /// Every request, under the engine's caps. Results come back in request order.
+    pub async fn run_all(
+        &self,
+        commands: mpsc::Receiver<Command>,
+    ) -> Result<Vec<(usize, JobOutcome)>, EngineError> {
+        let ids = self.admit().await?;
+        self.drive(ids, commands).await
+    }
+
+    /// Accepts every request, replaying any admitted by an earlier run.
+    async fn admit(&self) -> Result<Vec<(fhd_domain::JobId, usize)>, EngineError> {
+        let mut ids = Vec::with_capacity(self.requests.len());
+        for (index, request) in self.requests.iter().enumerate() {
+            let id = AddDownload::new(self.repository.as_ref(), &LocalOperator, &LocalOperator)
+                .execute(request.key, request.spec.clone())
+                .await
+                .map_err(EngineError::Admission)?;
+            ids.push((id, index));
+        }
+        Ok(ids)
+    }
+
+    /// Settles each job's starting state, then hands what may run to the scheduler.
+    async fn drive(
+        &self,
+        ids: Vec<(fhd_domain::JobId, usize)>,
+        commands: mpsc::Receiver<Command>,
+    ) -> Result<Vec<(usize, JobOutcome)>, EngineError> {
+        let mut outcomes = Vec::with_capacity(ids.len());
+        let mut runnable = Vec::new();
+        let mut owners = HashMap::new();
+        for (id, index) in ids {
+            owners.insert(id, index);
+            match self.prepare(self.load(id).await?).await? {
+                Ok(job) => runnable.push(job),
+                Err(outcome) => outcomes.push((index, outcome)),
+            }
+        }
+        for outcome in self.scheduler.run(runnable, commands).await {
+            let index = *owners.get(&outcome.id).ok_or(EngineError::InvalidInput)?;
+            let state = outcome.job.as_ref().map(Job::state);
+            outcomes.push((
+                index,
+                match (outcome.result, state) {
+                    (Some(Ok(SessionEnd::Published(path))), _) => JobOutcome::Published(path),
+                    (Some(Err(error)), _) => JobOutcome::Failed(error),
+                    (_, Some(state)) => JobOutcome::Settled(state),
+                    // Nothing came back but a job: a session that ended without one
+                    // proves nothing, and the repository is the authority anyway.
+                    (_, None) => JobOutcome::Failed(RunError::Invariant),
+                },
+            ));
+        }
+        outcomes.sort_by_key(|(index, _)| *index);
+        Ok(outcomes)
+    }
+
+    /// Recovery, then the operator's intent. A stopped job stays stopped unless the
+    /// operator has looked at the reason and asked for it to go on.
+    async fn prepare(&self, job: Job) -> Result<Result<Job, JobOutcome>, EngineError> {
         let job = self
             .coordinator
             .recover(job)
             .await
             .map_err(EngineError::Run)?;
         if matches!(job.state(), JobState::Completed | JobState::Cancelled) {
-            return Ok(SessionEnd::Settled(job.state()));
+            return Ok(Err(JobOutcome::Settled(job.state())));
         }
         let job = match (job.state(), self.intent) {
             (JobState::Queued | JobState::Probing | JobState::Transferring, _) => job,
-            // A waiting retry is released by its own deadline, never by clearing it.
-            (JobState::RetryWait, _) => {
-                let due = job.retry_at().is_some_and(|at| at <= SystemClock.now_ms());
-                if !due {
-                    return Ok(SessionEnd::Settled(JobState::RetryWait));
-                }
-                self.command(
-                    job,
-                    JobCommand::RetryDue {
-                        now_tick: SystemClock.now_ms(),
-                    },
-                )
-                .await?
-            }
+            // A waiting retry is released by its own deadline: the scheduler waits
+            // it out rather than the operator clearing it.
+            (JobState::RetryWait, _) => job,
             // Stopped jobs stay stopped until the operator says otherwise.
-            (_, Intent::Start) => {
-                return Err(EngineError::NeedsDecision(job.reason()));
-            }
+            (_, Intent::Start) => return Ok(Err(JobOutcome::NeedsDecision(job.reason()))),
             (JobState::NeedsAction, Intent::Resume)
                 if matches!(
                     job.reason(),
@@ -325,10 +479,7 @@ impl Engine {
             }
             (_, Intent::Resume) => self.command(job, JobCommand::Resume).await?,
         };
-        self.coordinator
-            .run(job, control)
-            .await
-            .map_err(EngineError::Run)
+        Ok(Ok(job))
     }
 
     /// Why this job is waiting for a person, when it is.
@@ -348,7 +499,10 @@ impl Engine {
         jobs.into_iter()
             .find(|job| match known {
                 Some(id) => job.id() == id,
-                None => job.spec() == &self.spec,
+                None => self
+                    .requests
+                    .first()
+                    .is_some_and(|request| job.spec() == &request.spec),
             })
             .ok_or(EngineError::InvalidInput)
     }
@@ -421,20 +575,70 @@ impl tracing::Subscriber for StderrEvents {
 }
 
 /// Reads a URL from standard input so signed links never appear in a process list.
-pub fn read_url(mut input: impl std::io::Read) -> Result<String, EngineError> {
+pub fn read_url(input: impl std::io::Read) -> Result<String, EngineError> {
+    let mut lines = read_lines(input)?;
+    match (lines.pop(), lines.is_empty()) {
+        (Some(url), true) => Ok(url),
+        _ => Err(EngineError::InvalidInput),
+    }
+}
+
+/// One request per line: a URL, or a URL and the file it lands in separated by a
+/// tab. The operator names every destination; nothing is taken from a URL, so no
+/// server can steer where its own bytes are written. A line without one uses the
+/// destination given on the command line, which only one line may do.
+pub fn read_requests(
+    input: impl std::io::Read,
+    default_destination: &Path,
+) -> Result<Vec<Request>, EngineError> {
+    let mut requests = Vec::new();
+    let mut defaulted = false;
+    for line in read_lines(input)? {
+        let (url, destination) = match line.split_once('\t') {
+            Some((url, destination)) => (url, absolute(Path::new(destination.trim()))?),
+            None => {
+                if defaulted {
+                    // Two URLs cannot share one name; the second must say where.
+                    return Err(EngineError::InvalidInput);
+                }
+                defaulted = true;
+                (line.as_str(), default_destination.to_path_buf())
+            }
+        };
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(EngineError::InvalidInput);
+        }
+        requests.push(Request {
+            url: url.to_owned(),
+            destination,
+            expected_sha256: None,
+        });
+    }
+    if requests.is_empty() {
+        return Err(EngineError::InvalidInput);
+    }
+    Ok(requests)
+}
+
+fn read_lines(mut input: impl std::io::Read) -> Result<Vec<String>, EngineError> {
     use std::io::Read;
     let mut buffer = Vec::new();
     input
         .by_ref()
-        .take(16_386)
+        .take(1 << 20)
         .read_to_end(&mut buffer)
         .map_err(|_| EngineError::InvalidInput)?;
-    let url = String::from_utf8(buffer).map_err(|_| EngineError::InvalidInput)?;
-    let url = url.trim_end_matches(['\r', '\n']).to_owned();
-    if url.is_empty() || url.len() > 16_384 {
+    let text = String::from_utf8(buffer).map_err(|_| EngineError::InvalidInput)?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_owned())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() || lines.iter().any(|line| line.len() > 16_384) {
         return Err(EngineError::InvalidInput);
     }
-    Ok(url)
+    Ok(lines)
 }
 
 pub fn absolute(path: &Path) -> Result<PathBuf, EngineError> {

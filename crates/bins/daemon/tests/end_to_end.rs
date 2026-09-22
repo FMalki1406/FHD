@@ -1,6 +1,6 @@
 //! The whole engine over real adapters: a local HTTP server, SQLite on disk and
 //! real part files. No fakes anywhere in this path.
-use fhd_daemon::{Engine, EngineConfig, Intent};
+use fhd_daemon::{Engine, EngineConfig, Intent, JobOutcome, Request};
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::{
@@ -108,6 +108,8 @@ fn config(state: &Directory, destination: PathBuf, connections: usize) -> Engine
         state_directory: state.0.clone(),
         destination,
         connections,
+        engine_connections: connections.max(2),
+        max_active: 2,
         expected_sha256: None,
         max_bytes: 64 * 1024 * 1024,
         allow_http: true,
@@ -421,4 +423,45 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(part_bytes(&state), 0, "reconciled publish left a part");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
+    let first = content(2 * 1024 * 1024 + 11);
+    let second = content(1024 * 1024 + 7);
+    let (one, _) = serve(first.clone(), 0);
+    let (two, _) = serve(second.clone(), 0);
+    let state = Directory::new("several");
+    let requests = vec![
+        Request {
+            url: format!("http://127.0.0.1:{one}/file"),
+            destination: state.0.join("first.bin"),
+            expected_sha256: Some(expected_digest(&first)),
+        },
+        Request {
+            url: format!("http://127.0.0.1:{two}/file"),
+            destination: state.0.join("second.bin"),
+            expected_sha256: Some(expected_digest(&second)),
+        },
+    ];
+    // Two connections in the whole engine, two jobs: the queue is what decides.
+    let mut settings = config(&state, state.0.join("unused.bin"), 2);
+    settings.engine_connections = 2;
+    settings.max_active = 2;
+
+    let engine = Engine::open_many(settings, requests.clone()).await.unwrap();
+    let (_keep, commands) = mpsc::channel(4);
+    let outcomes = engine.run_all(commands).await.unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
+        match outcome {
+            JobOutcome::Published(path) => assert_eq!(path, request.destination, "job {index}"),
+            other => panic!("job {index} ended as {other:?}"),
+        }
+    }
+    assert_eq!(std::fs::read(state.0.join("first.bin")).unwrap(), first);
+    assert_eq!(std::fs::read(state.0.join("second.bin")).unwrap(), second);
+    // Both parts were released once their bytes reached their final names.
+    assert_eq!(part_bytes(&state), 0, "part files left behind");
 }
