@@ -235,12 +235,13 @@ impl Session<'_> {
                 return self.finish().await;
             }
         };
-        let durable = self.job.projection().durable_bytes;
-        let changed = self
-            .job
-            .plan()
-            .is_some_and(|(total, _)| total != probe.total())
-            || (!probe.ranges() && durable > 0);
+        // Existing bytes resume only under the identical representation: same size and
+        // same strong validator. Anything else, including no validator, starts over.
+        let changed = self.job.plan().is_some_and(|(total, _)| {
+            total != probe.total()
+                || probe.validator().is_none()
+                || probe.validator() != self.job.validator()
+        });
         if changed {
             self.step(JobCommand::RepresentationChanged).await?;
             return self.finish().await;
@@ -256,6 +257,7 @@ impl Session<'_> {
         self.step(JobCommand::ProbeSucceeded {
             total: probe.total(),
             max_segments,
+            validator: probe.validator(),
         })
         .await?;
         self.open_part().await?;

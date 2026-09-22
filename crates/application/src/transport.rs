@@ -7,18 +7,28 @@ use fhd_domain::{ByteRange, SourceRef, StopReason};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
     total: u64,
-    ranges: bool,
+    validator: Option<[u8; 32]>,
 }
 impl Probe {
-    /// `ranges`: the adapter proved byte-range support bound to a strong validator.
-    pub fn new(total: u64, ranges: bool) -> Self {
-        Self { total, ranges }
+    /// `validator`: an opaque digest of the representation's strong validator, which
+    /// the adapter binds every range request to (If-Range). Without one there is no
+    /// range support and no resume: the representation cannot be proven unchanged.
+    ///
+    /// Adapter contract: derive it only from a strong ETag (the exact bytes including
+    /// quotes; never a weak `W/` tag, never Last-Modified), hashed with a fixed domain
+    /// label. A 200 answer to an If-Range request, or a 206 whose ETag differs, is
+    /// `TransportError::RepresentationChanged`, never bytes.
+    pub fn new(total: u64, validator: Option<[u8; 32]>) -> Self {
+        Self { total, validator }
     }
     pub fn total(self) -> u64 {
         self.total
     }
+    pub fn validator(self) -> Option<[u8; 32]> {
+        self.validator
+    }
     pub fn ranges(self) -> bool {
-        self.ranges
+        self.validator.is_some()
     }
 }
 

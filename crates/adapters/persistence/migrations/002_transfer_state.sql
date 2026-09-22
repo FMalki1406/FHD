@@ -18,7 +18,9 @@ CREATE TABLE job_state (
     attempts INTEGER NOT NULL CHECK(attempts BETWEEN 0 AND 255),
     total INTEGER CHECK(total IS NULL OR total >= 0),
     max_segments INTEGER CHECK(max_segments IS NULL OR max_segments BETWEEN 1 AND 262144),
-    CHECK((total IS NULL) = (max_segments IS NULL))
+    validator BLOB CHECK(validator IS NULL OR length(validator) = 32),
+    CHECK((total IS NULL) = (max_segments IS NULL)),
+    CHECK(validator IS NULL OR total IS NOT NULL)
 );
 CREATE TABLE extents (
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,

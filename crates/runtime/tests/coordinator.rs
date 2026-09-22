@@ -304,6 +304,7 @@ async fn crash_restored_job_settles_without_resuming() {
     rig.command(JobCommand::ProbeSucceeded {
         total: 30_000,
         max_segments: 8,
+        validator: Some(digest(&content)),
     })
     .await;
     let recovered = rig.coordinator.recover(rig.job().await).await.unwrap();
@@ -323,7 +324,7 @@ async fn unavailable_extent_commit_is_retried_idempotently() {
     rig.command(JobCommand::Pause).await;
     rig.command(JobCommand::WorkersDrained).await;
     rig.command(JobCommand::Resume).await;
-    // Start and ProbeSucceeded commit first; fail those two, then succeed.
+    // The first transition commit (Start) fails: the session must abort.
     let (_keep, control) = mpsc::channel(1);
     let job = rig.job().await;
     rig.repo.fail_next(1);
@@ -405,4 +406,59 @@ fn buffer_budget_below_one_block_per_connection_is_rejected() {
         std::env::temp_dir(),
     );
     assert!(matches!(result, Err(RunError::InvalidConfig)));
+}
+
+#[tokio::test]
+async fn same_size_replacement_never_mixes_representations() {
+    let old = body(70_000);
+    let rig = rig(&old, true, None);
+    rig.transport.fault(FetchFault::Stall { after: 1000 });
+    let (control, receiver) = mpsc::channel(1);
+    let run = rig.coordinator.run(rig.job().await, receiver);
+    let pause = async {
+        rig.until_durable().await;
+        control.send(Control::Pause).await.unwrap();
+    };
+    let (end, ()) = tokio::join!(run, pause);
+    assert_eq!(end, Ok(SessionEnd::Settled(JobState::Paused)));
+    assert!(rig.durable().await > 0);
+    // Same length, different bytes: only the validator can tell.
+    let new: Vec<u8> = old.iter().map(|b| b.wrapping_add(1)).collect();
+    rig.transport.replace_body(new.clone());
+    rig.command(JobCommand::Resume).await;
+    assert_eq!(rig.run().await, Ok(SessionEnd::Settled(JobState::Queued)));
+    let job = rig.job().await;
+    assert_eq!(job.generation().get(), 2);
+    assert_eq!(rig.durable().await, 0);
+    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&new))));
+    assert_eq!(
+        rig.store
+            .bytes(rig.id, rig.job().await.generation())
+            .unwrap(),
+        new
+    );
+}
+
+#[tokio::test]
+async fn server_without_validator_restarts_from_zero_on_resume() {
+    let content = body(60_000);
+    let rig = rig(&content, false, None);
+    rig.transport.fault(FetchFault::Stall { after: 20_000 });
+    let (control, receiver) = mpsc::channel(1);
+    let run = rig.coordinator.run(rig.job().await, receiver);
+    let pause = async {
+        // Pause only once the connection took the stall fault; pausing earlier
+        // would leave the fault queued for the next session.
+        while rig.transport.fetches() == 0 {
+            tokio::task::yield_now().await;
+        }
+        control.send(Control::Pause).await.unwrap();
+    };
+    let (end, ()) = tokio::join!(run, pause);
+    assert_eq!(end, Ok(SessionEnd::Settled(JobState::Paused)));
+    rig.command(JobCommand::Resume).await;
+    // No validator: existing bytes cannot be trusted, so a new generation starts.
+    assert_eq!(rig.run().await, Ok(SessionEnd::Settled(JobState::Queued)));
+    assert_eq!(rig.job().await.generation().get(), 2);
+    assert_eq!(rig.run().await, Ok(SessionEnd::Verified(digest(&content))));
 }

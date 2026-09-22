@@ -59,6 +59,7 @@ impl MemoryTransfers {
             replace_on_drain: false,
             attempts: 0,
             plan: None,
+            validator: None,
             durable: vec![],
         };
         self.jobs.lock().unwrap().insert(
@@ -111,11 +112,26 @@ impl TransferRepository for MemoryTransfers {
                     JobCommand::ProbeSucceeded {
                         total,
                         max_segments,
+                        ..
                     },
                     None,
                 ) => Some((total, max_segments)),
                 (_, plan) => plan,
             };
+            let validator = match event.command() {
+                _ if replaced => None,
+                JobCommand::ProbeSucceeded { validator, .. } if r.plan.is_none() => validator,
+                JobCommand::ProbeSucceeded { validator, .. } => {
+                    if validator.is_none() || validator != r.validator {
+                        return Err(CommitError::Conflict);
+                    }
+                    r.validator
+                }
+                _ => r.validator,
+            };
+            if validator != o.validator {
+                return Err(CommitError::Conflict);
+            }
             let durable: u64 = if replaced {
                 0
             } else {
@@ -137,6 +153,7 @@ impl TransferRepository for MemoryTransfers {
             r.replace_on_drain = o.replace_on_drain;
             r.attempts = o.attempts;
             r.plan = plan;
+            r.validator = validator;
             Ok(())
         })
     }
@@ -396,7 +413,7 @@ pub enum FetchFault {
     },
 }
 pub struct ScriptedTransport {
-    body: Arc<Vec<u8>>,
+    body: Mutex<Arc<Vec<u8>>>,
     ranges: bool,
     chunk: usize,
     probe_faults: Mutex<VecDeque<TransportError>>,
@@ -407,7 +424,7 @@ pub struct ScriptedTransport {
 impl ScriptedTransport {
     pub fn new(body: Vec<u8>, ranges: bool, chunk: usize) -> Self {
         Self {
-            body: Arc::new(body),
+            body: Mutex::new(Arc::new(body)),
             ranges,
             chunk: chunk.max(1),
             probe_faults: Mutex::default(),
@@ -427,6 +444,15 @@ impl ScriptedTransport {
     pub fn change_representation(&self) {
         *self.changed.lock().unwrap() = true;
     }
+    /// The server now serves different content (possibly the same size): a new
+    /// validator. Fetches bound to the old one report RepresentationChanged.
+    pub fn replace_body(&self, body: Vec<u8>) {
+        *self.body.lock().unwrap() = Arc::new(body);
+        *self.changed.lock().unwrap() = true;
+    }
+    fn validator(&self, body: &[u8]) -> Option<[u8; 32]> {
+        self.ranges.then(|| digest(body))
+    }
     pub fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
     }
@@ -438,7 +464,8 @@ impl Transport for ScriptedTransport {
                 return Err(error);
             }
             *self.changed.lock().unwrap() = false;
-            Ok(Probe::new(self.body.len() as u64, self.ranges))
+            let body = self.body.lock().unwrap().clone();
+            Ok(Probe::new(body.len() as u64, self.validator(&body)))
         })
     }
     fn fetch(
@@ -451,8 +478,9 @@ impl Transport for ScriptedTransport {
             if *self.changed.lock().unwrap() {
                 return Err(TransportError::RepresentationChanged);
             }
-            if range.end() > self.body.len() as u64
-                || (!self.ranges && (range.start() != 0 || range.end() != self.body.len() as u64))
+            let body = self.body.lock().unwrap().clone();
+            if range.end() > body.len() as u64
+                || (!self.ranges && (range.start() != 0 || range.end() != body.len() as u64))
             {
                 return Err(TransportError::Fatal(fhd_domain::StopReason::Unknown));
             }
@@ -461,7 +489,7 @@ impl Transport for ScriptedTransport {
                 return Err(error);
             }
             Ok(Box::new(ScriptedStream {
-                body: self.body.clone(),
+                body,
                 at: range.start() as usize,
                 end: range.end() as usize,
                 chunk: self.chunk,

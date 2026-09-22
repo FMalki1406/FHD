@@ -65,9 +65,12 @@ impl StopTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobCommand {
     Start,
+    /// `validator` identifies the representation (opaque digest of a strong
+    /// validator); `None` means it cannot be resumed across sessions.
     ProbeSucceeded {
         total: u64,
         max_segments: usize,
+        validator: Option<[u8; 32]>,
     },
     Pause,
     Resume,
@@ -107,6 +110,7 @@ pub struct JobProjection {
     pub replace_on_drain: bool,
     pub attempts: u8,
     pub durable_bytes: u64,
+    pub validator: Option<[u8; 32]>,
 }
 #[derive(Clone, Debug)]
 pub struct JobEvent {
@@ -156,6 +160,7 @@ pub struct JobRecord {
     pub attempts: u8,
     /// `(total, max_segments)` from this generation's ProbeSucceeded.
     pub plan: Option<(u64, usize)>,
+    pub validator: Option<[u8; 32]>,
     pub durable: Vec<ByteRange>,
 }
 #[derive(Debug)]
@@ -170,6 +175,8 @@ pub struct Job {
     stop: Option<StopTarget>,
     replace_on_drain: bool,
     attempts: u8,
+    /// Identity of the representation the segment map belongs to.
+    validator: Option<[u8; 32]>,
     segments: Option<SegmentMap>,
 }
 impl Job {
@@ -185,6 +192,7 @@ impl Job {
             stop: self.stop,
             replace_on_drain: self.replace_on_drain,
             attempts: self.attempts,
+            validator: self.validator,
             segments: self.segments.as_ref().map(SegmentMap::snapshot),
         }
     }
@@ -201,6 +209,7 @@ impl Job {
             stop: None,
             replace_on_drain: false,
             attempts: 0,
+            validator: None,
             segments: None,
         }
     }
@@ -218,7 +227,7 @@ impl Job {
                     r.state,
                     S::Transferring | S::Verifying | S::Publishing | S::Completed
                 ))
-            && (r.plan.is_some() || r.durable.is_empty())
+            && (r.plan.is_some() || (r.durable.is_empty() && r.validator.is_none()))
             && r.plan.is_none_or(|(total, _)| total <= r.spec.max_bytes());
         if !consistent {
             return Err(DomainError::InvalidInput);
@@ -245,12 +254,16 @@ impl Job {
             stop: record.stop,
             replace_on_drain: record.replace_on_drain,
             attempts: record.attempts,
+            validator: record.validator,
             segments,
         })
     }
     /// `(total, max_segments)` a repository needs to rebuild the segment map.
     pub fn plan(&self) -> Option<(u64, usize)> {
         self.segments.as_ref().map(|m| (m.total(), m.maximum()))
+    }
+    pub fn validator(&self) -> Option<[u8; 32]> {
+        self.validator
     }
     pub fn id(&self) -> JobId {
         self.id
@@ -295,6 +308,7 @@ impl Job {
             stop: self.stop,
             replace_on_drain: self.replace_on_drain,
             attempts: self.attempts,
+            validator: self.validator,
             durable_bytes: self.segments.as_ref().map_or(0, SegmentMap::durable_bytes),
         }
     }
@@ -397,16 +411,23 @@ impl Job {
                 C::ProbeSucceeded {
                     total,
                     max_segments,
+                    validator,
                 },
             ) => {
                 if total > self.spec.max_bytes() || !(1..=262144).contains(&max_segments) {
                     return Err(DomainError::InvalidInput);
                 }
                 if let Some(map) = &self.segments {
-                    if map.total() != total || map.generation() != self.generation {
+                    // Existing bytes belong to one representation only.
+                    if map.total() != total
+                        || map.generation() != self.generation
+                        || validator.is_none()
+                        || validator != self.validator
+                    {
                         return Err(DomainError::InvalidInput);
                     }
                 } else {
+                    self.validator = validator;
                     self.segments = Some(SegmentMap::new(
                         self.id,
                         self.generation,
@@ -489,6 +510,7 @@ impl Job {
                     self.replace_on_drain = false;
                     self.generation = self.generation.next()?;
                     self.segments = None;
+                    self.validator = None;
                 }
                 match target {
                     StopTarget::Verifying if self.all_durable() => S::Verifying,
@@ -598,6 +620,7 @@ impl Job {
             (S::NeedsAction | S::Paused | S::Failed, C::ReplaceRepresentation) => {
                 self.generation = self.generation.next()?;
                 self.segments = None;
+                self.validator = None;
                 self.reason = None;
                 self.retry_at = None;
                 self.attempts = 0;
@@ -689,6 +712,7 @@ mod tests {
             .handle(JobCommand::ProbeSucceeded {
                 total,
                 max_segments: 4,
+                validator: Some([1; 32]),
             })
             .unwrap();
         value
@@ -722,6 +746,7 @@ mod tests {
             C::ProbeSucceeded {
                 total: 0,
                 max_segments: 16,
+                validator: Some([1; 32]),
             },
             C::Pause,
             C::Resume,
@@ -790,6 +815,7 @@ mod tests {
                     value.stop = Some(StopTarget::Paused);
                 }
                 value.segments = Some(SegmentMap::new(value.id, value.generation, 0, 16).unwrap());
+                value.validator = Some([1; 32]);
                 let result = value.handle(command);
                 match expected[column] {
                     '.' => {
@@ -829,6 +855,7 @@ mod tests {
             .handle(JobCommand::ProbeSucceeded {
                 total: 10,
                 max_segments: 4,
+                validator: Some([1; 32]),
             })
             .unwrap();
         let lease = first_lease(&mut value);
@@ -1182,7 +1209,8 @@ mod tests {
                 value
                     .handle(JobCommand::ProbeSucceeded {
                         total,
-                        max_segments
+                        max_segments,
+                        validator: Some([1; 32])
                     })
                     .unwrap_err(),
                 DomainError::InvalidInput
@@ -1198,7 +1226,8 @@ mod tests {
             value
                 .handle(JobCommand::ProbeSucceeded {
                     total: 11,
-                    max_segments: 4
+                    max_segments: 4,
+                    validator: Some([1; 32]),
                 })
                 .unwrap_err(),
             DomainError::InvalidInput
@@ -1236,6 +1265,7 @@ mod tests {
             C::ProbeSucceeded {
                 total: 64,
                 max_segments: 8,
+                validator: Some([1; 32]),
             },
             C::Pause,
             C::Resume,
@@ -1359,6 +1389,7 @@ mod tests {
             replace_on_drain: p.replace_on_drain,
             attempts: p.attempts,
             plan: value.plan(),
+            validator: value.validator(),
             durable: value
                 .segments()
                 .map(|m| {
@@ -1427,6 +1458,10 @@ mod tests {
         r.plan = None;
         cases.push(r);
         let mut r = good.clone();
+        r.plan = None;
+        r.durable = vec![];
+        cases.push(r);
+        let mut r = good.clone();
         r.plan = Some((2048, 4));
         cases.push(r);
         let mut r = good.clone();
@@ -1446,5 +1481,42 @@ mod tests {
         fragmented.plan = Some((10, 2));
         fragmented.durable = vec![ByteRange::new(2, 4).unwrap()];
         assert_eq!(Job::restore(fragmented).unwrap_err(), DomainError::Capacity);
+    }
+
+    #[test]
+    fn existing_bytes_resume_only_under_the_same_validator() {
+        let mut value = transferring(10);
+        let lease = first_lease(&mut value);
+        value.mark_written(lease).unwrap();
+        let ticket = value.prepare_sync().unwrap();
+        let batch = value.acknowledge_sync(ticket).unwrap();
+        value.acknowledge_commit(batch).unwrap();
+        value.handle(JobCommand::Pause).unwrap();
+        value.handle(JobCommand::WorkersDrained).unwrap();
+        value.handle(JobCommand::Resume).unwrap();
+        value.handle(JobCommand::Pause).unwrap();
+        value.handle(JobCommand::Resume).unwrap();
+        assert_eq!(value.state(), JobState::Verifying, "all durable");
+        let mut value = transferring(10);
+        value.handle(JobCommand::Pause).unwrap();
+        value.handle(JobCommand::WorkersDrained).unwrap();
+        value.handle(JobCommand::Resume).unwrap();
+        value.handle(JobCommand::Start).unwrap();
+        for validator in [Some([2; 32]), None] {
+            assert_eq!(
+                value
+                    .handle(JobCommand::ProbeSucceeded {
+                        total: 10,
+                        max_segments: 4,
+                        validator,
+                    })
+                    .unwrap_err(),
+                DomainError::InvalidInput
+            );
+        }
+        value.handle(JobCommand::RepresentationChanged).unwrap();
+        value.handle(JobCommand::WorkersDrained).unwrap();
+        assert_eq!(value.validator(), None);
+        assert!(value.segments().is_none());
     }
 }

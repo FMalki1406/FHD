@@ -336,6 +336,7 @@ mod transfer_state {
             JobCommand::ProbeSucceeded {
                 total: 10,
                 max_segments: 4,
+                validator: Some([5; 32]),
             },
         )
         .await;
@@ -579,6 +580,7 @@ mod transfer_state {
             JobCommand::ProbeSucceeded {
                 total: 10,
                 max_segments: 2,
+                validator: Some([5; 32]),
             },
         )
         .await;
@@ -650,6 +652,7 @@ mod transfer_state {
             JobCommand::ProbeSucceeded {
                 total: 0,
                 max_segments: 1,
+                validator: Some([5; 32]),
             },
         )
         .await;
@@ -682,5 +685,30 @@ mod transfer_state {
         let map = restored.segments().unwrap();
         assert_eq!(map.durable_bytes(), 6);
         assert_eq!(map.segments().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn validator_survives_reload_and_a_different_one_conflicts() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let mut job = partly_durable(&repo).await;
+        step(&repo, &mut job, JobCommand::Pause).await;
+        step(&repo, &mut job, JobCommand::WorkersDrained).await;
+        step(&repo, &mut job, JobCommand::Resume).await;
+        step(&repo, &mut job, JobCommand::Start).await;
+        let restored = loaded(&repo, job.id()).await;
+        assert_eq!(restored.validator(), Some([5; 32]));
+        // A forged re-probe event with another validator must not persist.
+        let mut forged = loaded(&repo, job.id()).await;
+        forged.handle(JobCommand::RepresentationChanged).unwrap();
+        let event = forged.decide(JobCommand::WorkersDrained).unwrap().remove(0);
+        assert_eq!(
+            repo.commit_transition(event).await,
+            Err(CommitError::Conflict),
+            "stale version"
+        );
+        assert_eq!(loaded(&repo, job.id()).await.validator(), Some([5; 32]));
     }
 }

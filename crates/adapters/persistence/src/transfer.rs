@@ -114,13 +114,15 @@ struct Current {
     state: JobState,
     generation: i64,
     plan: Option<(i64, i64)>,
+    validator: Option<Vec<u8>>,
 }
 fn current(tx: &Transaction<'_>, id: i64) -> Result<Current> {
-    let row: Option<(i64, i64, Option<i64>, Option<i64>)> = tx
+    type Row = (i64, i64, Option<i64>, Option<i64>, Option<Vec<u8>>);
+    let row: Option<Row> = tx
         .query_row(
-            "SELECT state,generation,total,max_segments FROM job_state WHERE job_id=?1",
+            "SELECT state,generation,total,max_segments,validator FROM job_state WHERE job_id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
     Ok(match row {
@@ -128,11 +130,13 @@ fn current(tx: &Transaction<'_>, id: i64) -> Result<Current> {
             state: JobState::Queued,
             generation: 1,
             plan: None,
+            validator: None,
         },
-        Some((state, generation, total, maximum)) => Current {
+        Some((state, generation, total, maximum, validator)) => Current {
             state: state_of(state)?,
             generation,
             plan: total.zip(maximum),
+            validator,
         },
     })
 }
@@ -243,11 +247,31 @@ impl SqliteRepository {
                     JobCommand::ProbeSucceeded {
                         total,
                         max_segments,
+                        ..
                     },
                     None,
                 ) => Some((stored(total)?, stored(max_segments as u64)?)),
                 (_, plan) => plan,
             };
+            // The representation identity follows the plan: set once, compared on
+            // re-probe, forgotten with the generation.
+            let validator = match (event.command(), &now.validator) {
+                _ if replaced => None,
+                (JobCommand::ProbeSucceeded { validator, .. }, _) if now.plan.is_none() => {
+                    validator.map(|v| v.to_vec())
+                }
+                (JobCommand::ProbeSucceeded { validator, .. }, stored) => {
+                    // Resuming existing bytes needs a validator, as in the domain.
+                    if validator.is_none() || validator.map(|v| v.to_vec()) != *stored {
+                        return Err(PersistenceError::Conflict);
+                    }
+                    stored.clone()
+                }
+                (_, stored) => stored.clone(),
+            };
+            if validator.as_deref() != outcome.validator.as_ref().map(|v| v.as_slice()) {
+                return Err(PersistenceError::Conflict);
+            }
             if replaced {
                 tx.execute("DELETE FROM extents WHERE job_id=?1", [id])?;
             }
@@ -263,11 +287,12 @@ impl SqliteRepository {
             let (stop_kind, stop_value) = stop_columns(outcome.stop)?;
             tx.execute(
                 "INSERT INTO job_state(job_id,state,generation,reason,retry_at,stop_kind,stop_value,\
-                 replace_on_drain,attempts,total,max_segments) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 replace_on_drain,attempts,total,max_segments,validator) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                  ON CONFLICT(job_id) DO UPDATE SET state=excluded.state,generation=excluded.generation,\
                  reason=excluded.reason,retry_at=excluded.retry_at,stop_kind=excluded.stop_kind,\
                  stop_value=excluded.stop_value,replace_on_drain=excluded.replace_on_drain,\
-                 attempts=excluded.attempts,total=excluded.total,max_segments=excluded.max_segments",
+                 attempts=excluded.attempts,total=excluded.total,max_segments=excluded.max_segments,\
+                 validator=excluded.validator",
                 params![
                     id,
                     state_code(outcome.state),
@@ -280,6 +305,7 @@ impl SqliteRepository {
                     i64::from(outcome.attempts),
                     plan.map(|p| p.0),
                     plan.map(|p| p.1),
+                    validator,
                 ],
             )?;
             if tx.execute(
@@ -380,11 +406,12 @@ impl SqliteRepository {
                 super::SpecRow,
                 Option<(i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64, i64)>,
                 Option<(i64, i64)>,
+                Option<Vec<u8>>,
             );
             let mut statement = inner.db.prepare(
                 "SELECT j.id,j.version,j.source,j.destination,j.expected,j.priority,j.max_bytes,\
                  s.state,s.generation,s.reason,s.retry_at,s.stop_kind,s.stop_value,s.replace_on_drain,\
-                 s.attempts,s.total,s.max_segments FROM jobs j LEFT JOIN job_state s ON s.job_id=j.id \
+                 s.attempts,s.total,s.max_segments,s.validator FROM jobs j LEFT JOIN job_state s ON s.job_id=j.id \
                  ORDER BY j.id",
             )?;
             let rows: Vec<Row> = statement
@@ -410,11 +437,15 @@ impl SqliteRepository {
                             )),
                         },
                         total.zip(maximum),
+                        r.get(17)?,
                     ))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             let mut jobs = Vec::with_capacity(rows.len());
-            for (id, version, spec, state, plan) in rows {
+            for (id, version, spec, state, plan, validator) in rows {
+                let validator = validator
+                    .map(|v| <[u8; 32]>::try_from(v).map_err(|_| PersistenceError::Corrupt))
+                    .transpose()?;
                 let job_id = JobId::new(loaded(id)?).map_err(|_| PersistenceError::Corrupt)?;
                 let spec = decode_spec(spec)?;
                 let version = loaded(version)?;
@@ -431,6 +462,7 @@ impl SqliteRepository {
                         replace_on_drain: false,
                         attempts: 0,
                         plan: None,
+                        validator: None,
                         durable: vec![],
                     },
                     Some((state, generation, reason, retry_at, kind, value, replace, attempts)) => {
@@ -456,6 +488,7 @@ impl SqliteRepository {
                             attempts: u8::try_from(attempts)
                                 .map_err(|_| PersistenceError::Corrupt)?,
                             plan,
+                            validator,
                             durable: ranges(&extents(&inner.db, id, generation)?),
                         }
                     }
