@@ -444,8 +444,9 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
             expected_sha256: Some(expected_digest(&second)),
         },
     ];
-    // Two connections in the whole engine, two jobs: the queue is what decides.
-    let mut settings = config(&state, state.0.join("unused.bin"), 2);
+    // One connection each and room for both: the two jobs genuinely overlap, each
+    // writing its own part in the one directory the engine owns.
+    let mut settings = config(&state, state.0.join("unused.bin"), 1);
     settings.engine_connections = 2;
     settings.max_active = 2;
 
@@ -457,6 +458,9 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
     for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
         match outcome {
             JobOutcome::Published(path) => assert_eq!(path, request.destination, "job {index}"),
+            JobOutcome::Settled(state, reason) => {
+                panic!("job {index} stopped in {state:?} because {reason:?}")
+            }
             other => panic!("job {index} ended as {other:?}"),
         }
     }

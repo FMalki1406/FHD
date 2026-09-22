@@ -7,6 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const MAGIC: &[u8; 9] = b"FHDPART\0\x01";
@@ -142,8 +143,34 @@ fn identity(spec: PartSpec, sealed: bool) -> [u8; META_LEN] {
     data[33] = u8::from(sealed);
     data
 }
+/// Holds the part directory against a second engine for as long as it lives, and
+/// nothing finer: two jobs in one engine each own their own generation's file, so
+/// the directory lock must not be taken again per handle.
 #[derive(Default)]
-pub struct FileStorage;
+pub struct FileStorage {
+    owner: Option<Arc<File>>,
+}
+impl FileStorage {
+    /// Claims `directory` for this process. A second engine pointed at the same
+    /// tree is refused here rather than corrupting a part later.
+    pub fn own(path: &Path) -> Result<Self, StorageError> {
+        // The engine's own tree, created here if this is its first run.
+        let directory = directory(path, true)?;
+        let lock_path = directory.join("owner.lock");
+        check_optional(&lock_path)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(io)?;
+        lock.try_lock().map_err(|_| StorageError::Locked)?;
+        Ok(Self {
+            owner: Some(Arc::new(lock)),
+        })
+    }
+}
 impl SegmentStore for FileStorage {
     /// Reconciliation only, never the byte path: resolves the destination exactly as
     /// `publish` does, follows no link, and hashes only a file of the expected size.
@@ -185,10 +212,20 @@ impl SegmentStore for FileStorage {
         }))
     }
     fn create(&self, path: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError> {
-        Ok(Box::new(FilePart::open_inner(path, spec, true)?))
+        Ok(Box::new(FilePart::open_inner(
+            path,
+            spec,
+            true,
+            self.owner.clone(),
+        )?))
     }
     fn open(&self, path: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError> {
-        Ok(Box::new(FilePart::open_inner(path, spec, false)?))
+        Ok(Box::new(FilePart::open_inner(
+            path,
+            spec,
+            false,
+            self.owner.clone(),
+        )?))
     }
 }
 #[cfg(test)]
@@ -213,22 +250,17 @@ struct FilePart {
     poisoned: bool,
     #[cfg(test)]
     fault: Option<Fault>,
-    // Release the ownership lock after every open data/metadata handle.
-    _lock: File,
+    // Released after every open data/metadata handle of this part.
+    _lock: Option<Arc<File>>,
 }
 impl FilePart {
-    fn open_inner(path: &Path, spec: PartSpec, create: bool) -> Result<Self, StorageError> {
+    fn open_inner(
+        path: &Path,
+        spec: PartSpec,
+        create: bool,
+        owner: Option<Arc<File>>,
+    ) -> Result<Self, StorageError> {
         let directory = directory(path, create)?;
-        let lock_path = directory.join("owner.lock");
-        check_optional(&lock_path)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(io)?;
-        lock.try_lock().map_err(|_| StorageError::Locked)?;
         let name = format!("{}-{}", spec.job().get(), spec.generation().get());
         let part_path = directory.join(format!("{name}.part"));
         let metadata_path = directory.join(format!("{name}.meta"));
@@ -247,6 +279,7 @@ impl FilePart {
                     io(error)
                 }
             })?;
+
         let mut metadata = OpenOptions::new()
             .read(true)
             .write(true)
@@ -290,7 +323,7 @@ impl FilePart {
             poisoned: false,
             #[cfg(test)]
             fault: None,
-            _lock: lock,
+            _lock: owner,
         })
     }
     fn healthy(&self) -> Result<(), StorageError> {
@@ -567,7 +600,9 @@ mod tests {
     #[test]
     fn out_of_order_writes_preserve_holes_until_full_coverage_and_sync() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
         part.write_at(3, b"def").unwrap();
         part.sync().unwrap();
         assert_eq!(
@@ -585,7 +620,9 @@ mod tests {
     #[test]
     fn a_part_is_released_only_after_publication_or_abandonment() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
         part.write_at(0, b"abcdef").unwrap();
         part.sync().unwrap();
         part.verify(None).unwrap();
@@ -605,7 +642,9 @@ mod tests {
 
         // A cancelled transfer may drop bytes it never published.
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
         part.write_at(0, b"abcdef").unwrap();
         part.sync().unwrap();
         part.abandon();
@@ -615,7 +654,9 @@ mod tests {
     #[test]
     fn file_length_and_zero_hash_never_authorize_unwritten_holes() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(8)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(8))
+            .unwrap();
         assert_eq!(
             fs::metadata(directory.part().join("1-1.part"))
                 .unwrap()
@@ -634,12 +675,16 @@ mod tests {
     #[test]
     fn reopen_requires_rehashed_repository_extents_and_explicit_sync() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
         part.write_at(3, b"def").unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         drop(part);
-        let mut reopened = FileStorage.open(&directory.part(), spec(6)).unwrap();
+        let mut reopened = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
         assert_eq!(reopened.verify(None), Err(StorageError::InvalidState));
         reopened.recover_extent(range(3, 6), hash(b"def")).unwrap();
         assert_eq!(
@@ -657,7 +702,9 @@ mod tests {
     #[test]
     fn write_after_verification_invalidates_publication_and_needs_new_sync() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(3)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(3))
+            .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         part.verify(None).unwrap();
@@ -678,7 +725,9 @@ mod tests {
     #[test]
     fn destination_collision_never_overwrites_user_file() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(3)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(3))
+            .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         part.verify(None).unwrap();
@@ -692,14 +741,18 @@ mod tests {
     #[test]
     fn seal_survives_reopen_and_prevents_writing_published_inode() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(3)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(3))
+            .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         part.verify(None).unwrap();
         part.publish(&directory.output()).unwrap();
         assert_eq!(part.write_at(0, b"xyz"), Err(StorageError::InvalidState));
         drop(part);
-        let mut reopened = FileStorage.open(&directory.part(), spec(3)).unwrap();
+        let mut reopened = FileStorage::default()
+            .open(&directory.part(), spec(3))
+            .unwrap();
         assert_eq!(
             reopened.write_at(0, b"xyz"),
             Err(StorageError::InvalidState)
@@ -713,7 +766,7 @@ mod tests {
             .write_all(b"USER")
             .unwrap();
         assert!(matches!(
-            FileStorage.open(&directory.part(), spec(3)),
+            FileStorage::default().open(&directory.part(), spec(3)),
             Err(StorageError::Integrity)
         ));
         assert_eq!(fs::read(directory.output()).unwrap(), b"abcUSER");
@@ -721,32 +774,39 @@ mod tests {
     #[test]
     fn lock_identity_bounds_and_existing_generation_are_enforced() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(3)).unwrap();
+        let store = FileStorage::own(&directory.part()).unwrap();
+        // The tree belongs to one engine: a second one is refused here, not later.
         assert!(matches!(
-            FileStorage.open(&directory.part(), spec(3)),
+            FileStorage::own(&directory.part()),
             Err(StorageError::Locked)
         ));
+        let mut part = store.create(&directory.part(), spec(3)).unwrap();
         assert_eq!(part.write_at(u64::MAX, b"a"), Err(StorageError::Bounds));
         assert_eq!(part.write_at(2, b"xx"), Err(StorageError::Bounds));
         assert_eq!(part.hash_range(range(2, 4)), Err(StorageError::Bounds));
         drop(part);
         assert!(matches!(
-            FileStorage.create(&directory.part(), spec(3)),
+            store.create(&directory.part(), spec(3)),
             Err(StorageError::Conflict)
         ));
         assert!(matches!(
-            FileStorage.open(&directory.part(), spec(4)),
+            store.open(&directory.part(), spec(4)),
             Err(StorageError::Integrity)
         ));
+        // Two generations of one job, and two jobs, live side by side: the engine
+        // runs several at once, so opening one part never excludes another.
         let other = PartSpec::new(JobId::new(1).unwrap(), Generation::new(2).unwrap(), 3).unwrap();
-        let _next = FileStorage.create(&directory.part(), other).unwrap();
+        let _next = store.create(&directory.part(), other).unwrap();
+        let elsewhere = PartSpec::new(JobId::new(9).unwrap(), Generation::initial(), 3).unwrap();
+        let _other_job = store.create(&directory.part(), elsewhere).unwrap();
+        assert!(directory.part().join("9-1.part").exists());
         assert!(directory.part().join("1-1.part").exists());
         assert!(directory.part().join("1-2.part").exists());
     }
     #[test]
     fn partial_write_poisoning_never_credits_full_range() {
         let directory = Directory::new();
-        let mut part = FilePart::open_inner(&directory.part(), spec(6), true).unwrap();
+        let mut part = FilePart::open_inner(&directory.part(), spec(6), true, None).unwrap();
         part.fault = Some(Fault::PartialWrite(2));
         assert_eq!(
             part.write_at(0, b"abcdef"),
@@ -756,7 +816,9 @@ mod tests {
         assert_eq!(part.sync(), Err(StorageError::InvalidState));
         assert_eq!(part.write_at(0, b"abcdef"), Err(StorageError::InvalidState));
         drop(part);
-        let mut part = FileStorage.open(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
         assert_eq!(
             part.recover_extent(range(0, 6), hash(b"abcdef")),
             Err(StorageError::Integrity)
@@ -768,7 +830,7 @@ mod tests {
     #[test]
     fn failed_sync_requires_reopen_and_reconciliation() {
         let directory = Directory::new();
-        let mut part = FilePart::open_inner(&directory.part(), spec(3), true).unwrap();
+        let mut part = FilePart::open_inner(&directory.part(), spec(3), true, None).unwrap();
         part.write_at(0, b"abc").unwrap();
         part.fault = Some(Fault::Sync);
         assert_eq!(
@@ -781,7 +843,9 @@ mod tests {
             Err(StorageError::InvalidState)
         );
         drop(part);
-        let mut part = FileStorage.open(&directory.part(), spec(3)).unwrap();
+        let mut part = FileStorage::default()
+            .open(&directory.part(), spec(3))
+            .unwrap();
         part.recover_extent(range(0, 3), hash(b"abc")).unwrap();
         part.sync().unwrap();
         part.verify(Some(hash(b"abc"))).unwrap();
@@ -789,7 +853,9 @@ mod tests {
     #[test]
     fn changed_bytes_after_verification_are_rejected_at_publication() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(3)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(3))
+            .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         part.verify(None).unwrap();
@@ -803,7 +869,9 @@ mod tests {
     #[test]
     fn empty_file_is_a_valid_complete_transfer_without_nonempty_extents() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(0)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(0))
+            .unwrap();
         assert_eq!(part.verify(Some(hash(b""))).unwrap(), hash(b""));
         part.publish(&directory.output()).unwrap();
         assert_eq!(fs::metadata(directory.output()).unwrap().len(), 0);
@@ -816,7 +884,7 @@ mod tests {
         fs::write(directory.output(), b"USER").unwrap();
         std::os::unix::fs::symlink(directory.output(), directory.part().join("1-1.part")).unwrap();
         assert!(matches!(
-            FileStorage.create(&directory.part(), spec(4)),
+            FileStorage::default().create(&directory.part(), spec(4)),
             Err(StorageError::InvalidInput)
         ));
         assert_eq!(fs::read(directory.output()).unwrap(), b"USER");
@@ -824,11 +892,15 @@ mod tests {
     #[test]
     fn recovered_durable_ranges_cannot_be_overwritten() {
         let directory = Directory::new();
-        let mut part = FileStorage.create(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
         drop(part);
-        let mut part = FileStorage.open(&directory.part(), spec(6)).unwrap();
+        let mut part = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
         part.recover_extent(range(0, 3), hash(b"abc")).unwrap();
         assert_eq!(part.write_at(1, b"XX"), Err(StorageError::InvalidState));
         assert_eq!(part.write_at(2, b"XX"), Err(StorageError::InvalidState));

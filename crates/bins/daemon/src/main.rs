@@ -136,9 +136,14 @@ async fn main() {
                         JobOutcome::Published(path) => {
                             println!("{index} published {}", path.display())
                         }
-                        JobOutcome::Settled(state) => {
+                        JobOutcome::Settled(state, reason) => {
                             failed |= state != fhd_domain::JobState::Completed;
-                            println!("{index} stopped in {state:?}");
+                            match reason {
+                                Some(reason) => {
+                                    println!("{index} stopped in {state:?} ({reason:?})")
+                                }
+                                None => println!("{index} stopped in {state:?}"),
+                            }
                         }
                         JobOutcome::NeedsDecision(reason) => {
                             failed = true;

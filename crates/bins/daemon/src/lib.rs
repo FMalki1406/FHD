@@ -123,7 +123,9 @@ pub struct Request {
 #[derive(Debug)]
 pub enum JobOutcome {
     Published(PathBuf),
-    Settled(JobState),
+    /// Where the job came to rest, and why when it says so: a state alone does not
+    /// tell an operator whether to retry, free space, or fix the link.
+    Settled(JobState, Option<StopReason>),
     NeedsDecision(Option<StopReason>),
     Failed(RunError),
 }
@@ -321,7 +323,10 @@ impl Engine {
             Coordinator::new(
                 Ports {
                     repository: repository.clone(),
-                    store: Arc::new(FileStorage),
+                    store: Arc::new(
+                        FileStorage::own(&config.state_directory.join("parts"))
+                            .map_err(|_| EngineError::InvalidInput)?,
+                    ),
                     transport: Arc::new(transport),
                     destinations: Arc::new(FixedDestinations(destinations)),
                 },
@@ -386,7 +391,7 @@ impl Engine {
         let mut outcomes = self.drive(ids, receiver).await?;
         match outcomes.pop().map(|(_, outcome)| outcome) {
             Some(JobOutcome::Published(path)) => Ok(SessionEnd::Published(path)),
-            Some(JobOutcome::Settled(state)) => Ok(SessionEnd::Settled(state)),
+            Some(JobOutcome::Settled(state, _)) => Ok(SessionEnd::Settled(state)),
             Some(JobOutcome::NeedsDecision(reason)) => Err(EngineError::NeedsDecision(reason)),
             Some(JobOutcome::Failed(error)) => Err(EngineError::Run(error)),
             None => Err(EngineError::InvalidInput),
@@ -433,13 +438,13 @@ impl Engine {
         }
         for outcome in self.scheduler.run(runnable, commands).await {
             let index = *owners.get(&outcome.id).ok_or(EngineError::InvalidInput)?;
-            let state = outcome.job.as_ref().map(Job::state);
+            let rest = outcome.job.as_ref().map(|job| (job.state(), job.reason()));
             outcomes.push((
                 index,
-                match (outcome.result, state) {
+                match (outcome.result, rest) {
                     (Some(Ok(SessionEnd::Published(path))), _) => JobOutcome::Published(path),
                     (Some(Err(error)), _) => JobOutcome::Failed(error),
-                    (_, Some(state)) => JobOutcome::Settled(state),
+                    (_, Some((state, reason))) => JobOutcome::Settled(state, reason),
                     // Nothing came back but a job: a session that ended without one
                     // proves nothing, and the repository is the authority anyway.
                     (_, None) => JobOutcome::Failed(RunError::Invariant),
@@ -459,7 +464,7 @@ impl Engine {
             .await
             .map_err(EngineError::Run)?;
         if matches!(job.state(), JobState::Completed | JobState::Cancelled) {
-            return Ok(Err(JobOutcome::Settled(job.state())));
+            return Ok(Err(JobOutcome::Settled(job.state(), job.reason())));
         }
         let job = match (job.state(), self.intent) {
             (JobState::Queued | JobState::Probing | JobState::Transferring, _) => job,
