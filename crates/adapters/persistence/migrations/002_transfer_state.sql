@@ -25,6 +25,7 @@ CREATE TABLE extents (
     generation INTEGER NOT NULL CHECK(generation > 0),
     start INTEGER NOT NULL CHECK(start >= 0),
     end_excl INTEGER NOT NULL CHECK(end_excl > start),
+    digest BLOB NOT NULL CHECK(length(digest) = 32),
     PRIMARY KEY(job_id, generation, start)
 ) WITHOUT ROWID;
 PRAGMA user_version = 2;

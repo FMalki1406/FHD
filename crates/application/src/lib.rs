@@ -153,22 +153,43 @@ pub enum CommitError {
     Capacity,
 }
 
+/// A synced range and the SHA-256 of its bytes, hashed after sync. Storage rehashes
+/// against this digest before trusting the range again after a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableExtent {
+    range: ByteRange,
+    digest: [u8; 32],
+}
+impl DurableExtent {
+    pub fn new(range: ByteRange, digest: [u8; 32]) -> Self {
+        Self { range, digest }
+    }
+    pub fn range(self) -> ByteRange {
+        self.range
+    }
+    pub fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+}
+
 /// Durable transfer state. Each call is one transaction; nothing is acknowledged
 /// before commit. Callers apply a domain change in memory only after its commit.
 pub trait TransferRepository: Send + Sync {
     /// Stores `event.outcome()` only if the stored version, state and generation are
     /// exactly what the event was decided against; otherwise `Conflict`.
     fn commit_transition(&self, event: JobEvent) -> PortFuture<'_, Result<(), CommitError>>;
-    /// Records synced ranges of the current generation. Re-committing ranges that are
-    /// already durable is a no-op, so an ambiguous commit can be retried.
+    /// Records synced extents of the current generation. Re-committing an identical
+    /// extent is a no-op, so an ambiguous commit can be retried.
     fn commit_extents(
         &self,
         job: JobId,
         generation: Generation,
-        ranges: Vec<ByteRange>,
+        extents: Vec<DurableExtent>,
     ) -> PortFuture<'_, Result<(), CommitError>>;
     /// Every admitted job, rebuilt from durable state only.
     fn load_jobs(&self) -> PortFuture<'_, Result<Vec<Job>, AppError>>;
+    /// Durable extents of the job's current generation, ascending, for storage recovery.
+    fn durable_extents(&self, job: JobId) -> PortFuture<'_, Result<Vec<DurableExtent>, AppError>>;
 }
 
 pub trait JobRepository: Send + Sync {

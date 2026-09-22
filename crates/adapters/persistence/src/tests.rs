@@ -303,9 +303,13 @@ async fn redirected_parent_is_allowed_but_private_leaf_symlink_is_rejected() {
 
 mod transfer_state {
     use super::*;
-    use fhd_app::TransferRepository;
+    use fhd_app::{DurableExtent, TransferRepository};
     use fhd_domain::{ByteRange, Job, JobCommand, SegmentState, StopReason};
 
+    /// Test digest derived from the range; real digests come from hashing synced bytes.
+    fn ext(start: u64, end: u64) -> DurableExtent {
+        DurableExtent::new(ByteRange::new(start, end).unwrap(), [start as u8; 32])
+    }
     async fn step(repo: &SqliteRepository, job: &mut Job, command: JobCommand) {
         for event in job.decide(command).unwrap() {
             repo.commit_transition(event.clone()).await.unwrap();
@@ -341,7 +345,11 @@ mod transfer_state {
         job.mark_written(lease).unwrap();
         let ticket = job.prepare_sync().unwrap();
         let batch = job.acknowledge_sync(ticket).unwrap();
-        let ranges = batch.ranges().to_vec();
+        let ranges: Vec<_> = batch
+            .ranges()
+            .iter()
+            .map(|r| ext(r.start(), r.end()))
+            .collect();
         repo.commit_extents(batch.job(), batch.generation(), ranges.clone())
             .await
             .unwrap();
@@ -447,8 +455,9 @@ mod transfer_state {
         );
         let generation = job.generation();
         for ranges in [
-            vec![ByteRange::new(2, 6).unwrap()],
-            vec![ByteRange::new(6, 8).unwrap(), ByteRange::new(7, 9).unwrap()],
+            vec![ext(2, 6)],
+            vec![ext(6, 8), ext(7, 9)],
+            vec![DurableExtent::new(ByteRange::new(0, 4).unwrap(), [9; 32])],
         ] {
             assert_eq!(
                 repo.commit_extents(job.id(), generation, ranges).await,
@@ -456,12 +465,8 @@ mod transfer_state {
             );
         }
         assert_eq!(
-            repo.commit_extents(
-                job.id(),
-                generation.next().unwrap(),
-                vec![ByteRange::new(4, 6).unwrap()]
-            )
-            .await,
+            repo.commit_extents(job.id(), generation.next().unwrap(), vec![ext(4, 6)])
+                .await,
             Err(CommitError::Conflict)
         );
         assert_eq!(loaded(&repo, job.id()).await.projection(), job.projection());
@@ -537,7 +542,7 @@ mod transfer_state {
         let id = signed_id(job.id()).unwrap();
         repo.run(move |inner| {
             inner.db.execute(
-                "INSERT INTO extents(job_id,generation,start,end_excl) VALUES(?1,7,4,6)",
+                "INSERT INTO extents(job_id,generation,start,end_excl,digest) VALUES(?1,7,4,6,zeroblob(32))",
                 [id],
             )?;
             Ok(())
@@ -562,12 +567,8 @@ mod transfer_state {
         step(&repo, &mut job, JobCommand::WorkersDrained).await;
         // Paused: the drain is over, so no more extents may land.
         assert_eq!(
-            repo.commit_extents(
-                job.id(),
-                job.generation(),
-                vec![ByteRange::new(4, 6).unwrap()]
-            )
-            .await,
+            repo.commit_extents(job.id(), job.generation(), vec![ext(4, 6)])
+                .await,
             Err(CommitError::Conflict)
         );
         step(&repo, &mut job, JobCommand::Resume).await;
@@ -600,17 +601,15 @@ mod transfer_state {
         let job = partly_durable(&repo).await;
         let (id, generation) = (job.id(), job.generation());
         // durable [0,4) [6,7) plus gaps [4,6) [7,10): four segments, the maximum.
-        repo.commit_extents(id, generation, vec![ByteRange::new(6, 7).unwrap()])
+        repo.commit_extents(id, generation, vec![ext(6, 7)])
             .await
             .unwrap();
         assert_eq!(
-            repo.commit_extents(id, generation, vec![ByteRange::new(8, 9).unwrap()])
-                .await,
+            repo.commit_extents(id, generation, vec![ext(8, 9)]).await,
             Err(CommitError::Conflict)
         );
         assert_eq!(
-            repo.commit_extents(id, generation, vec![ByteRange::new(4, 7).unwrap()])
-                .await,
+            repo.commit_extents(id, generation, vec![ext(4, 7)]).await,
             Err(CommitError::Conflict),
             "superset of a durable extent"
         );
@@ -662,5 +661,26 @@ mod transfer_state {
             .await
             .unwrap();
         assert_eq!(loaded(&repo, id).await.projection(), job.projection());
+    }
+
+    #[tokio::test]
+    async fn durable_extents_return_committed_digests_unmerged() {
+        let directory = Directory::new();
+        let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+            .await
+            .unwrap();
+        let job = partly_durable(&repo).await;
+        repo.commit_extents(job.id(), job.generation(), vec![ext(4, 6)])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.durable_extents(job.id()).await.unwrap(),
+            vec![ext(0, 4), ext(4, 6)]
+        );
+        // Touching extents stay separate rows but restore as one durable segment.
+        let restored = loaded(&repo, job.id()).await;
+        let map = restored.segments().unwrap();
+        assert_eq!(map.durable_bytes(), 6);
+        assert_eq!(map.segments().len(), 2);
     }
 }

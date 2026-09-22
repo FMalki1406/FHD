@@ -1,6 +1,6 @@
 //! Transfer-state transactions: one row of projection per job plus its durable extents.
 use super::{app_error, decode_spec, signed_id, PersistenceError, Result, SqliteRepository};
-use fhd_app::{AppError, CommitError, PortFuture, TransferRepository};
+use fhd_app::{AppError, CommitError, DurableExtent, PortFuture, TransferRepository};
 use fhd_domain::{
     ByteRange, Generation, Job, JobCommand, JobEvent, JobId, JobRecord, JobState, StopReason,
     StopTarget,
@@ -136,59 +136,61 @@ fn current(tx: &Transaction<'_>, id: i64) -> Result<Current> {
         },
     })
 }
-fn extents(db: &Connection, id: i64, generation: i64) -> Result<Vec<ByteRange>> {
+fn extents(db: &Connection, id: i64, generation: i64) -> Result<Vec<DurableExtent>> {
     let mut statement = db.prepare_cached(
-        "SELECT start,end_excl FROM extents WHERE job_id=?1 AND generation=?2 ORDER BY start",
+        "SELECT start,end_excl,digest FROM extents WHERE job_id=?1 AND generation=?2 ORDER BY start",
     )?;
     let rows = statement.query_map(params![id, generation], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (start, end) = row?;
-        out.push(
-            ByteRange::new(loaded(start)?, loaded(end)?).map_err(|_| PersistenceError::Corrupt)?,
-        );
+        let (start, end, digest) = row?;
+        let range =
+            ByteRange::new(loaded(start)?, loaded(end)?).map_err(|_| PersistenceError::Corrupt)?;
+        let digest = digest.try_into().map_err(|_| PersistenceError::Corrupt)?;
+        out.push(DurableExtent::new(range, digest));
     }
     Ok(out)
 }
-/// Sorted, merged union. An incoming range already inside a durable extent is a no-op
-/// (retry after an ambiguous commit). Any other overlap, including a superset of an
-/// existing extent or duplicates within one batch, is `None`: batches carry only
-/// newly synced ranges, so overlap means the caller's view diverged.
-fn merge(existing: Vec<ByteRange>, incoming: &[ByteRange]) -> Option<Vec<ByteRange>> {
-    let mut all = existing.clone();
-    for range in incoming {
-        if existing.iter().any(|e| e.contains(*range)) {
+fn ranges(extents: &[DurableExtent]) -> Vec<ByteRange> {
+    extents.iter().map(|e| e.range()).collect()
+}
+/// Extents to insert. Each committed extent keeps its own digest (a union has no
+/// derivable digest), so rows are never merged. An identical extent is a no-op retry;
+/// any other overlap, with durable rows or within the batch, is `None`.
+fn admit(existing: &[DurableExtent], incoming: &[DurableExtent]) -> Option<Vec<DurableExtent>> {
+    let overlaps = |a: ByteRange, b: ByteRange| a.start() < b.end() && b.start() < a.end();
+    let mut fresh: Vec<DurableExtent> = Vec::with_capacity(incoming.len());
+    for extent in incoming {
+        if existing.contains(extent) || fresh.contains(extent) {
             continue;
         }
         if existing
             .iter()
-            .any(|e| range.start() < e.end() && e.start() < range.end())
+            .chain(fresh.iter())
+            .any(|e| overlaps(e.range(), extent.range()))
         {
             return None;
         }
-        all.push(*range);
+        fresh.push(*extent);
     }
-    all.sort_by_key(|r| r.start());
-    let mut merged: Vec<ByteRange> = Vec::with_capacity(all.len());
-    for range in all {
-        match merged.last_mut() {
-            Some(last) if range.start() < last.end() => return None,
-            Some(last) if range.start() == last.end() => {
-                *last = ByteRange::new(last.start(), range.end()).ok()?
-            }
-            _ => merged.push(range),
-        }
-    }
-    Some(merged)
+    Some(fresh)
 }
-
-/// Segments `SegmentMap::restore` would build: durable extents plus the gaps between.
-fn restored_segments(merged: &[ByteRange], total: u64) -> usize {
+/// Segments `SegmentMap::restore` would build: touching durable ranges merge, plus gaps.
+fn restored_segments(mut durable: Vec<ByteRange>, total: u64) -> usize {
+    durable.sort_by_key(|r| r.start());
     let mut count = 0;
     let mut cursor = 0;
-    for range in merged {
+    for range in durable {
+        if count > 0 && range.start() == cursor {
+            cursor = range.end();
+            continue;
+        }
         count += usize::from(range.start() > cursor) + 1;
         cursor = range.end();
     }
@@ -251,7 +253,7 @@ impl SqliteRepository {
             }
             let durable: u64 = extents(&tx, id, generation)?
                 .iter()
-                .map(|r| r.len())
+                .map(|e| e.range().len())
                 .sum();
             // Memory only marks bytes durable after this repository committed them.
             // Retrying cannot fix a caller whose view diverged: Conflict, not Unavailable.
@@ -297,7 +299,7 @@ impl SqliteRepository {
         &self,
         job: JobId,
         generation: Generation,
-        ranges: Vec<ByteRange>,
+        incoming: Vec<DurableExtent>,
     ) -> Result<()> {
         self.run(move |inner| {
             let id = signed_id(job)?;
@@ -323,29 +325,49 @@ impl SqliteRepository {
                 return Err(PersistenceError::Conflict);
             }
             let total = loaded(total)?;
-            if ranges.iter().any(|r| r.end() > total) {
+            if incoming.iter().any(|e| e.range().end() > total) {
                 return Err(PersistenceError::Corrupt);
             }
-            let merged =
-                merge(extents(&tx, id, generation)?, &ranges).ok_or(PersistenceError::Conflict)?;
+            let existing = extents(&tx, id, generation)?;
+            let fresh = admit(&existing, &incoming).ok_or(PersistenceError::Conflict)?;
+            let mut all = ranges(&existing);
+            all.extend(ranges(&fresh));
             // Never write a state that load_jobs could not rebuild.
-            if restored_segments(&merged, total)
+            if restored_segments(all, total)
                 > usize::try_from(maximum).map_err(|_| PersistenceError::Corrupt)?
             {
                 return Err(PersistenceError::Conflict);
             }
-            tx.execute(
-                "DELETE FROM extents WHERE job_id=?1 AND generation=?2",
-                params![id, generation],
-            )?;
-            for range in &merged {
+            for extent in &fresh {
                 tx.execute(
-                    "INSERT INTO extents(job_id,generation,start,end_excl) VALUES(?1,?2,?3,?4)",
-                    params![id, generation, stored(range.start())?, stored(range.end())?],
+                    "INSERT INTO extents(job_id,generation,start,end_excl,digest) VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        id,
+                        generation,
+                        stored(extent.range().start())?,
+                        stored(extent.range().end())?,
+                        extent.digest().as_slice()
+                    ],
                 )?;
             }
             tx.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn current_extents(&self, job: JobId) -> Result<Vec<DurableExtent>> {
+        self.run(move |inner| {
+            let id = signed_id(job)?;
+            let generation: Option<i64> = inner
+                .db
+                .query_row(
+                    "SELECT generation FROM job_state WHERE job_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            extents(&inner.db, id, generation.unwrap_or(1))
         })
         .await
     }
@@ -434,7 +456,7 @@ impl SqliteRepository {
                             attempts: u8::try_from(attempts)
                                 .map_err(|_| PersistenceError::Corrupt)?,
                             plan,
-                            durable: extents(&inner.db, id, generation)?,
+                            durable: ranges(&extents(&inner.db, id, generation)?),
                         }
                     }
                 };
@@ -465,13 +487,19 @@ impl TransferRepository for SqliteRepository {
         &self,
         job: JobId,
         generation: Generation,
-        ranges: Vec<ByteRange>,
+        extents: Vec<DurableExtent>,
     ) -> PortFuture<'_, std::result::Result<(), CommitError>> {
         Box::pin(async move {
-            self.durable(job, generation, ranges)
+            self.durable(job, generation, extents)
                 .await
                 .map_err(commit_error)
         })
+    }
+    fn durable_extents(
+        &self,
+        job: JobId,
+    ) -> PortFuture<'_, std::result::Result<Vec<DurableExtent>, AppError>> {
+        Box::pin(async move { self.current_extents(job).await.map_err(app_error) })
     }
     fn load_jobs(&self) -> PortFuture<'_, std::result::Result<Vec<Job>, AppError>> {
         Box::pin(async move { self.jobs().await.map_err(app_error) })
