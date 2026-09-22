@@ -7,8 +7,8 @@ publish = false
 [dependencies]
 fhd-app = { path = "../application" }
 fhd-domain = { path = "../domain" }
-tokio = { version = "=1.51.4", features = ["rt", "sync"] }
+tokio = { version = "=1.51.4", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 
 [dev-dependencies]
-tokio = { version = "=1.51.4", features = ["macros", "rt", "sync", "time"] }
+fhd-testkit = { path = "../testkit" }

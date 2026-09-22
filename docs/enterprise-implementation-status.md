@@ -10,7 +10,7 @@
 | fhd-app | AddDownload فوق Repository وAuthorizer وEntitlementGate، بمعاملة تجمع المهمة والإيصال ومصالحة تنافس القبول؛ منافذ SegmentStore وSegmentFile | بقية حالات الاستخدام وIPC والترخيص الإنتاجي لم تُنفذ |
 | fhd-storage | ملف لكل جيل، كتابة موضعية خارج الترتيب، تغطية نطاقات، قفل وsync وبصمات وختم قبل النشر | نشر hard link فقط؛ لا fallback عبر الأقراص ولا حماية directory-handle ولا PublishIntent دائم |
 | fhd-persistence | SQLite WAL/FULL وقبول ذري للمهمة والإيصال وحجز IDs وحذف بإصدار وtombstones؛ الترحيل 2: TransferRepository يحفظ إسقاط كل انتقال والنطاقات المتينة ذريًا ويعيد بناء المهام من المتين وحده؛ عمل محجوب محدود قبل الجدولة | مستودع قبول فقط؛ لا extents أو تحولات حالة التشغيل أو vault أو ترحيل بيانات المحرك القديم |
-| fhd-runtime | BufferPool مشترك يعيد استخدام كتل محدودة؛ Writer على خيط مخصص بقناة محدودة ودمج الكتابات المتجاورة وحواجز sync/hash | مسار واحد لكل ملف؛ لا مشرف WriterPool أو Scheduler أو JobCoordinator أو ربط HTTP بعد |
+| fhd-runtime | BufferPool مشترك؛ Writer على خيط مخصص بحواجز sync/hash/verify؛ JobCoordinator لجلسة مهمة: probe وتقسيم وعمال متوازون وcheckpoint بالبصمات وأخطاء مصنفة وإعادة فتح بإثبات البصمات وتحقق نهائي | مسار واحد لكل ملف؛ لا مشرف WriterPool أو Scheduler أو ربط محول HTTP أو نشر بعد |
 | fhd-testkit | مخزن ذاكرة ذري وحقن فشل قبل المعاملة وبعدها، وحاجز يفرض تنافس ثمانية طلبات | للاختبار فقط؛ ليس تخزينًا دائمًا |
 | fhd-config | حدود متحقق منها ودمج default/user/enforced مع مصدر كل قيمة؛ تحليل إعداد proxy وحجبه | لا قارئات GPO/MDM أو PAC أو تطبيق حي على النقل |
 | fhd-telemetry | أحداث برموز ثابتة وtracing فعلي وأغلفة أسرار محجوبة؛ حلقة ذاكرة محدودة ومقاييس ثابتة | لا دوران ملفات أو حزمة دعم أو رفع بيانات؛ الحجب لا يشمل tracing خارج هذه الواجهة |
@@ -34,7 +34,7 @@
 | 1: الدومين | منفذ جزئيًا: آلة الحالات بجدول §5.2 الكامل (13×17) وخريطة النطاقات وretry واختبارات جدولية وتوليد حتمي. proptest وRepresentation كاملة وربط الاستعادة لم تنفذ |
 | 2: التخزين والاستمرارية | منفذة جزئيًا: write_at وSQLite WAL لقبول الأوامر، ومستودع حالة التنزيل والنطاقات المتينة (الترحيل 2) مع الاستعادة؛ بقي نوايا النشر والمصالحة وfallback ومخزن المراجع والأسرار |
 | 3: النقل | مفتوحة: HTTP adapter وسياسات proxy وTLS؛ نوع ProxyEndpoint لا يعني دعم proxy فعليًا |
-| 4: التشغيل | منفذة جزئيًا: BufferPool ومسار Writer؛ بقي المشرف وScheduler وJobCoordinator وربط النقل والقياسات |
+| 4: التشغيل | منفذة جزئيًا: BufferPool ومسار Writer وJobCoordinator (مختبر بمزيفات)؛ بقي Scheduler وOriginGovernor والمشرف وربط محول HTTP والنشر والقياسات |
 | 5: IPC والعملاء | مفتوحة: daemon وNamed Pipe وUDS وnative host |
 | 6: المؤسسي | مفتوحة: قراءة GPO/MDM وفرض السياسة من البداية إلى النهاية |
 | 7: التصلب | مفتوحة: deny/audit وSBOM وfuzz وقياسات التراجع؛ لا دليل لأهداف 1Gbps أو CPU أو 10000 مهمة |

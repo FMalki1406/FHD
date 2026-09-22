@@ -1,6 +1,7 @@
 //! Application decisions over ports. No networking, filesystem or database dependency.
 #![forbid(unsafe_code)]
 pub mod storage;
+pub mod transport;
 
 use fhd_domain::{ByteRange, Generation, Job, JobEvent, JobId, JobSpec};
 use std::{future::Future, pin::Pin};

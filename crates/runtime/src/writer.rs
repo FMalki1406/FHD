@@ -22,6 +22,7 @@ enum Command {
     },
     Sync(Reply<()>),
     Hash(ByteRange, Reply<[u8; 32]>),
+    Verify(Option<[u8; 32]>, Reply<[u8; 32]>),
 }
 
 /// One dedicated OS writer for a part; workers only send owned bounded buffers.
@@ -110,6 +111,19 @@ impl Writer {
                             }
                             let _ = reply.send(result);
                         }
+                        // A digest mismatch is a verdict, not a broken lane: no poisoning.
+                        Command::Verify(expected, reply) => {
+                            let result = match failure {
+                                Some(error) => Err(error),
+                                None => file.verify(expected).map_err(WriterError::Storage),
+                            };
+                            if let Err(error) = result {
+                                if error != WriterError::Storage(StorageError::Integrity) {
+                                    failure = Some(error);
+                                }
+                            }
+                            let _ = reply.send(result);
+                        }
                     }
                 }
                 failure.map_or(Ok(()), Err)
@@ -180,6 +194,16 @@ impl Writer {
         }
         let (reply, result) = oneshot::channel();
         self.send(Command::Hash(range, reply), cancel).await?;
+        result.await.map_err(|_| WriterError::WorkerFailed)?
+    }
+    /// Whole-file verification after every range is durable; FIFO after prior writes.
+    pub async fn verify(
+        &self,
+        expected: Option<[u8; 32]>,
+        cancel: &CancellationToken,
+    ) -> Result<[u8; 32], WriterError> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::Verify(expected, reply), cancel).await?;
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }
     pub async fn shutdown(mut self) -> Result<(), WriterError> {

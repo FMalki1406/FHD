@@ -1,5 +1,6 @@
 //! Deterministic in-memory ports for application tests. Never a production store.
 #![forbid(unsafe_code)]
+pub mod transfer;
 use fhd_app::{
     AddUnitOfWork, AppError, Authorizer, CommitError, EntitlementGate, JobRepository, PortFuture,
     Principal, Receipt, ReceiptKey,
