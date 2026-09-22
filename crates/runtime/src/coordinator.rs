@@ -48,9 +48,6 @@ impl CoordinatorConfig {
     }
 }
 
-/// Publication retries are bounded: the destination name never changes here.
-const MAX_PUBLISH_ATTEMPTS: u32 = 5;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 
 pub enum Control {
@@ -143,6 +140,13 @@ impl Coordinator {
 
     /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.
     /// Part-file cleanup for Cancelling is not implemented yet; the record completes.
+    /// Applies one command through the same decide → commit → apply path the
+    /// coordinator uses, so callers never invent a second protocol.
+    pub async fn command(&self, mut job: Job, command: JobCommand) -> Result<Job, RunError> {
+        step(self.ports.repository.as_ref(), &mut job, command).await?;
+        Ok(job)
+    }
+
     pub async fn recover(&self, mut job: Job) -> Result<Job, RunError> {
         let repository = self.ports.repository.as_ref();
         match job.state() {
@@ -678,6 +682,15 @@ impl Session<'_> {
         let Some(writer) = self.writer.clone() else {
             return Ok(SessionEnd::Settled(self.job.state()));
         };
+        // A handle that wrote nothing this session (everything was already durable)
+        // has never synced, and verification requires a synced file.
+        if writer.sync(&self.io).await.is_err() {
+            self.step(JobCommand::RequireAction {
+                reason: StopReason::Storage,
+            })
+            .await?;
+            return Ok(SessionEnd::Settled(self.job.state()));
+        }
         match writer
             .verify(self.job.spec().expected_sha256(), &self.io)
             .await
@@ -743,9 +756,6 @@ impl Session<'_> {
         if intent.generation() != self.job.generation() {
             // An intent of an older representation proves nothing about these bytes.
             return self.publish_blocked(StopReason::Storage).await;
-        }
-        if intent.attempt() > MAX_PUBLISH_ATTEMPTS {
-            return self.publish_blocked(StopReason::Destination).await;
         }
         let destination = self
             .c

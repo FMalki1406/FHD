@@ -580,3 +580,26 @@ async fn a_non_file_holding_the_name_blocks_publication() {
     );
     assert_eq!(rig.job().await.reason(), Some(StopReason::Destination));
 }
+
+#[tokio::test]
+async fn a_resumed_session_with_nothing_left_to_fetch_still_verifies() {
+    let content = body(30_000);
+    let rig = rig(&content, true, None);
+    // Block publication so the job settles with every byte already durable.
+    rig.store.block(rig.destination.clone());
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    rig.store.free(&rig.destination);
+    rig.command(JobCommand::Resume).await;
+    assert_eq!(rig.job().await.state(), JobState::Verifying);
+    let fetches = rig.transport.fetches();
+    // This session writes nothing, so only an explicit sync makes verification legal.
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(rig.destination.clone()))
+    );
+    assert_eq!(rig.transport.fetches(), fetches);
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+}

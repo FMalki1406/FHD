@@ -1,0 +1,131 @@
+//! Operator entry point for the new engine: one job, driven to rest.
+//! Ctrl+C pauses durably rather than killing the transfer.
+#![forbid(unsafe_code)]
+
+use fhd_daemon::{absolute, read_url, Engine, EngineConfig, EngineError, Intent};
+use fhd_runtime::coordinator::{Control, SessionEnd};
+use std::path::PathBuf;
+use tokio::sync::mpsc;
+
+fn usage() -> &'static str {
+    "usage: fhd-engine <state-directory> <destination-file> [--connections N] \
+     [--max-bytes N] [--sha256 HEX] [--allow-http] [--resume]   (URL on stdin)"
+}
+
+fn parse() -> Result<EngineConfig, &'static str> {
+    let mut args = std::env::args().skip(1);
+    let state_directory = PathBuf::from(args.next().ok_or(usage())?);
+    let destination = PathBuf::from(args.next().ok_or(usage())?);
+    let mut config = EngineConfig {
+        state_directory: absolute(&state_directory).map_err(|_| "invalid state directory")?,
+        destination: absolute(&destination).map_err(|_| "invalid destination")?,
+        connections: 4,
+        expected_sha256: None,
+        max_bytes: 100 * 1024 * 1024 * 1024,
+        allow_http: false,
+        intent: Intent::Start,
+    };
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--connections" => {
+                config.connections = args
+                    .next()
+                    .ok_or("missing connection count")?
+                    .parse()
+                    .map_err(|_| "invalid connection count")?
+            }
+            "--max-bytes" => {
+                config.max_bytes = args
+                    .next()
+                    .ok_or("missing maximum size")?
+                    .parse()
+                    .map_err(|_| "invalid maximum size")?
+            }
+            "--sha256" => {
+                let hex = args.next().ok_or("missing checksum")?;
+                if hex.len() != 64 || !hex.is_ascii() {
+                    return Err("invalid checksum");
+                }
+                let mut digest = [0u8; 32];
+                for (index, byte) in digest.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&hex[2 * index..2 * index + 2], 16)
+                        .map_err(|_| "invalid checksum")?;
+                }
+                config.expected_sha256 = Some(digest);
+            }
+            "--allow-http" => config.allow_http = true,
+            // Releasing a stopped job is the operator's decision, never automatic.
+            "--resume" => config.intent = Intent::Resume,
+            _ => return Err(usage()),
+        }
+    }
+    Ok(config)
+}
+
+#[tokio::main]
+async fn main() {
+    let config = match parse() {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let url = match read_url(std::io::stdin()) {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("expected a URL on stdin");
+            std::process::exit(2);
+        }
+    };
+    let engine = match Engine::open(config, &url).await {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    };
+    let (control, receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // Durable pause: progress already committed is kept.
+            let _ = control.send(Control::Pause).await;
+        }
+        // A second interrupt leaves immediately; committed progress is already safe.
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+        std::future::pending::<()>().await;
+    });
+    match engine.run(receiver).await {
+        Ok(SessionEnd::Published(path)) => println!("published {}", path.display()),
+        Ok(SessionEnd::Settled(state)) => {
+            println!("stopped in {state:?}");
+            std::process::exit(if state == fhd_domain::JobState::Completed {
+                0
+            } else {
+                1
+            });
+        }
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Only controlled categories reach the operator: never a URL or server text.
+fn code(error: &EngineError) -> String {
+    match error {
+        EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
+        EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
+        EngineError::NeedsDecision(reason) => match reason {
+            Some(reason) => format!("STOPPED-{reason:?}-RERUN-WITH-RESUME").to_uppercase(),
+            None => "STOPPED-RERUN-WITH-RESUME".into(),
+        },
+        EngineError::Persistence(error) => error.code().into(),
+        EngineError::Binding(error) => format!("SOURCE-{error:?}").to_uppercase(),
+        EngineError::Admission(error) => error.code().into(),
+        EngineError::Run(error) => format!("RUN-{error:?}").to_uppercase(),
+    }
+}

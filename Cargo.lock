@@ -255,6 +255,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fhd-daemon"
+version = "0.1.0"
+dependencies = [
+ "fhd-app",
+ "fhd-domain",
+ "fhd-http",
+ "fhd-persistence",
+ "fhd-runtime",
+ "fhd-storage",
+ "fhd-telemetry",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "fhd-domain"
 version = "0.1.0"
 dependencies = [

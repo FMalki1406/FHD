@@ -472,7 +472,7 @@ impl SegmentFile for MemoryFile {
             return Err(StorageError::Integrity);
         }
         self.cover(range.start(), range.end());
-        self.synced = true;
+        // Like the real adapter: a reopened handle has not synced anything yet.
         Ok(())
     }
     fn verify(&mut self, expected: Option<[u8; 32]>) -> Result<[u8; 32], StorageError> {
