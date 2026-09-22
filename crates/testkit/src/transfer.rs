@@ -585,13 +585,14 @@ impl Transport for ScriptedTransport {
         &self,
         _: SourceRef,
         range: ByteRange,
+        validator: Option<[u8; 32]>,
     ) -> PortFuture<'_, Result<Box<dyn ByteStream>, TransportError>> {
         Box::pin(async move {
             self.fetches.fetch_add(1, Ordering::SeqCst);
-            if *self.changed.lock().unwrap() {
+            let body = self.body.lock().unwrap().clone();
+            if *self.changed.lock().unwrap() || validator != self.validator(&body) {
                 return Err(TransportError::RepresentationChanged);
             }
-            let body = self.body.lock().unwrap().clone();
             if range.end() > body.len() as u64
                 || (!self.ranges && (range.start() != 0 || range.end() != body.len() as u64))
             {

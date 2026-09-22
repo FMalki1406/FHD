@@ -59,10 +59,13 @@ pub trait ByteStream: Send {
 /// Dropping a returned future or stream cancels the request.
 pub trait Transport: Send + Sync {
     fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>>;
-    /// Bound to the representation of the latest probe of `source`.
+    /// `validator` is the representation the caller's bytes belong to, as reported by
+    /// the probe. The adapter must refuse (`RepresentationChanged`) if what it would
+    /// fetch is anything else, so a later probe cannot swap it under a running job.
     fn fetch(
         &self,
         source: SourceRef,
         range: ByteRange,
+        validator: Option<[u8; 32]>,
     ) -> PortFuture<'_, Result<Box<dyn ByteStream>, TransportError>>;
 }

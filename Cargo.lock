@@ -262,6 +262,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fhd-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fhd-app",
+ "fhd-domain",
+ "reqwest",
+ "sha2",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "fhd-persistence"
 version = "0.1.0"
 dependencies = [

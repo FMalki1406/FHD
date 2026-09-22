@@ -437,6 +437,7 @@ impl Session<'_> {
             let task = fetch(
                 self.c.ports.transport.clone(),
                 self.source,
+                self.job.validator(),
                 writer,
                 self.c.buffers.clone(),
                 lease,
@@ -843,6 +844,7 @@ impl Session<'_> {
 async fn fetch(
     transport: Arc<dyn Transport>,
     source: SourceRef,
+    validator: Option<[u8; 32]>,
     writer: Arc<Writer>,
     buffers: BufferPool,
     lease: Lease,
@@ -852,7 +854,7 @@ async fn fetch(
     let spec = writer.spec();
     let mut stream = tokio::select! { biased;
         _ = cancel.cancelled() => return Err(Failure::Cancelled),
-        stream = transport.fetch(source, range) => stream.map_err(Failure::Transport)?,
+        stream = transport.fetch(source, range, validator) => stream.map_err(Failure::Transport)?,
     };
     let block = MAX_BUFFER.min(buffers.capacity()) as u64;
     let mut offset = range.start();

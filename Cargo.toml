@@ -5,6 +5,7 @@ members = [
     "crates/domain", "crates/application", "crates/config", "crates/telemetry",
     "crates/testkit",
     "crates/runtime", "crates/adapters/storage", "crates/adapters/persistence",
+    "crates/adapters/http",
 ]
 resolver = "2"
 
