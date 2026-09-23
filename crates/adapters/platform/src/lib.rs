@@ -54,9 +54,9 @@ mod imp {
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SDDL_REVISION_1,
+                ConvertStringSidToSidW, SDDL_REVISION_1,
             },
-            GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+            EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
         System::{
             RemoteDesktop::ProcessIdToSessionId,
@@ -200,12 +200,52 @@ mod imp {
     /// rather than quietly undercutting it.
     pub const MAX_INSTANCES: usize = 32;
 
+    /// A principal named in a descriptor, as a SID the system allocated. Accepts
+    /// both spellings SDDL uses: a literal `S-1-...` and a two-letter alias.
+    fn parse_sid(text: &str) -> Option<Local> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        let mut sid: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated wide string that outlives the call,
+        // and `sid` is a valid out-parameter the system allocates into.
+        let parsed = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) };
+        if parsed == 0 || sid.is_null() {
+            return None;
+        }
+        Some(Local(sid))
+    }
+
+    /// Whether two principals named in a descriptor are the same account.
+    ///
+    /// Windows prints a well-known SID as its SDDL alias when it converts a
+    /// descriptor to text: `LA` for the account that built the machine, `SY` for
+    /// the system. So the text of a descriptor we asked for does not have to
+    /// come back as the text we asked with, even though the account is
+    /// identical. Comparing the strings made the engine refuse its own pipe on
+    /// every account that has an alias -- an administrator account among them,
+    /// which is why the build machine found this and a developer's did not. An
+    /// account is a SID, so this compares SIDs.
+    fn same_principal(printed: &str, ours: &str) -> bool {
+        if printed == ours {
+            return true;
+        }
+        let (Some(printed), Some(ours)) = (parse_sid(printed), parse_sid(ours)) else {
+            return false;
+        };
+        // SAFETY: both pointers came back from `ConvertStringSidToSidW`, so each
+        // points at a valid SID, and both `Local` guards live to the end of this
+        // function.
+        unsafe { EqualSid(printed.0, ours.0) != 0 }
+    }
+
     /// Whether this descriptor is one this account's engine would have created:
     /// owned by the account, carrying a mandatory label at medium or above, and
     /// granting nothing to a group that would let anyone else in.
     ///
-    /// Pure, so both answers can be tested: a descriptor a sandboxed process
-    /// could produce must be refused, not merely a foreign owner.
+    /// Both answers can be tested: a descriptor a sandboxed process could
+    /// produce must be refused, not merely a foreign owner.
     pub fn acceptable_descriptor(sddl: &str, sid: &str) -> bool {
         // The owner runs from after "O:" to the letter that opens the next
         // section. Splitting on the letters themselves would cut a SID in half,
@@ -217,7 +257,7 @@ mod imp {
             Some(next) => &rest[..next.saturating_sub(1)],
             None => rest,
         };
-        if owner != sid {
+        if !same_principal(owner, sid) {
             return false;
         }
         // Anything that would admit more than this account.
@@ -307,6 +347,13 @@ mod imp {
         let described = String::from_utf16_lossy(slice);
         drop(owned_text);
         Ok(described.trim_end_matches('\0').to_owned())
+    }
+
+    /// Whether two named principals are one account, for a test that has to
+    /// compare what the system printed against what this account is.
+    #[cfg(test)]
+    pub(crate) fn same_principal_for_test(printed: &str, ours: &str) -> bool {
+        same_principal(printed, ours)
     }
 
     /// The descriptor of a pipe we are holding. Only tests need this: production
@@ -510,8 +557,15 @@ mod tests {
         let server = create_pipe(&name, true).expect("create");
         let sid = user_scope().unwrap().identity;
         let described = super::imp::describe_for_test(&server).expect("read the descriptor back");
+        // Asserted as identity, not as spelling: the system prints a well-known
+        // SID as its alias, so a machine whose account has one would fail a text
+        // comparison while owning the pipe perfectly well.
+        let owner = described
+            .strip_prefix("O:")
+            .and_then(|rest| rest.find(':').map(|next| &rest[..next - 1]))
+            .expect("the descriptor names an owner");
         assert!(
-            described.starts_with(&format!("O:{sid}")),
+            super::imp::same_principal_for_test(owner, &sid),
             "the account does not own it: {described}"
         );
         assert!(
@@ -524,8 +578,16 @@ mod tests {
             1,
             "more than this account may reach it: {described}"
         );
+        // The entry ends at its own ')': closing it first keeps the label's
+        // trailing fields, which are also ';;;'-separated, out of the answer.
+        let granted = described
+            .split("(A;")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|entry| entry.rsplit(";;;").next())
+            .expect("the access entry names a principal");
         assert!(
-            described.contains(&sid),
+            super::imp::same_principal_for_test(granted, &sid),
             "the entry is not for this account: {described}"
         );
         // And the check the client runs accepts precisely this.
@@ -558,6 +620,42 @@ mod tests {
                 "accepted a descriptor this account's engine would never create: {refused}"
             );
         }
+    }
+
+    /// The build machine caught what a developer's machine could not: the system
+    /// prints a well-known SID as its SDDL alias, so the descriptor of a pipe we
+    /// just created comes back spelled differently from the SID we created it
+    /// with. Comparing text refused our own pipe on any account with an alias,
+    /// which is every administrator account. These two spellings must agree, and
+    /// two different accounts must still not.
+    #[cfg(windows)]
+    #[test]
+    fn a_well_known_account_is_recognised_under_either_spelling() {
+        // `LA` is how the system writes the account that built the machine.
+        let literal = super::imp::same_principal_for_test("LA", "LA");
+        assert!(literal, "an alias does not even match itself");
+        let system = "S-1-5-18";
+        assert!(
+            super::imp::same_principal_for_test("SY", system),
+            "the alias and the SID of the system account were read as two accounts"
+        );
+        assert!(
+            super::imp::same_principal_for_test(system, "SY"),
+            "the comparison is not symmetric"
+        );
+        assert!(
+            !super::imp::same_principal_for_test("SY", "S-1-5-19"),
+            "two different well-known accounts were read as one"
+        );
+        // Nonsense resolves to nothing and must not be treated as a match.
+        assert!(!super::imp::same_principal_for_test("ZZ", system));
+        assert!(!super::imp::same_principal_for_test("", system));
+        // And the whole check, with the owner written the way the system writes it.
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert!(acceptable_descriptor(
+            &format!("O:SYG:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;ME)"),
+            system
+        ));
     }
 
     #[cfg(windows)]
