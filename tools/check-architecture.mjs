@@ -16,7 +16,10 @@ const layers = {
   'fhd-platform': ['fhd-app', 'fhd-domain', 'fhd-config', 'fhd-telemetry'],
   'fhd-policy': ['fhd-app', 'fhd-domain', 'fhd-config', 'fhd-telemetry'],
   'fhd-protocol': ['fhd-domain'],
-  'fhd-ipc': ['fhd-app', 'fhd-protocol', 'fhd-config', 'fhd-telemetry'],
+  // fhd-platform is the one crate §4 allows unsafe, and it exposes operating
+  // system primitives rather than a port's implementation: the control surface
+  // cannot express §3.1's pipe security without it.
+  'fhd-ipc': ['fhd-app', 'fhd-protocol', 'fhd-config', 'fhd-telemetry', 'fhd-platform'],
   'fhd-telemetry': [],
   'fhd-config': ['fhd-domain'],
   'fhd-testkit': ['fhd-app', 'fhd-domain', 'fhd-config'],

@@ -62,10 +62,8 @@ pub struct Service {
     destinations: Arc<Registry>,
     commands: mpsc::Sender<Command>,
     config: EngineConfig,
-    /// Resolved once: a request naming somewhere else is refused before any bytes.
-    state: PathBuf,
-    /// The same two places as the filesystem itself names them, so a destination
-    /// cannot be admitted by spelling one of them differently.
+    /// The engine's own tree and the allowed root, as the filesystem itself names
+    /// them: a destination cannot be admitted by spelling one of them differently.
     canonical_state: PathBuf,
     canonical_root: Option<PathBuf>,
 }
@@ -164,7 +162,6 @@ impl Resident {
             destinations: destinations.clone(),
             commands,
             config,
-            state,
             canonical_state,
             canonical_root,
         });
@@ -317,7 +314,10 @@ impl Service {
         // The client proposes; this decides. A destination is refused here rather
         // than after a whole file has been fetched.
         let destination_path = self.allowed_destination(&request.destination)?;
-        if !same_volume(&self.state, &destination_path)? {
+        // Both sides resolved the same way: comparing a canonical path with a
+        // configured one would compare a verbatim prefix against a drive letter
+        // and call two places on one disk different volumes.
+        if !same_volume(&self.canonical_state, &destination_path)? {
             return Err(EngineError::CrossVolume);
         }
         let expected = match &request.expected_sha256 {

@@ -297,6 +297,7 @@ dependencies = [
 name = "fhd-ipc"
 version = "0.1.0"
 dependencies = [
+ "fhd-platform",
  "fhd-protocol",
  "fhd-telemetry",
  "tokio",
@@ -311,6 +312,14 @@ dependencies = [
  "rusqlite",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "fhd-platform"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

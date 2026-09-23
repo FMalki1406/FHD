@@ -32,11 +32,10 @@ const MAX_CLIENTS: usize = 32;
 
 #[derive(Debug)]
 pub enum IpcError {
-    /// The endpoint already exists: another engine owns this user's directory,
-    /// or someone took the name first. On Unix the client checks the owner before
-    /// it speaks, so taking the name denies service rather than granting entry.
-    /// **On Windows there is no such check yet** (§3.1, enterprise-ipc.md): taking
-    /// the name there means the client speaks to whoever took it.
+    /// The endpoint already exists: another engine owns this user's directory, or
+    /// someone took the name first. Either way the client checks who owns it
+    /// before speaking -- the socket's owner on Unix, the pipe's on Windows -- so
+    /// taking the name denies service rather than granting entry (§3.1).
     Taken,
     /// The directory or socket is not ours alone.
     Untrusted,
@@ -78,12 +77,15 @@ impl std::fmt::Debug for Endpoint {
 
 #[cfg(windows)]
 impl Endpoint {
-    /// `\\.\pipe\fhd-<name>`, where the name identifies the engine's own state
-    /// directory. **This is not yet what §3.1 asks for:** it carries no user SID
-    /// and no session, so it is predictable, and nothing here stops another user
-    /// taking the name first. See docs/enterprise-ipc.md.
+    /// `\\.\pipe\fhd-<SID>-<session>-<name>` (§3.1): the account and the logon
+    /// session are part of the name, so two users -- and two sessions of one user
+    /// -- never address the same surface. If the system will not say who we are,
+    /// there is no name to build and nothing is bound.
     pub fn for_user(name: &str) -> Self {
-        Self(format!(r"\\.\pipe\fhd-{name}"))
+        match fhd_platform::user_scope() {
+            Ok(scope) => Self(format!(r"\\.\pipe\fhd-{}-{name}", scope.tag())),
+            Err(_) => Self(String::new()),
+        }
     }
 }
 #[cfg(unix)]
@@ -136,8 +138,6 @@ pub struct Server {
     /// The uid this engine runs as; every peer is checked against it.
     #[cfg(unix)]
     owner: u32,
-    #[cfg(windows)]
-    options: tokio::net::windows::named_pipe::ServerOptions,
     #[cfg(windows)]
     first: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
 }
@@ -307,42 +307,38 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+    use tokio::net::windows::named_pipe::NamedPipeServer;
 
     impl Server {
-        /// Claims the pipe name. `first_pipe_instance` means a name already taken
-        /// is an error here rather than a second engine quietly serving beside us.
+        /// Claims the pipe name with a descriptor only this user can reach, and as
+        /// the first instance, so a name already taken is an error here rather
+        /// than a second engine quietly serving beside us (§3.1).
         pub fn bind(endpoint: Endpoint) -> Result<Self, IpcError> {
-            let mut options = ServerOptions::new();
-            options
-                .first_pipe_instance(true)
-                // A pipe is reachable over the network unless this is set.
-                .reject_remote_clients(true)
-                .max_instances(16);
-            let first = options
-                .create(&endpoint.0)
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::AddrInUse => IpcError::Taken,
-                    _ => IpcError::Io(error.kind()),
+            if endpoint.0.is_empty() {
+                return Err(IpcError::Untrusted);
+            }
+            let first =
+                fhd_platform::create_pipe(&endpoint.0, true).map_err(|error| {
+                    match error.kind() {
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::AddrInUse => {
+                            IpcError::Taken
+                        }
+                        _ => IpcError::Io(error.kind()),
+                    }
                 })?;
             Ok(Self {
                 endpoint,
-                options,
                 first: Some(first),
             })
         }
 
         pub(super) async fn accept(&mut self) -> Result<NamedPipeServer, IpcError> {
             // The first instance is created at bind so the name is held from the
-            // start; later ones are created as each client is taken.
+            // start; later ones are created as each client is taken, and only the
+            // one that claimed the name asks to be first.
             let server = match self.first.take() {
                 Some(server) => server,
-                // Only the instance that claimed the name may ask to be first;
-                // asking again would fail for every client after the first.
-                None => {
-                    self.options.first_pipe_instance(false);
-                    self.options.create(&self.endpoint.0)?
-                }
+                None => fhd_platform::create_pipe(&self.endpoint.0, false)?,
             };
             server.connect().await?;
             Ok(server)
@@ -353,22 +349,19 @@ mod platform {
     /// one as it takes the previous client, so a caller that arrives in between
     /// waits briefly instead of being told the engine is unreachable.
     const ERROR_PIPE_BUSY: i32 = 231;
-    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
-    const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 
-    /// Connects to this user's engine.
+    /// Connects to this user's engine, and to nobody else's: who owns the pipe is
+    /// checked before a byte is sent, so a name another account took first is
+    /// refused rather than spoken to (§3.1).
     pub async fn connect(
         endpoint: &Endpoint,
     ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, IpcError> {
+        if endpoint.0.is_empty() {
+            return Err(IpcError::Untrusted);
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match ClientOptions::new()
-                // A fake server must not be able to act as us: identification
-                // lets it check who we are and nothing more. Set here rather
-                // than relied upon as somebody else's default.
-                .security_qos_flags(SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT)
-                .open(&endpoint.0)
-            {
+            match fhd_platform::open_pipe(&endpoint.0) {
                 Ok(client) => return Ok(client),
                 Err(error)
                     if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
@@ -376,6 +369,8 @@ mod platform {
                 {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                // An owner that is not us is a refusal, never something to retry.
+                Err(error) if error.raw_os_error().is_none() => return Err(IpcError::Untrusted),
                 Err(error) => return Err(IpcError::Io(error.kind())),
             }
         }
