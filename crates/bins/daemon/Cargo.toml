@@ -19,6 +19,9 @@ tokio = { version = "=1.51.4", features = ["macros", "rt-multi-thread", "signal"
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Measurements only: what a batched commit would cost against the same
+# durability settings the repository uses.
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 fhd-runtime = { path = "../../runtime" }
 sha2 = "=0.11.0"
 tokio = { version = "=1.51.4", features = ["macros", "rt-multi-thread", "time"] }

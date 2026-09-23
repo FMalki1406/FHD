@@ -13,27 +13,103 @@ use harness::Directory;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Instant,
 };
 
+/// When each engine event happened, so a run can be split into the part that
+/// moves bytes and the part that makes the file usable. The engine already
+/// reports both; this only timestamps what it says.
+type Marks = Arc<Mutex<Vec<(String, Instant)>>>;
+static MARKS: OnceLock<Marks> = OnceLock::new();
+
+fn marks() -> Marks {
+    MARKS
+        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
+}
+
+/// Records the code of every engine event with the moment it arrived.
+struct Stopwatch;
+struct CodeOnly(Option<String>);
+impl tracing::field::Visit for CodeOnly {
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "code" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+}
+impl tracing::Subscriber for Stopwatch {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "fhd"
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut code = CodeOnly(None);
+        event.record(&mut code);
+        if let Some(code) = code.0 {
+            marks().lock().unwrap().push((code, Instant::now()));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Starts the clock for one run and forgets any earlier one.
+fn watch() -> Instant {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(Stopwatch);
+    });
+    marks().lock().unwrap().clear();
+    Instant::now()
+}
+
+/// The last moment the engine said bytes became durable: the end of moving
+/// bytes, before anything is read back to prove them.
+fn last(code: &str, start: Instant) -> Option<f64> {
+    marks()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(seen, _)| seen == code)
+        .map(|(_, at)| at.duration_since(start).as_secs_f64())
+        .next_back()
+}
+
 /// A server that is not the thing being measured: threaded, serving a body held
 /// in memory, answering byte ranges. If it were the bottleneck the numbers would
-/// be about it rather than about the engine.
+/// be about it rather than about the engine. It also counts what it sent, which
+/// is how a resumed run shows what it had to fetch again.
 fn serve_fast(body: Arc<Vec<u8>>) -> u16 {
+    serve_counted(body).0
+}
+
+fn serve_counted(body: Arc<Vec<u8>>) -> (u16, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(AtomicU64::new(0));
+    let counter = served.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
             let body = body.clone();
-            std::thread::spawn(move || answer(stream, &body));
+            let counter = counter.clone();
+            std::thread::spawn(move || answer(stream, &body, &counter));
         }
     });
-    port
+    (port, served)
 }
 
-fn answer(mut stream: TcpStream, body: &[u8]) {
+fn answer(mut stream: TcpStream, body: &[u8], served: &AtomicU64) {
     let _ = stream.set_nodelay(true);
     loop {
         let mut request = Vec::new();
@@ -70,6 +146,7 @@ fn answer(mut stream: TcpStream, body: &[u8]) {
         if stream.write_all(head.as_bytes()).is_err() || stream.write_all(slice).is_err() {
             return;
         }
+        served.fetch_add(slice.len() as u64, Ordering::Relaxed);
         let _ = stream.flush();
     }
 }
@@ -79,7 +156,13 @@ fn settings(state: &Directory, connections: usize) -> EngineConfig {
         state_directory: state.engine(),
         destination: state.0.join("measured.bin"),
         connections,
-        engine_connections: connections.max(2),
+        // The buffer budget is sized from this, so it is separated here: a pool
+        // exactly as large as the connections leaves a worker nothing to take
+        // while the writer holds a block, which is worth measuring on purpose.
+        engine_connections: std::env::var("FHD_MEASURE_POOL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(connections.max(2)),
         max_active: 1,
         expected_sha256: None,
         max_bytes: 8 * 1024 * 1024 * 1024,
@@ -117,18 +200,31 @@ async fn one_file_end_to_end() {
         .await
         .unwrap();
     let (_keep, control) = tokio::sync::mpsc::channel(1);
-    let started = Instant::now();
+    let started = watch();
     let outcome = engine.run(control).await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
+    // The last commit is the moment every byte was durable: the transfer is over
+    // and nothing has been read back yet.
+    let transfer = last("STORE-COMMITTED", started).unwrap_or(elapsed);
 
-    let rate = size / elapsed / (1024.0 * 1024.0);
+    let mib = size / (1024.0 * 1024.0);
     println!("MEASURE one_file_end_to_end");
-    println!("  size_mib        {megabytes}");
-    println!("  connections     {connections}");
-    println!("  seconds         {elapsed:.3}");
-    println!("  mib_per_second  {rate:.1}");
-    println!("  megabits        {:.0}", rate * 8.0);
-    println!("  outcome         {outcome:?}");
+    println!("  size_mib          {megabytes}");
+    println!("  connections       {connections}");
+    println!("  transfer_seconds  {transfer:.3}");
+    println!(
+        "  transfer_mib_s    {:.1}   ({:.0} Mbps)",
+        mib / transfer,
+        mib / transfer * 8.0
+    );
+    println!("  ready_seconds     {elapsed:.3}   (usable file)");
+    println!(
+        "  ready_mib_s       {:.1}   ({:.0} Mbps)",
+        mib / elapsed,
+        mib / elapsed * 8.0
+    );
+    println!("  verify_publish    {:.3}", elapsed - transfer);
+    println!("  outcome           {outcome:?}");
 }
 
 /// §1 asks for ten thousand jobs in the record. This measures the record
@@ -265,4 +361,199 @@ async fn cost_of_the_parts() {
         "  floor_seconds     {:.3}  (one write plus two hashes)",
         writing + hashing + rereading
     );
+}
+
+/// The ceiling §19 declares: thirty-two jobs at once over sixty-four
+/// connections. What it costs in wall time and what the engine gets through,
+/// measured together rather than one job at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement: run deliberately and record the numbers"]
+async fn thirty_two_jobs_at_once() {
+    let jobs: usize = std::env::var("FHD_MEASURE_ACTIVE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32);
+    let each: usize = std::env::var("FHD_MEASURE_MB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let body = Arc::new(
+        (0..each * 1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
+    );
+    let port = serve_fast(body);
+    let state = Directory::new("measure-many");
+    let mut requests = Vec::with_capacity(jobs);
+    for index in 0..jobs {
+        requests.push(fhd_daemon::Request {
+            url: format!("http://127.0.0.1:{port}/file-{index}"),
+            destination: state.0.join(format!("many-{index}.bin")),
+            expected_sha256: None,
+            sensitive: false,
+        });
+    }
+    let mut config = settings(&state, 2);
+    config.engine_connections = 64;
+    config.max_active = jobs;
+    let engine = fhd_daemon::Engine::open_many(config, requests)
+        .await
+        .unwrap();
+
+    let (_keep, commands) = tokio::sync::mpsc::channel(4);
+    let started = Instant::now();
+    let outcomes = engine.run_all(commands).await.unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    let published = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, fhd_daemon::JobOutcome::Published(_)))
+        .count();
+    let total = (jobs * each) as f64;
+
+    println!("MEASURE thirty_two_jobs_at_once");
+    println!("  jobs              {jobs}");
+    println!("  each_mib          {each}");
+    println!("  published         {published}");
+    println!("  seconds           {elapsed:.3}");
+    println!("  aggregate_mib_s   {:.1}", total / elapsed);
+    assert_eq!(published, jobs, "a job did not finish");
+}
+
+/// What a crash costs. The run is cut off with bytes in flight, then continued:
+/// the difference between what the server sent in total and the size of the file
+/// is what had to be fetched a second time, which is the price of the checkpoint
+/// interval. Cancelling the run drops workers without draining them, so the
+/// uncommitted bytes are lost exactly as they would be in a crash; the part file
+/// is closed cleanly, which a power cut would not do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement: run deliberately and record the numbers"]
+async fn what_a_crash_costs() {
+    let megabytes: usize = std::env::var("FHD_MEASURE_MB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256);
+    let cut: f64 = std::env::var("FHD_MEASURE_CUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(900.0);
+    let body = Arc::new(
+        (0..megabytes * 1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
+    );
+    let size = body.len() as u64;
+    let (port, served) = serve_counted(body);
+    let state = Directory::new("measure-crash");
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // Cut off mid-transfer.
+    {
+        let engine = Engine::open(settings(&state, 1), &url).await.unwrap();
+        let (_keep, control) = tokio::sync::mpsc::channel(1);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs_f64(cut / 1000.0),
+            engine.run(control),
+        )
+        .await;
+    }
+    let before = served.load(Ordering::Relaxed);
+
+    // Continue. Anything fetched now beyond what was missing is the cost.
+    let mut resumed = settings(&state, 1);
+    resumed.intent = Intent::Resume;
+    // The cut engine's background work lets go of the directory shortly after it
+    // stops; waiting for that is part of what a restart costs in practice.
+    let waited = Instant::now();
+    let engine = loop {
+        match Engine::open(resumed.clone(), &url).await {
+            Ok(engine) => break engine,
+            Err(error) if waited.elapsed().as_secs() < 30 => {
+                assert!(
+                    format!("{error:?}").contains("Locked")
+                        || matches!(error, fhd_daemon::EngineError::StateBusy),
+                    "reopening failed for another reason: {error:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("the directory never became available: {error:?}"),
+        }
+    };
+    let unlock = waited.elapsed().as_secs_f64();
+    let (_keep, control) = tokio::sync::mpsc::channel(1);
+    let started = Instant::now();
+    let outcome = engine.run(control).await.unwrap();
+    let recovery = started.elapsed().as_secs_f64();
+    let total = served.load(Ordering::Relaxed);
+
+    println!("MEASURE what_a_crash_costs");
+    println!("  size_mib          {megabytes}");
+    println!("  cut_after_ms      {cut:.0}");
+    println!(
+        "  sent_before_mib   {:.1}",
+        before as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  sent_total_mib    {:.1}",
+        total as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  refetched_mib     {:.1}",
+        (total.saturating_sub(size)) as f64 / (1024.0 * 1024.0)
+    );
+    println!("  unlock_seconds    {unlock:.3}   (waiting for the cut engine to let go)");
+    println!("  resume_seconds    {recovery:.3}");
+    println!("  outcome           {outcome:?}");
+}
+
+/// What admitting a job costs, and what it would cost if the engine committed a
+/// batch of them together. The guarantee is not in question either way: a job is
+/// acknowledged only after its transaction is durable. This measures the ceiling
+/// group commit would buy, so the decision to build it rests on a number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement: run deliberately and record the numbers"]
+async fn what_group_commit_would_buy() {
+    let count: usize = std::env::var("FHD_MEASURE_JOBS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000);
+    let directory = Directory::new("measure-commit");
+    std::fs::create_dir_all(directory.engine()).unwrap();
+    for batch in [1usize, 16, 64, 256] {
+        let path = directory.engine().join(format!("batch-{batch}.sqlite"));
+        let database = rusqlite::Connection::open(&path).unwrap();
+        // The same durability the repository uses: a write-ahead log that is
+        // flushed to the disk on every commit.
+        database.pragma_update(None, "journal_mode", "WAL").unwrap();
+        database.pragma_update(None, "synchronous", "FULL").unwrap();
+        database
+            .execute(
+                "CREATE TABLE rows(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+                [],
+            )
+            .unwrap();
+        let payload = vec![0u8; 96];
+        let started = Instant::now();
+        let mut written = 0usize;
+        while written < count {
+            let size = batch.min(count - written);
+            let transaction = database.unchecked_transaction().unwrap();
+            for index in 0..size {
+                transaction
+                    .execute(
+                        "INSERT INTO rows(id,payload) VALUES(?1,?2)",
+                        rusqlite::params![(written + index) as i64 + 1, payload.as_slice()],
+                    )
+                    .unwrap();
+            }
+            // One flush per batch, and nothing is acknowledged before it returns.
+            transaction.commit().unwrap();
+            written += size;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "MEASURE group_commit batch={batch:>3}  {:.3}s  {:.0} rows/second",
+            elapsed,
+            count as f64 / elapsed
+        );
+    }
 }

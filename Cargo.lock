@@ -267,6 +267,7 @@ dependencies = [
  "fhd-runtime",
  "fhd-storage",
  "fhd-telemetry",
+ "rusqlite",
  "sha2",
  "tokio",
  "tracing",
