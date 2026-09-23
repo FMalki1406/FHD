@@ -3,9 +3,10 @@
 #![forbid(unsafe_code)]
 
 use fhd_daemon::{
-    absolute, code, read_requests, Engine, EngineConfig, EngineError, Intent, JobOutcome, Resident,
-    StderrEvents,
+    absolute, code, read_requests, read_url, Engine, EngineConfig, EngineError, Intent, JobOutcome,
+    Resident, StderrEvents,
 };
+use fhd_protocol::{AddRequest, Request, Response};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -17,8 +18,12 @@ fn usage() -> &'static str {
      each optionally followed by a tab and its own destination file)\n\
      or:    fhd-engine <state-directory> --continue [--resume]   (no stdin: every \
      job this directory remembers)\n\
-     or:    fhd-engine <state-directory> --serve [--allow-http]   (resident: takes \
-     work over this user's control surface)"
+     or:    fhd-engine <state-directory> --serve [--allow-http] \
+     [--download-root DIR]   (resident: takes work over this user's control \
+     surface)\n\
+     or:    fhd-engine <state-directory> --client <command>   where command is \
+     add <destination-file> [--sensitive] [--allow-http] (URL on stdin), list,      pause <job>, \
+     cancel <job>, or stop"
 }
 
 /// What the command line asked for: the engine's settings, whether links are to be
@@ -34,6 +39,9 @@ fn parse() -> Result<Invocation, &'static str> {
     let mut args = std::env::args().skip(1);
     let state_directory = PathBuf::from(args.next().ok_or(usage())?);
     let second = args.next().ok_or(usage())?;
+    if second == "--client" {
+        return Err("client");
+    }
     let cont = second == "--continue";
     let serve = second == "--serve";
     // Neither continuing nor serving needs a destination: each job carries its own.
@@ -119,6 +127,102 @@ fn parse() -> Result<Invocation, &'static str> {
     })
 }
 
+/// Speaks to a resident engine on this user's control surface. One request, one
+/// answer, then it leaves: a client holds nothing open.
+async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> ! {
+    let command = args.next().unwrap_or_default();
+    let request = match command.as_str() {
+        "add" => {
+            let destination = match args.next() {
+                Some(destination) => match absolute(&PathBuf::from(destination)) {
+                    Ok(path) => path,
+                    Err(_) => fail("ENGINE-INVALID-INPUT"),
+                },
+                None => fail("ENGINE-INVALID-INPUT"),
+            };
+            let flags: Vec<String> = args.collect();
+            let sensitive = flags.iter().any(|argument| argument == "--sensitive");
+            // A client may ask for cleartext; the engine still decides whether it
+            // is allowed, so asking is not the same as getting it.
+            let allow_http = flags.iter().any(|argument| argument == "--allow-http");
+            // The link comes on standard input, never as an argument: arguments
+            // are visible to every process on the machine.
+            let Ok(url) = read_url(std::io::stdin()) else {
+                fail("ENGINE-INVALID-INPUT")
+            };
+            Request::Add(AddRequest {
+                url,
+                destination: destination.to_string_lossy().into_owned(),
+                sensitive,
+                expected_sha256: None,
+                max_bytes: 100 * 1024 * 1024 * 1024,
+                allow_http,
+            })
+        }
+        "list" => Request::List { after: None },
+        "pause" | "cancel" => {
+            let Some(job) = args.next().and_then(|job| job.parse::<u64>().ok()) else {
+                fail("ENGINE-INVALID-INPUT")
+            };
+            if command == "pause" {
+                Request::Pause { job }
+            } else {
+                Request::Cancel { job }
+            }
+        }
+        "stop" => Request::Shutdown,
+        _ => {
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+    };
+    let Ok(state) = absolute(&state) else {
+        fail("ENGINE-INVALID-INPUT")
+    };
+    let endpoint = fhd_ipc::Endpoint::for_user(&endpoint_name(&state));
+    let mut connection = match fhd_ipc::connect(&endpoint).await {
+        Ok(connection) => connection,
+        // Nothing is listening for this directory, or it is not ours.
+        Err(error) => fail(error.code()),
+    };
+    match fhd_ipc::ask(&mut connection, 1, &request).await {
+        Ok(Response::Accepted { job }) => {
+            println!("accepted {job}");
+            std::process::exit(0)
+        }
+        Ok(Response::Done) => {
+            println!("done");
+            std::process::exit(0)
+        }
+        Ok(Response::Jobs { jobs, next }) => {
+            for job in jobs {
+                let reason = job.reason.unwrap_or_default();
+                println!(
+                    "{} {} {}/{} {}",
+                    job.job,
+                    job.state,
+                    job.durable_bytes,
+                    job.total.map_or("?".to_owned(), |total| total.to_string()),
+                    reason
+                );
+            }
+            if let Some(next) = next {
+                println!("more after {next}");
+            }
+            std::process::exit(0)
+        }
+        Ok(Response::Failed { code }) => fail(&code),
+        Err(error) => fail(error.code()),
+    }
+}
+
+/// The engine's answer to an operator is a code, never a sentence assembled from
+/// whatever went wrong.
+fn fail(code: &str) -> ! {
+    eprintln!("{code}");
+    std::process::exit(1)
+}
+
 #[tokio::main]
 async fn main() {
     // Engine events go to standard error; the published path goes to standard output.
@@ -130,6 +234,14 @@ async fn main() {
         serve,
     } = match parse() {
         Ok(invocation) => invocation,
+        // The client path shares only the state directory with the engine's own
+        // settings, so it is parsed where it is used.
+        Err("client") => {
+            let mut args = std::env::args().skip(1);
+            let state = PathBuf::from(args.next().unwrap_or_default());
+            let _ = args.next();
+            client_run(state, args).await
+        }
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
