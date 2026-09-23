@@ -70,14 +70,31 @@ impl Endpoint {
     pub fn for_user(name: &str) -> Self {
         Self(Self::directory().join(name).to_string_lossy().into_owned())
     }
-    fn directory() -> PathBuf {
-        match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(runtime) if !runtime.is_empty() => PathBuf::from(runtime).join("fhd"),
-            _ => match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(".local/state/fhd/run"),
-                None => PathBuf::from(".fhd-run"),
-            },
+    /// Refuses a path a Unix socket cannot hold: `sun_path` is 108 bytes on Linux
+    /// and 104 on macOS, and a truncated path would name something else entirely.
+    pub fn usable(&self) -> Result<(), IpcError> {
+        let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+        if self.0.as_bytes().len() >= limit {
+            return Err(IpcError::Untrusted);
         }
+        Ok(())
+    }
+    /// The runtime directory if the session really has one, else the user's own
+    /// state directory. A set but unusable XDG_RUNTIME_DIR -- a service account, a
+    /// session without one -- must not leave the engine unreachable.
+    fn directory() -> PathBuf {
+        let home =
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/fhd/run"));
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|runtime| !runtime.is_empty())
+            .map(|runtime| PathBuf::from(runtime).join("fhd"));
+        for candidate in [runtime, home].into_iter().flatten() {
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                return candidate;
+            }
+        }
+        // Nowhere of our own to put it: the caller learns that from bind.
+        PathBuf::from(".fhd-run")
     }
 }
 
@@ -152,6 +169,7 @@ mod platform {
         /// checked: if it exists and is not ours alone, we refuse rather than
         /// listen somewhere another user can reach.
         pub fn bind(endpoint: Endpoint) -> Result<Self, IpcError> {
+            endpoint.usable()?;
             let path = PathBuf::from(&endpoint.0);
             let directory = path.parent().ok_or(IpcError::Untrusted)?.to_path_buf();
             std::fs::create_dir_all(&directory)?;
@@ -226,6 +244,7 @@ mod platform {
     /// Connects to this user's engine, checking who owns the endpoint before a
     /// single byte is sent: a socket someone else planted is not talked to.
     pub async fn connect(endpoint: &Endpoint) -> Result<tokio::net::UnixStream, IpcError> {
+        endpoint.usable()?;
         let path = PathBuf::from(endpoint.0.clone());
         let directory = path.parent().ok_or(IpcError::Untrusted)?;
         let uid = trusted_directory(directory)?;

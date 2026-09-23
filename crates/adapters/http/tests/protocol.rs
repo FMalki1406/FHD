@@ -20,14 +20,29 @@ fn serve(responses: Vec<Vec<u8>>) -> Server {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
     std::thread::spawn(move || {
-        for response in responses {
+        let mut remaining = std::collections::VecDeque::from(responses);
+        while !remaining.is_empty() {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let request = read_request(&mut stream);
-            recorder.lock().unwrap().push(request);
-            let _ = stream.write_all(&response);
-            let _ = stream.flush();
+            // Answer every request this connection carries, not just the first:
+            // a client is free to keep the connection alive, and a script that
+            // assumed one request per connection would hang whenever it did.
+            while let Some(response) = remaining.front().cloned() {
+                let request = read_request(&mut stream);
+                if request.is_empty() {
+                    break;
+                }
+                remaining.pop_front();
+                recorder.lock().unwrap().push(request);
+                if stream
+                    .write_all(&response)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     });
     Server { port, seen }
@@ -56,7 +71,10 @@ fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
 fn new_transport() -> HttpTransport {
     HttpTransport::new(HttpConfig {
         read_idle_timeout: Duration::from_millis(300),
-        response_timeout: Duration::from_millis(500),
+        // Headers from a server on this machine: generous, because this is a
+        // guard against hanging, not a claim about how fast a loaded CI machine
+        // answers. The stall tests rely on the idle timeout above instead.
+        response_timeout: Duration::from_secs(10),
         ..HttpConfig::default()
     })
     .unwrap()
