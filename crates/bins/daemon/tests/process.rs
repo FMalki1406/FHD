@@ -422,40 +422,69 @@ stderr: {err}"
 #[test]
 #[cfg(windows)]
 fn a_state_path_others_could_rename_is_refused() {
-    // The repository's own tree sits on a data volume in development, which is
-    // exactly the shape this refuses. If it happens to be protected here, there
-    // is nothing to prove and the test says so instead of passing quietly.
-    let candidate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/swappable-probe");
-    let _ = std::fs::create_dir_all(&candidate);
-    let Ok(components) = fhd_platform::swappable_components(&candidate) else {
-        eprintln!("skipped: the path could not be inspected");
-        return;
-    };
-    if components.is_empty() {
-        eprintln!("skipped: no swappable path available on this machine");
-        let _ = std::fs::remove_dir_all(&candidate);
-        return;
-    }
+    // The exposed condition is built here, not looked for. Asking
+    // `swappable_components` whether a swappable path exists and skipping when it
+    // says no would make the control its own oracle: a control that wrongly
+    // reports everything clean would skip this test and pass.
+    //
+    // So: a directory this account protects, then one child granted DELETE to
+    // Authenticated Users through `icacls`, which knows nothing about our check.
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("fhd-swaptest-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("the base directory is created");
+    fhd_platform::protect_new_directory(&base).expect("the base is protected");
+    let exposed = base.join("exposed");
+    std::fs::create_dir(&exposed).expect("the exposed directory is created");
 
-    let destination = candidate.join("out.bin");
+    let granted = std::process::Command::new("icacls")
+        .arg(&exposed)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)(D)"])
+        .output()
+        .expect("icacls runs");
+    // A missing environment requirement is recorded as a failure, not a skip.
+    // Passing quietly here would mean the control has no coverage at all and
+    // nothing says so.
+    assert!(
+        granted.status.success(),
+        "this test needs icacls to grant DELETE to S-1-5-11; without it the \
+         control is uncovered rather than covered: {}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+
     let (code, out, err) = run(
         &[
-            &candidate.join("state").to_string_lossy(),
-            &destination.to_string_lossy(),
+            &exposed.join("state").to_string_lossy(),
+            &exposed.join("out.bin").to_string_lossy(),
             "--allow-http",
         ],
-        "http://127.0.0.1:1/file
-",
+        "http://127.0.0.1:1/file\n",
     );
     assert_ne!(code, Some(0), "a swappable path was accepted");
     assert!(
         err.contains("STATE-PATH-SWAPPABLE") || out.contains("STATE-PATH-SWAPPABLE"),
-        "refused for the wrong reason.
-stdout: {out}
-stderr: {err}"
+        "refused for the wrong reason.\nstdout: {out}\nstderr: {err}"
     );
-    let _ = std::fs::remove_dir_all(&candidate);
+
+    // And the control is not simply refusing everything: the protected base is
+    // accepted. Without this the test above would pass against a check that
+    // always said "swappable".
+    let (code, out, err) = run(
+        &[
+            &base.join("fine").to_string_lossy(),
+            &base.join("fine-out.bin").to_string_lossy(),
+            "--allow-http",
+        ],
+        "http://127.0.0.1:1/file\n",
+    );
+    assert!(
+        !err.contains("STATE-PATH-SWAPPABLE") && !out.contains("STATE-PATH-SWAPPABLE"),
+        "a protected path was refused as swappable.\nstdout: {out}\nstderr: {err}"
+    );
+    let _ = code;
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A refused argument leaves nothing behind, in any mode.

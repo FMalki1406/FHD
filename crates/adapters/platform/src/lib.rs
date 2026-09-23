@@ -1388,18 +1388,26 @@ mod tests {
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
-        if made {
-            let through = link.join("inner");
-            std::fs::create_dir(&through).unwrap();
-            // Both spellings must agree, because they are the same directory.
-            let direct = swappable_components(&target.join("inner")).unwrap();
-            let via = swappable_components(&through).unwrap();
-            assert_eq!(
-                direct.is_empty(),
-                via.is_empty(),
-                "the same directory was judged differently through a junction:\n                   direct: {direct:?}\n  via: {via:?}"
-            );
-        }
+        // A directory junction needs no privilege, so failing to make one is a
+        // missing environment requirement and is recorded as one. Skipping
+        // quietly would leave the bypass this case exists for with no coverage
+        // and nothing saying so.
+        assert!(
+            made,
+            "this case needs a directory junction; without it the junction bypass \
+             is uncovered rather than covered"
+        );
+        let through = link.join("inner");
+        std::fs::create_dir(&through).unwrap();
+        // Both spellings must agree, because they are the same directory.
+        let direct = swappable_components(&target.join("inner")).unwrap();
+        let via = swappable_components(&through).unwrap();
+        assert_eq!(
+            direct.is_empty(),
+            via.is_empty(),
+            "the same directory was judged differently through a junction:\n  \
+             direct: {direct:?}\n  via: {via:?}"
+        );
 
         // 3. A volume root is not a false positive. It carries a DELETE grant
         //    that means nothing, because no volume root can be renamed.
