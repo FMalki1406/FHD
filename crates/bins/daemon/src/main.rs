@@ -224,8 +224,8 @@ fn fail(code: &str) -> ! {
 }
 
 /// What a peer sent is data, and this is a terminal. An answer carrying escape
-/// sequences could retitle the window or paste into the shell, and on Windows
-/// this client cannot yet prove which engine it is talking to (§3.1).
+/// sequences could retitle the window or paste into the shell, and an engine is
+/// not the only thing that can answer on a socket.
 fn printable(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).take(64).collect()
 }

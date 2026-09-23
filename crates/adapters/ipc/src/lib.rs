@@ -28,6 +28,8 @@ const HANDLE: Duration = Duration::from_secs(20);
 const ANSWER: Duration = Duration::from_secs(60);
 /// Connections served at once. Every one of them costs a read buffer and a
 /// reassembly buffer, so the count is a declared budget rather than a surprise.
+/// On Windows the pipe's instance ceiling is the same number, so neither limit
+/// silently undercuts the other.
 const MAX_CLIENTS: usize = 32;
 
 #[derive(Debug)]
@@ -188,6 +190,12 @@ impl Server {
                 // bad connection is a denial of service with extra steps. It waits
                 // a moment first, so a permanent failure cannot become a hot loop.
                 Err(_) => {
+                    // Say so: on Windows a run of these means someone else holds
+                    // the name, and an engine that looks alive while every client
+                    // reaches somebody else is the worst of both.
+                    fhd_telemetry::emit(fhd_telemetry::Event::new(
+                        fhd_telemetry::Code::PolicyRejected,
+                    ));
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -291,6 +299,9 @@ mod platform {
     pub async fn connect(endpoint: &Endpoint) -> Result<tokio::net::UnixStream, IpcError> {
         endpoint.usable()?;
         let path = PathBuf::from(endpoint.0.clone());
+        if !path.is_absolute() {
+            return Err(IpcError::Untrusted);
+        }
         let directory = path.parent().ok_or(IpcError::Untrusted)?;
         let uid = trusted_directory(directory)?;
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -333,14 +344,16 @@ mod platform {
         }
 
         pub(super) async fn accept(&mut self) -> Result<NamedPipeServer, IpcError> {
-            // The first instance is created at bind so the name is held from the
-            // start; later ones are created as each client is taken, and only the
-            // one that claimed the name asks to be first.
             let server = match self.first.take() {
                 Some(server) => server,
                 None => fhd_platform::create_pipe(&self.endpoint.0, false)?,
             };
             server.connect().await?;
+            // The next instance is made before this one is handed over, so the
+            // name is never without an instance. A name whose last instance has
+            // closed is free to be taken, and a client would then reach whoever
+            // took it rather than us.
+            self.first = Some(fhd_platform::create_pipe(&self.endpoint.0, false)?);
             Ok(server)
         }
     }

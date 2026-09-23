@@ -112,7 +112,10 @@ mod imp {
         if needed == 0 {
             return Err(last_error());
         }
-        let mut buffer = vec![0u8; needed as usize];
+        // Aligned for the pointer inside TOKEN_USER: a Vec<u8> is byte-aligned,
+        // and a reference to a misaligned TOKEN_USER is undefined behaviour even
+        // where the allocator happens to return a suitable address.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
         // SAFETY: the buffer is at least `needed` bytes, as the call just said.
         let read = unsafe {
             GetTokenInformation(
@@ -127,7 +130,8 @@ mod imp {
             return Err(last_error());
         }
         // SAFETY: on success the buffer holds a TOKEN_USER whose Sid points
-        // inside that same buffer, which outlives this borrow.
+        // inside that same buffer, which outlives this borrow, and the buffer is
+        // 8-aligned because it is a Vec<u64>.
         let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
         let mut text: *mut u16 = ptr::null_mut();
         // SAFETY: `user.User.Sid` is a valid SID for as long as `buffer` lives.
@@ -154,11 +158,13 @@ mod imp {
         // group as owner, and the client's check compares against the user, so
         // leaving it implicit would make that check fail on exactly the machines
         // where the engine runs with more rights, not fewer.
-        // D: the access control list. A: allow, FA: full access, P: protected,
-        // so nothing is inherited into it.
+        // D: the access control list. A: allow, FA: full access, P: protected.
+        // Only the account itself: LocalSystem needs nothing here, and granting
+        // it would make every process running as SYSTEM an authorised client of
+        // an ordinary user's engine, since this list is the whole authorisation.
         // S: the mandatory label. ML at medium, NR|NW|NX: no read, write or
         // execute up, so a lower-integrity process cannot reach the pipe.
-        let sddl = format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)S:(ML;;NRNWNX;;;ME)");
+        let sddl = format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;ME)");
         let wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
             .encode_wide()
             .chain(once(0))
@@ -186,9 +192,137 @@ mod imp {
         Ok((owned, attributes))
     }
 
+    /// Everything below medium integrity is a process that could not have
+    /// applied this label, which is the property the check rests on.
+    const MEDIUM: u32 = 8192;
+    /// Instances of the pipe that may exist at once. It is the real ceiling on
+    /// concurrent clients on Windows, so it matches the socket layer's budget
+    /// rather than quietly undercutting it.
+    pub const MAX_INSTANCES: usize = 32;
+
+    /// Whether this descriptor is one this account's engine would have created:
+    /// owned by the account, carrying a mandatory label at medium or above, and
+    /// granting nothing to a group that would let anyone else in.
+    ///
+    /// Pure, so both answers can be tested: a descriptor a sandboxed process
+    /// could produce must be refused, not merely a foreign owner.
+    pub fn acceptable_descriptor(sddl: &str, sid: &str) -> bool {
+        // The owner runs from after "O:" to the letter that opens the next
+        // section. Splitting on the letters themselves would cut a SID in half,
+        // since every one of them begins with S.
+        let Some(rest) = sddl.strip_prefix("O:") else {
+            return false;
+        };
+        let owner = match rest.find(':') {
+            Some(next) => &rest[..next.saturating_sub(1)],
+            None => rest,
+        };
+        if owner != sid {
+            return false;
+        }
+        // Anything that would admit more than this account.
+        const BROAD: [&str; 8] = [
+            ";;;WD)",
+            ";;;AC)",
+            ";;;BU)",
+            ";;;AU)",
+            ";;;IU)",
+            ";;;S-1-1-0)",
+            ";;;S-1-5-32-545)",
+            ";;;S-1-15-2-1)",
+        ];
+        if BROAD.iter().any(|principal| sddl.contains(principal)) {
+            return false;
+        }
+        // The label: a process may not label an object above its own integrity,
+        // so a medium label cannot come from a low-integrity or AppContainer
+        // process running as this same account.
+        let Some(label) = sddl.split("(ML;;").nth(1) else {
+            return false;
+        };
+        let Some(level) = label
+            .split(";;;")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+        else {
+            return false;
+        };
+        match level {
+            "ME" | "HI" | "SI" => true,
+            other => other
+                .strip_prefix("S-1-16-")
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_some_and(|value| value >= MEDIUM),
+        }
+    }
+
+    /// This object's owner, group, access list and label, as text.
+    fn describe(handle: HANDLE) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+        };
+        const OWNER: u32 = 0x0000_0001;
+        const GROUP: u32 = 0x0000_0002;
+        const DACL: u32 = 0x0000_0004;
+        const LABEL: u32 = 0x0000_0010;
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: the out-parameter is valid and the system allocates into it;
+        // every other pointer argument is optional and passed as null.
+        let queried = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER | GROUP | DACL | LABEL,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if queried != 0 || descriptor.is_null() {
+            return Err(io::Error::other("the endpoint's descriptor is unreadable"));
+        }
+        let owned = Local(descriptor);
+        let mut text: *mut u16 = ptr::null_mut();
+        let mut length = 0u32;
+        // SAFETY: `descriptor` is a valid self-relative descriptor that outlives
+        // the call; both out-parameters are valid.
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                OWNER | GROUP | DACL | LABEL,
+                &mut text,
+                &mut length,
+            )
+        };
+        drop(owned);
+        if converted == 0 || text.is_null() {
+            return Err(io::Error::other("the endpoint's descriptor is unreadable"));
+        }
+        let owned_text = Local(text.cast());
+        // SAFETY: the system returned `length` units of a wide string.
+        let slice = unsafe { std::slice::from_raw_parts(text, length as usize) };
+        let described = String::from_utf16_lossy(slice);
+        drop(owned_text);
+        Ok(described.trim_end_matches('\0').to_owned())
+    }
+
+    /// The descriptor of a pipe we are holding. Only tests need this: production
+    /// reads the descriptor of a pipe it is about to talk to, not one it made.
+    #[cfg(test)]
+    pub(crate) fn describe_for_test(
+        server: &tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> io::Result<String> {
+        use std::os::windows::io::AsRawHandle;
+        describe(server.as_raw_handle() as HANDLE)
+    }
+
     /// Creates one instance of a pipe only this user can reach. `first` asks the
     /// system to refuse if the name already exists, which is how a squatter is
-    /// detected rather than silently joined.
+    /// detected rather than silently joined. Must be called inside a Tokio
+    /// runtime with the I/O driver enabled.
     pub fn create_pipe(
         name: &str,
         first: bool,
@@ -199,7 +333,7 @@ mod imp {
         options
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .max_instances(16);
+            .max_instances(MAX_INSTANCES);
         // SAFETY: the descriptor behind `attributes` lives until this function
         // returns, and the call copies what it needs before that. The pointer is
         // non-null and points at a SECURITY_ATTRIBUTES whose size field is set.
@@ -211,9 +345,11 @@ mod imp {
         }
     }
 
-    /// Opens the pipe only when this user owns it. A client that skipped this
-    /// would hand its request -- and any credential in it -- to whoever took the
-    /// name first, which is exactly the attack §3.1 names.
+    /// Opens the pipe only when it is this account's engine: the owner, and a
+    /// mandatory label no sandboxed process of the same account could have
+    /// applied. A client that skipped this would hand its request -- and any
+    /// credential in it -- to whoever took the name first, which is the attack
+    /// §3.1 names. Must be called inside a Tokio runtime with the I/O driver.
     pub fn open_pipe(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
         use windows_sys::Win32::{
             Security::{Authorization::GetSecurityInfo, Authorization::SE_KERNEL_OBJECT, PSID},
@@ -279,12 +415,19 @@ mod imp {
         let slice = unsafe { std::slice::from_raw_parts(text, length) };
         let owner_sid = String::from_utf16_lossy(slice);
         drop(owned_text);
-        if owner_sid != user_scope()?.identity {
-            // Someone else's pipe wearing our name: say nothing to it. Note this
-            // compares the account, not the group: a pipe an administrator owns
-            // is not ours even when we could take it.
-            return Err(io::Error::other("the endpoint is owned by another user"));
+        // The owner alone is not enough. A sandboxed process running as this
+        // same account can create a pipe, and it owns what it creates -- so an
+        // owner check would pass and the client would hand it the request. What
+        // such a process cannot do is stamp a mandatory label at or above medium
+        // integrity, because a process may not label an object above its own
+        // level. So the descriptor is what is checked, not the owner alone.
+        let descriptor_text = describe(handle)?;
+        if !acceptable_descriptor(&descriptor_text, &user_scope()?.identity) {
+            return Err(io::Error::other(
+                "the endpoint is not this account's engine",
+            ));
         }
+        let _ = owner_sid;
         // SAFETY: the handle is a valid, overlapped pipe handle that we own and
         // do not use again; tokio takes ownership of it here.
         unsafe {
@@ -297,11 +440,24 @@ mod imp {
 
 pub use imp::user_scope;
 #[cfg(windows)]
-pub use imp::{create_pipe, open_pipe};
+pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name no other test in this process will claim.
+    #[cfg(windows)]
+    fn pipe_name(label: &str) -> String {
+        format!(
+            r"\\.\pipe\fhd-platform-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
 
     #[test]
     fn the_scope_names_this_account_and_session() {
@@ -342,6 +498,66 @@ mod tests {
         // open_pipe refuses anything whose owner is not this account, so its
         // success is the assertion.
         open_pipe(&name).expect("the pipe is owned by this account");
+    }
+
+    /// The descriptor the kernel actually stamped, read back. Without this the
+    /// access list and the label could both be dropped and every other test here
+    /// would still pass.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_pipe_carries_the_descriptor_we_asked_for() {
+        let name = pipe_name("descriptor");
+        let server = create_pipe(&name, true).expect("create");
+        let sid = user_scope().unwrap().identity;
+        let described = super::imp::describe_for_test(&server).expect("read the descriptor back");
+        assert!(
+            described.starts_with(&format!("O:{sid}")),
+            "the account does not own it: {described}"
+        );
+        assert!(
+            described.contains("(ML;;"),
+            "no mandatory label was applied: {described}"
+        );
+        // Exactly one access entry, for this account: nothing was widened.
+        assert_eq!(
+            described.matches("(A;").count(),
+            1,
+            "more than this account may reach it: {described}"
+        );
+        assert!(
+            described.contains(&sid),
+            "the entry is not for this account: {described}"
+        );
+        // And the check the client runs accepts precisely this.
+        assert!(acceptable_descriptor(&described, &sid));
+    }
+
+    /// What a process in a sandbox, running as this same account, could produce.
+    /// It owns what it creates, so an owner check alone would admit it.
+    #[cfg(windows)]
+    #[test]
+    fn a_descriptor_a_sandboxed_process_could_make_is_refused() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let ours = format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;ME)");
+        assert!(acceptable_descriptor(&ours, sid));
+        for refused in [
+            // No label at all: the ordinary product of a low-integrity creator.
+            format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})"),
+            // A label it could apply -- its own level, below medium.
+            format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;LW)"),
+            format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;S-1-16-4096)"),
+            // Owned by somebody else entirely.
+            format!("O:S-1-5-21-9-9-9-500G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;ME)"),
+            // Correct label, but open to everyone.
+            format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;WD)S:(ML;;NRNWNX;;;ME)"),
+            // Open to every AppContainer.
+            format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;AC)S:(ML;;NRNWNX;;;ME)"),
+        ] {
+            assert!(
+                !acceptable_descriptor(&refused, sid),
+                "accepted a descriptor this account's engine would never create: {refused}"
+            );
+        }
     }
 
     #[cfg(windows)]

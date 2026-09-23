@@ -65,9 +65,19 @@ jobs:
       # logs are not, so on a runner we cannot reproduce this is the diagnosis.
       - name: Platform - the account and session are readable
         run: cargo +1.98.1 test -p fhd-platform --locked the_scope
+      # Windows only, and marked so: a filter matching no test exits zero, which
+      # would make these green no-ops elsewhere under security-sounding names.
+      - name: Platform - the pipe carries the descriptor we asked for
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked descriptor_we_asked_for
+      - name: Platform - a sandboxed process's descriptor is refused
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked sandboxed_process_could_make
       - name: Platform - a pipe is owned by the account that made it
+        if: runner.os == 'Windows'
         run: cargo +1.98.1 test -p fhd-platform --locked owned_by_the_account
       - name: Platform - a pipe we made is one we will talk to
+        if: runner.os == 'Windows'
         run: cargo +1.98.1 test -p fhd-platform --locked one_we_will_talk_to
       - name: Test IPC
         run: cargo +1.98.1 test -p fhd-ipc --locked
