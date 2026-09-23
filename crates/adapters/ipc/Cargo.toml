@@ -1,0 +1,13 @@
+[package]
+name = "fhd-ipc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fhd-protocol = { path = "../../protocol" }
+fhd-telemetry = { path = "../../telemetry" }
+tokio = { version = "=1.51.4", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "=1.51.4", features = ["rt-multi-thread", "macros", "time"] }

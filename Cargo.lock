@@ -292,6 +292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fhd-ipc"
+version = "0.1.0"
+dependencies = [
+ "fhd-protocol",
+ "fhd-telemetry",
+ "tokio",
+]
+
+[[package]]
 name = "fhd-persistence"
 version = "0.1.0"
 dependencies = [
