@@ -53,10 +53,21 @@ pub enum OwnerVerdict {
 /// account, the system, and the local administrators: an administrator can take
 /// ownership regardless, so naming them a finding would be noise.
 pub fn judge_owner(owner: Option<&str>, us: &str) -> OwnerVerdict {
-    // The account that owns Windows' own directories. Measured, not assumed:
-    // `C:\Users` is owned by it on a stock installation, so treating it as a
-    // stranger would refuse every path on the machine. It is more privileged than
-    // the administrators already in this set, not less.
+    // `NT SERVICE\TrustedInstaller`, the Windows servicing identity. It is here
+    // for a reason inside the trust model, not because of a privilege ranking:
+    // becoming it requires Administrator or SYSTEM, both already in this set, so
+    // it widens the set by nothing.
+    //
+    // It is needed because the Windows servicing roots are owned by it. Measured
+    // on this machine, 2026-09-23: `C:\` and `C:\Program Files` are
+    // TrustedInstaller's; `C:\Users` and `C:\Users\<name>` are SYSTEM's. An
+    // earlier comment here named `C:\Users` and was wrong -- the load-bearing
+    // component is `C:\` itself, which the walk reads as the delete-child parent
+    // of `C:\Users`. Calling it foreign refuses every path on the system volume.
+    //
+    // And it is trusted only as an *owner*. It is absent from the access-list
+    // trusted sets in `foreign_writers` and `holders`, so an entry granting it
+    // write is still reported.
     const TRUSTED_INSTALLER: &str =
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
     match owner {
@@ -129,18 +140,29 @@ mod imp {
         Ok(())
     }
 
-    /// Not implemented here. Unix has the same exposure -- a writable parent lets
-    /// a path be swapped -- and closing it needs `O_NOFOLLOW`/`openat` walking
-    /// rather than a permission read, which this crate does not do yet. Reported
-    /// as unexamined rather than answered "nothing found".
+    /// Not implemented, and this returns "nothing found" rather than "not
+    /// examined" -- so `STATE-PATH-SWAPPABLE` can never fire on Unix.
+    ///
+    /// An earlier comment here claimed the opposite. It was wrong, and the
+    /// difference matters: a state directory under a group- or world-writable
+    /// parent is accepted on Unix exactly as it would have been before any of
+    /// this work. Closing it needs `openat`/`O_NOFOLLOW`/`RESOLVE_BENEATH`
+    /// walking rather than a permission read. Until then the guarantee names
+    /// Unix as unchecked instead of the code implying it is clean.
     pub fn swappable_components(_: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
         Ok(Vec::new())
     }
 
-    /// Unix creates the directory and then sets its mode, which is what the
-    /// caller already does.
+    /// Created with its mode, not repaired afterwards.
+    ///
+    /// `create_dir` then `set_permissions` leaves the directory readable by the
+    /// process umask's idea of the world for as long as the two calls take --
+    /// the same create-then-repair window the Windows side was rewritten to
+    /// remove. `DirBuilder::mode` passes the mode to `mkdir(2)`, so there is no
+    /// interval to lose.
     pub fn create_protected_directory(path: &std::path::Path) -> io::Result<bool> {
-        match std::fs::create_dir(path) {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(error) => Err(error),
@@ -836,33 +858,58 @@ mod imp {
     /// parent grants delete-child can be moved aside between the moment it is
     /// checked and the moment it is opened -- after which every check describes a
     /// directory that is no longer there.
-    pub fn swappable_components(path: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
-        // Resolved before it is walked. The chain built from the text of a path
-        // is not the chain the system walks: a junction anywhere in it -- and
-        // making `%LOCALAPPDATA%\<app>` a junction onto a data volume is an
-        // ordinary thing for a person short of space to do -- sends the real
-        // directory somewhere whose ancestors never appear in the text at all.
-        // Checking the written components then says "clean" about a path whose
-        // actual parents every account on the machine can rename.
-        let resolved = std::fs::canonicalize(path)?;
-        let mut chain: Vec<std::path::PathBuf> = Vec::new();
-        let mut current = Some(resolved.as_path());
-        while let Some(component) = current {
-            chain.push(component.to_path_buf());
-            current = component.parent();
-        }
+    /// Every directory on the way to `path`, root first.
+    fn ancestors(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut chain: Vec<std::path::PathBuf> =
+            path.ancestors().map(std::path::Path::to_path_buf).collect();
         chain.reverse();
+        chain
+    }
+
+    pub fn swappable_components(path: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
+        // Both chains, because neither one alone is the set of directories that
+        // can move us. A security review demonstrated the half that was missing:
+        // with `base\gate` granting another account Modify and `base\gate\link`
+        // a junction onto a clean `base\real`, every check passed -- and then
+        // `gate` was used to repoint `link` at the attacker's directory, and the
+        // next open by path landed there. `gate` and `link` are exactly what
+        // canonicalising erases.
+        //
+        // So: the resolved chain catches a junction *we* were pointed through
+        // onto hostile ground, and the typed chain catches the hostile ground
+        // that *holds the junction*. Missing either is a path somebody else can
+        // swap while the check says clean.
+        //
+        // Every component is judged on its own parent rather than on its place
+        // in a list, because two chains concatenated have no single ordering.
+        let mut chain = ancestors(&std::fs::canonicalize(path)?);
+        for component in ancestors(&std::path::absolute(path)?) {
+            if !chain.contains(&component) {
+                chain.push(component);
+            }
+        }
 
         let mut found = Vec::new();
-        for (index, component) in chain.iter().enumerate() {
-            let Ok(metadata) = std::fs::symlink_metadata(component) else {
-                continue;
+        for component in &chain {
+            // An unreadable component is a finding, not a pass. Skipping here
+            // failed open on the one condition an attacker can induce, while
+            // `holders(..)?` a few lines below failed closed on the same one.
+            let metadata = match std::fs::symlink_metadata(component) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    found.push(SwappableComponent {
+                        path: component.clone(),
+                        principals: vec![format!("<unreadable: {}>", error.kind())],
+                    });
+                    continue;
+                }
             };
             let mut principals = Vec::new();
             // A component that is itself a reparse point redirects the path
             // without anybody renaming anything, so whoever can rewrite its
-            // target can move us. Canonicalising should have removed these; one
-            // surviving here is reported rather than trusted.
+            // target can move us. On the resolved chain there should be none; on
+            // the typed chain this is the junction the review used, and it is
+            // reported so its holders are read below rather than erased.
             {
                 use std::os::windows::fs::MetadataExt;
                 if metadata.file_attributes() & 0x400 != 0 {
@@ -873,7 +920,7 @@ mod imp {
             // `D:\` carries a DELETE grant that means nothing, because no volume
             // root can be renamed -- and its delete-child is still checked below
             // as the parent of the next component, which is the part that bites.
-            if index > 0 {
+            if component.parent().is_some() {
                 for holder in holders(component, RENAME_RIGHTS)? {
                     if !principals.contains(&holder) {
                         principals.push(holder);
@@ -881,8 +928,9 @@ mod imp {
                 }
             }
             // And its parent: delete-child there reaches this component whatever
-            // its own list says.
-            if let Some(parent) = index.checked_sub(1).and_then(|i| chain.get(i)) {
+            // its own list says. Taken from the component itself, not from a
+            // neighbouring index, so it stays right across both chains.
+            if let Some(parent) = component.parent() {
                 for holder in holders(parent, DELETE_CHILD)? {
                     if !principals.contains(&holder) {
                         principals.push(holder);
@@ -1366,21 +1414,46 @@ mod tests {
         std::fs::create_dir(&wdac).unwrap();
         let child = wdac.join("state");
         std::fs::create_dir(&child).unwrap();
-        if icacls(
-            &wdac,
-            &["/grant".to_owned(), "*S-1-5-11:(WDAC,WO)".to_owned()],
-        ) {
-            assert!(
-                !swappable_components(&child).unwrap().is_empty(),
-                "an ancestor granting WRITE_DAC alone was called unswappable"
-            );
-        }
+        assert!(
+            icacls(
+                &wdac,
+                &["/grant".to_owned(), "*S-1-5-11:(WDAC,WO)".to_owned()],
+            ),
+            "this case needs icacls to grant WRITE_DAC; without it the WRITE_DAC \
+             path is uncovered rather than covered"
+        );
+        assert!(
+            !swappable_components(&child).unwrap().is_empty(),
+            "an ancestor granting WRITE_DAC alone was called unswappable"
+        );
 
-        // 2. A junction. The written path is clean; the real one need not be.
-        //    Creating one needs no privilege for a directory link.
+        // 2. The junction bypass, built exactly as the security review built it.
+        //
+        //    An earlier version of this case pointed a junction at a target
+        //    inside the same protected base and asserted the two spellings
+        //    agreed. They did -- both were clean -- so the assertion read
+        //    `true == true` and pinned nothing. Worse, the one thing that could
+        //    fail it was the reparse clause, which canonicalising makes dead
+        //    code for this shape.
+        //
+        //    The real bypass is the other way round: a *hostile gate* holding a
+        //    junction onto *clean ground*. Canonicalising erases the gate, so
+        //    every check passed -- and then the gate was used to repoint the
+        //    junction and the next open by path landed in the attacker's
+        //    directory.
         let target = base.join("target");
         std::fs::create_dir(&target).unwrap();
-        let link = base.join("link");
+        let gate = base.join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        assert!(
+            icacls(
+                &gate,
+                &["/grant".to_owned(), "*S-1-5-11:(OI)(CI)M".to_owned()]
+            ),
+            "this case needs icacls to grant Modify on the gate; without it the \
+             junction bypass is uncovered rather than covered"
+        );
+        let link = gate.join("link");
         let made = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(&link)
@@ -1399,14 +1472,20 @@ mod tests {
         );
         let through = link.join("inner");
         std::fs::create_dir(&through).unwrap();
-        // Both spellings must agree, because they are the same directory.
+
+        // The resolved chain is clean, so this is the whole finding: it comes
+        // from the typed chain or not at all.
         let direct = swappable_components(&target.join("inner")).unwrap();
-        let via = swappable_components(&through).unwrap();
-        assert_eq!(
+        assert!(
             direct.is_empty(),
-            via.is_empty(),
-            "the same directory was judged differently through a junction:\n  \
-             direct: {direct:?}\n  via: {via:?}"
+            "the negative control is dirty, so the assertion below would pass \
+             against a check that refuses everything: {direct:?}"
+        );
+        let via = swappable_components(&through).unwrap();
+        assert!(
+            !via.is_empty(),
+            "a path reached through a junction whose holder another account can \
+             rewrite was called unswappable"
         );
 
         // 3. A volume root is not a false positive. It carries a DELETE grant
