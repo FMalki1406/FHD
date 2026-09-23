@@ -29,6 +29,52 @@ impl UserScope {
     }
 }
 
+/// What an owner means for a directory we are asked to adopt.
+///
+/// Split out from the Win32 call so the rule can be exercised without the
+/// privilege that creating a directory owned by somebody else requires. What is
+/// tested here is the decision; that the owner is read at all, and that a real
+/// foreign-owned directory is refused, is a separate check needing a second
+/// account -- recorded as such rather than claimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerVerdict {
+    /// Ours, or an account that can take ownership anyway.
+    Trusted,
+    /// Somebody else. An owner holds WRITE_DAC whatever the access list says, so
+    /// they can re-grant themselves at any moment.
+    Foreign,
+    /// The system reported no owner. Refused rather than assumed.
+    Missing,
+}
+
+/// Decides what an owner SID means, given who we are.
+///
+/// `owner` is `None` when the descriptor carried none. The trusted set is this
+/// account, the system, and the local administrators: an administrator can take
+/// ownership regardless, so naming them a finding would be noise.
+pub fn judge_owner(owner: Option<&str>, us: &str) -> OwnerVerdict {
+    match owner {
+        None => OwnerVerdict::Missing,
+        Some(owner) if owner == us => OwnerVerdict::Trusted,
+        Some("S-1-5-18") | Some("S-1-5-32-544") => OwnerVerdict::Trusted,
+        Some(_) => OwnerVerdict::Foreign,
+    }
+}
+
+/// A path component an untrusted account could rename, and who could do it.
+///
+/// Protecting the state directory settles who may write *into* it. It says
+/// nothing about who may move it aside: renaming needs `DELETE` on the component
+/// itself or `FILE_DELETE_CHILD` on its parent, and neither is a right the
+/// directory's own list grants. If any component of the path can be swapped, then
+/// every check made against that path describes a directory that may no longer be
+/// the one we open a moment later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwappableComponent {
+    pub path: std::path::PathBuf,
+    pub principals: Vec<String>,
+}
+
 /// Who may write to a directory besides the people we already trust.
 ///
 /// "Trusted" is the account that runs the engine, the system account, and the
@@ -75,6 +121,14 @@ mod imp {
     /// The caller sets the mode on Unix; there is no inherited list to replace.
     pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Not implemented here. Unix has the same exposure -- a writable parent lets
+    /// a path be swapped -- and closing it needs `O_NOFOLLOW`/`openat` walking
+    /// rather than a permission read, which this crate does not do yet. Reported
+    /// as unexamined rather than answered "nothing found".
+    pub fn swappable_components(_: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
+        Ok(Vec::new())
     }
 
     /// Unix creates the directory and then sets its mode, which is what the
@@ -532,10 +586,16 @@ mod imp {
         // this directory, leaves a list naming only trusted accounts, and keeps
         // ownership can re-grant themselves at any moment. Reading the list alone
         // called that directory clean.
-        if owner.is_null() {
-            foreign.push("<no owner>".to_owned());
-        } else if !known(owner) {
-            foreign.push(sid_text(owner).unwrap_or_else(|| "<unreadable owner>".to_owned()));
+        // The same rule `judge_owner` states, applied to what the system said.
+        // Reading it through that function keeps the decision in one place, where
+        // it can be tested without a second account.
+        let owner_text = (!owner.is_null()).then(|| sid_text(owner)).flatten();
+        match judge_owner(owner_text.as_deref(), &scope.identity) {
+            OwnerVerdict::Trusted => {}
+            OwnerVerdict::Missing => foreign.push("<no owner>".to_owned()),
+            OwnerVerdict::Foreign => {
+                foreign.push(owner_text.unwrap_or_else(|| "<unreadable owner>".to_owned()));
+            }
         }
 
         // A null access list is not an empty one: it grants everyone everything.
@@ -753,6 +813,124 @@ mod imp {
         Ok(())
     }
 
+    /// Rights that let the holder move a directory aside. `DELETE` on the
+    /// component itself, and `FILE_DELETE_CHILD` on its parent, which permits
+    /// deleting a child regardless of that child's own list.
+    const RENAME_RIGHTS: u32 = 0x0001_0000; // DELETE
+    const DELETE_CHILD: u32 = 0x0000_0040; // FILE_DELETE_CHILD
+
+    /// Every component of `path`, from the root down, that somebody outside the
+    /// trusted set could rename or delete.
+    ///
+    /// Giving the state directory a list of its own decides who may write into
+    /// it. It does not decide who may replace it: on a data volume every ancestor
+    /// typically grants `Authenticated Users: Modify`, and a directory whose
+    /// parent grants delete-child can be moved aside between the moment it is
+    /// checked and the moment it is opened -- after which every check describes a
+    /// directory that is no longer there.
+    pub fn swappable_components(path: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        let mut current = Some(path);
+        while let Some(component) = current {
+            chain.push(component.to_path_buf());
+            current = component.parent();
+        }
+        chain.reverse();
+
+        let mut found = Vec::new();
+        for (index, component) in chain.iter().enumerate() {
+            if !component.exists() {
+                continue;
+            }
+            // The component itself: who may delete it outright.
+            let mut principals = holders(component, RENAME_RIGHTS)?;
+            // And its parent: delete-child there reaches this component whatever
+            // its own list says.
+            if let Some(parent) = index.checked_sub(1).and_then(|i| chain.get(i)) {
+                for holder in holders(parent, DELETE_CHILD)? {
+                    if !principals.contains(&holder) {
+                        principals.push(holder);
+                    }
+                }
+            }
+            if !principals.is_empty() {
+                found.push(SwappableComponent {
+                    path: component.clone(),
+                    principals,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// Untrusted principals an object's access list grants any of `rights` to.
+    fn holders(path: &std::path::Path, rights: u32) -> io::Result<Vec<String>> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated path outliving the call, and the
+        // out-parameters are valid; the descriptor owns the ACL and is freed once.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _owned = Local(descriptor);
+        let scope = user_scope()?;
+        let trusted = [scope.identity.as_str(), "S-1-5-18", "S-1-5-32-544"];
+        if dacl.is_null() {
+            return Ok(vec!["S-1-1-0".to_owned()]);
+        }
+        // SAFETY: `dacl` points inside the descriptor kept alive above.
+        let count = unsafe { (*dacl).AceCount };
+        let mut out: Vec<String> = Vec::new();
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `index` is below the count the ACL reported.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                continue;
+            }
+            // SAFETY: every ACE begins with a header.
+            let (kind, flags) = unsafe {
+                let header = ace.cast::<ACE_HEADER>();
+                ((*header).AceType, u32::from((*header).AceFlags))
+            };
+            if !ALLOW_TYPES.contains(&kind) || flags & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: the type was checked, so mask and SID are where they belong.
+            let mask = unsafe { (*ace).Mask };
+            // GENERIC_ALL carries every specific right, delete among them.
+            if mask & (rights | 0x1000_0000) == 0 {
+                continue;
+            }
+            // SAFETY: the SID begins at `SidStart` in both allowed types.
+            let sid = unsafe { ptr::addr_of!((*ace).SidStart).cast::<c_void>().cast_mut() };
+            if trusted
+                .iter()
+                .any(|text| parse_sid(text).is_some_and(|known| equal(known.0, sid)))
+            {
+                continue;
+            }
+            let text = sid_text(sid).unwrap_or_else(|| "<unreadable>".to_owned());
+            if !out.contains(&text) {
+                out.push(text);
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether two SID pointers name the same account.
     fn equal(a: *mut c_void, b: *mut c_void) -> bool {
         // SAFETY: both point at valid SIDs owned by their callers for this call.
@@ -897,7 +1075,8 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
 pub use imp::{
-    create_protected_directory, foreign_writers, process_cpu, protect_new_directory, user_scope,
+    create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
+    swappable_components, user_scope,
 };
 
 #[cfg(test)]
@@ -1062,12 +1241,10 @@ mod tests {
             );
         }
 
-        // 4. The owner, which is not in the access list at all. Creating a
-        //    directory owned by somebody else needs a privilege a test cannot
-        //    assume, so what is asserted is the half that can be: the owner is
-        //    read, and this account is accepted as its own. The other half -- a
-        //    foreign owner being reported -- rests on the code path, and is
-        //    called out as such in the review record rather than claimed covered.
+        // 4. The owner, which is not in the access list at all. The decision is
+        //    tested on its own in `the_owner_rule_is_decided_not_assumed`; here
+        //    the half that needs a real directory is asserted: this account is
+        //    accepted as the owner of what it created.
         let dir = make("owned");
         assert!(
             foreign_writers(&dir).unwrap().is_empty(),
@@ -1075,6 +1252,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What an owner means, decided rather than assumed.
+    ///
+    /// Creating a directory owned by another account needs a privilege a test
+    /// cannot assume, so the rule is split from the system call and checked here.
+    /// **This does not show that a real foreign-owned directory is refused** --
+    /// that needs a second account and is tracked as its own verification item.
+    /// What it shows is that the rule says the right thing when it is asked.
+    #[test]
+    fn the_owner_rule_is_decided_not_assumed() {
+        let us = "S-1-5-21-1-2-3-1001";
+        assert_eq!(judge_owner(Some(us), us), OwnerVerdict::Trusted);
+        // An administrator can take ownership regardless, and the system reads
+        // everything; naming either a finding would be noise.
+        assert_eq!(judge_owner(Some("S-1-5-18"), us), OwnerVerdict::Trusted);
+        assert_eq!(judge_owner(Some("S-1-5-32-544"), us), OwnerVerdict::Trusted);
+        // Anybody else owns WRITE_DAC on it whatever the access list says.
+        assert_eq!(
+            judge_owner(Some("S-1-5-21-1-2-3-1002"), us),
+            OwnerVerdict::Foreign
+        );
+        assert_eq!(judge_owner(Some("S-1-1-0"), us), OwnerVerdict::Foreign);
+        // No owner is refused, not assumed to be ours.
+        assert_eq!(judge_owner(None, us), OwnerVerdict::Missing);
     }
 
     /// A directory made under a parent that hands out write access to others is

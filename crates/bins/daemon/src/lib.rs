@@ -55,6 +55,11 @@ pub enum EngineError {
     /// many such principals were found; the SIDs stay out of the code, which is
     /// carried across layers and logged.
     ExposedStateDirectory(u32),
+    /// Some component of the path to the state directory could be renamed by an
+    /// account outside the trusted set, so the directory checked is not
+    /// guaranteed to be the directory opened. The count is how many components,
+    /// not which: the code crosses layers and is logged.
+    SwappableStatePath(u32),
     Persistence(PersistenceError),
     Binding(BindingError),
     Admission(AppError),
@@ -254,6 +259,19 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
         return Err(EngineError::ExposedStateDirectory(
             foreign.sids().len() as u32
         ));
+    }
+    // And who could move it aside. Giving the directory a list of its own settles
+    // who may write into it; it settles nothing about who may replace it, because
+    // renaming needs DELETE on the component or FILE_DELETE_CHILD on its parent
+    // and neither is granted by the directory's own list. If any component of the
+    // path can be swapped, every check above describes a directory that may not
+    // be the one the database and the part files are opened in a moment later --
+    // measured on this machine: on a data volume every ancestor grants
+    // Authenticated Users enough to do it.
+    let swappable =
+        fhd_platform::swappable_components(path).map_err(|_| EngineError::InvalidInput)?;
+    if !swappable.is_empty() {
+        return Err(EngineError::SwappableStatePath(swappable.len() as u32));
     }
     Ok(())
 }
@@ -951,6 +969,7 @@ pub fn code(error: &EngineError) -> String {
             None => "STOPPED-RERUN-WITH-RESUME".into(),
         },
         EngineError::ExposedStateDirectory(_) => "STATE-DIRECTORY-EXPOSED".into(),
+        EngineError::SwappableStatePath(_) => "STATE-PATH-SWAPPABLE".into(),
         EngineError::Persistence(error) => error.code().into(),
         EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),

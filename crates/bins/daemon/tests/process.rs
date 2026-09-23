@@ -408,6 +408,56 @@ stderr: {err}"
     );
 }
 
+/// A state directory whose path somebody else could rename is refused.
+///
+/// Giving the directory an access list of its own settles who may write into it
+/// and nothing about who may replace it: renaming needs DELETE on the component
+/// or FILE_DELETE_CHILD on its parent, and the directory's own list grants
+/// neither. On this machine every ancestor of a path on a data volume grants
+/// Authenticated Users enough to move a directory aside, so a check made against
+/// the path describes a directory that need not be the one opened a moment later.
+///
+/// Skipped where no such path is available rather than asserting something the
+/// machine cannot show.
+#[test]
+#[cfg(windows)]
+fn a_state_path_others_could_rename_is_refused() {
+    // The repository's own tree sits on a data volume in development, which is
+    // exactly the shape this refuses. If it happens to be protected here, there
+    // is nothing to prove and the test says so instead of passing quietly.
+    let candidate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../target/swappable-probe");
+    let _ = std::fs::create_dir_all(&candidate);
+    let Ok(components) = fhd_platform::swappable_components(&candidate) else {
+        eprintln!("skipped: the path could not be inspected");
+        return;
+    };
+    if components.is_empty() {
+        eprintln!("skipped: no swappable path available on this machine");
+        let _ = std::fs::remove_dir_all(&candidate);
+        return;
+    }
+
+    let destination = candidate.join("out.bin");
+    let (code, out, err) = run(
+        &[
+            &candidate.join("state").to_string_lossy(),
+            &destination.to_string_lossy(),
+            "--allow-http",
+        ],
+        "http://127.0.0.1:1/file
+",
+    );
+    assert_ne!(code, Some(0), "a swappable path was accepted");
+    assert!(
+        err.contains("STATE-PATH-SWAPPABLE") || out.contains("STATE-PATH-SWAPPABLE"),
+        "refused for the wrong reason.
+stdout: {out}
+stderr: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&candidate);
+}
+
 /// A refused argument leaves nothing behind, in any mode.
 ///
 /// Exiting non-zero is not enough. The question is whether anything happened
