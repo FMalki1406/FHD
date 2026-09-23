@@ -15,13 +15,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A connection that has asked for nothing yet is cheap to make and must stay
 /// cheap to hold: an unauthenticated peer may not occupy the engine for minutes.
-const FIRST_BYTE: Duration = Duration::from_secs(5);
+/// It counts from the connection, not from the last byte, so dribbling a byte
+/// before it expires buys nothing.
+const FIRST_REQUEST: Duration = Duration::from_secs(5);
 /// Between requests, a client that has already spoken is given longer.
 const IDLE: Duration = Duration::from_secs(120);
 /// One client may not keep the engine writing forever either.
 const WRITE: Duration = Duration::from_secs(30);
 /// Nor may one answer take forever: the engine says it is busy instead.
 const HANDLE: Duration = Duration::from_secs(20);
+/// What a client waits, in total, for one answer.
+const ANSWER: Duration = Duration::from_secs(60);
 /// Connections served at once. Every one of them costs a read buffer and a
 /// reassembly buffer, so the count is a declared budget rather than a surprise.
 const MAX_CLIENTS: usize = 32;
@@ -29,8 +33,10 @@ const MAX_CLIENTS: usize = 32;
 #[derive(Debug)]
 pub enum IpcError {
     /// The endpoint already exists: another engine owns this user's directory,
-    /// or someone squatted the name first (§3.1 declares this as a denial of
-    /// service, not a way in -- the client still checks who owns it).
+    /// or someone took the name first. On Unix the client checks the owner before
+    /// it speaks, so taking the name denies service rather than granting entry.
+    /// **On Windows there is no such check yet** (§3.1, enterprise-ipc.md): taking
+    /// the name there means the client speaks to whoever took it.
     Taken,
     /// The directory or socket is not ours alone.
     Untrusted,
@@ -72,8 +78,10 @@ impl std::fmt::Debug for Endpoint {
 
 #[cfg(windows)]
 impl Endpoint {
-    /// `\\.\pipe\fhd-<session>-<name>`: the pipe namespace is per machine, so the
-    /// name carries the session and the engine's own directory identity.
+    /// `\\.\pipe\fhd-<name>`, where the name identifies the engine's own state
+    /// directory. **This is not yet what §3.1 asks for:** it carries no user SID
+    /// and no session, so it is predictable, and nothing here stops another user
+    /// taking the name first. See docs/enterprise-ipc.md.
     pub fn for_user(name: &str) -> Self {
         Self(format!(r"\\.\pipe\fhd-{name}"))
     }
@@ -386,15 +394,25 @@ where
 {
     let mut frames = Frames::new();
     let mut buffer = vec![0u8; 16 * 1024];
-    let mut spoken = false;
+    // Until a whole request has arrived, the clock runs from when the connection
+    // was made. A peer that sends one byte a minute is not a slow client asking
+    // for something; it is a peer holding the engine open, so it is dropped.
+    let opened = tokio::time::Instant::now();
+    let mut asked = false;
     loop {
-        let patience = if spoken { IDLE } else { FIRST_BYTE };
+        let patience = if asked {
+            IDLE
+        } else {
+            match FIRST_REQUEST.checked_sub(opened.elapsed()) {
+                Some(left) => left,
+                None => return,
+            }
+        };
         let read = match tokio::time::timeout(patience, stream.read(&mut buffer)).await {
             Ok(Ok(0)) | Err(_) => return,
             Ok(Ok(read)) => read,
             Ok(Err(_)) => return,
         };
-        spoken = true;
         if frames.push(&buffer[..read]).is_err() {
             return;
         }
@@ -404,6 +422,8 @@ where
                 Ok(None) => break,
                 Err(_) => return,
             };
+            // A complete request: this peer is a client, not a squatter.
+            asked = true;
             let (id, response) = match decode_request(&frame) {
                 // An answer that never comes would hold this connection, and on
                 // Windows one of a small number of pipe instances with it.
@@ -461,8 +481,14 @@ where
         .map_err(|_| IpcError::Io(io::ErrorKind::TimedOut))??;
     let mut frames = Frames::new();
     let mut buffer = vec![0u8; 16 * 1024];
+    // One answer, one budget. Without it a server that sends a byte before every
+    // read deadline keeps a client waiting for as long as it likes.
+    let deadline = tokio::time::Instant::now() + ANSWER;
     loop {
-        let read = tokio::time::timeout(IDLE, stream.read(&mut buffer))
+        let left = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(IpcError::Io(io::ErrorKind::TimedOut))?;
+        let read = tokio::time::timeout(left, stream.read(&mut buffer))
             .await
             .map_err(|_| IpcError::Io(io::ErrorKind::TimedOut))??;
         if read == 0 {

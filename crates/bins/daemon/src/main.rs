@@ -18,9 +18,9 @@ fn usage() -> &'static str {
      each optionally followed by a tab and its own destination file)\n\
      or:    fhd-engine <state-directory> --continue [--resume]   (no stdin: every \
      job this directory remembers)\n\
-     or:    fhd-engine <state-directory> --serve [--allow-http] \
-     [--download-root DIR]   (resident: takes work over this user's control \
-     surface)\n\
+     or:    fhd-engine <state-directory> --serve --download-root DIR \
+     [--allow-http]   (resident: takes work over this user's control surface; \
+     downloads may land only under DIR)\n\
      or:    fhd-engine <state-directory> --client <command>   where command is \
      add <destination-file> [--sensitive] [--allow-http] (URL on stdin), list,      pause <job>, \
      cancel <job>, or stop"
@@ -200,10 +200,10 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
                 println!(
                     "{} {} {}/{} {}",
                     job.job,
-                    job.state,
+                    printable(&job.state),
                     job.durable_bytes,
                     job.total.map_or("?".to_owned(), |total| total.to_string()),
-                    reason
+                    printable(&reason)
                 );
             }
             if let Some(next) = next {
@@ -219,8 +219,15 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
 /// The engine's answer to an operator is a code, never a sentence assembled from
 /// whatever went wrong.
 fn fail(code: &str) -> ! {
-    eprintln!("{code}");
+    eprintln!("{}", printable(code));
     std::process::exit(1)
+}
+
+/// What a peer sent is data, and this is a terminal. An answer carrying escape
+/// sequences could retitle the window or paste into the shell, and on Windows
+/// this client cannot yet prove which engine it is talking to (§3.1).
+fn printable(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 #[tokio::main]
@@ -321,6 +328,13 @@ async fn main() {
 /// Runs as a resident engine: takes work over this user's control surface until a
 /// client asks it to stop or the operator interrupts.
 async fn serve_run(config: EngineConfig) -> ! {
+    // A resident engine takes destinations from whoever connects, so where those
+    // may land is policy, not an option. Without it the engine would accept any
+    // path on its volume, which is a fail-open default; it refuses to start.
+    if config.download_root.is_none() {
+        eprintln!("--serve requires --download-root");
+        std::process::exit(2);
+    }
     let name = endpoint_name(&config.state_directory);
     let resident = match Resident::open(config).await {
         Ok(resident) => resident,

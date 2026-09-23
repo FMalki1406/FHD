@@ -64,6 +64,10 @@ pub struct Service {
     config: EngineConfig,
     /// Resolved once: a request naming somewhere else is refused before any bytes.
     state: PathBuf,
+    /// The same two places as the filesystem itself names them, so a destination
+    /// cannot be admitted by spelling one of them differently.
+    canonical_state: PathBuf,
+    canonical_root: Option<PathBuf>,
 }
 
 /// A running engine: its control surface and the scheduler behind it.
@@ -142,6 +146,18 @@ impl Resident {
         .map_err(EngineError::Run)?;
         let (commands, incoming) = mpsc::channel(64);
         let state = config.state_directory.clone();
+        // Both exist by now: the engine made its own tree above, and a download
+        // root that does not exist is a configuration error, not a surprise.
+        let canonical_state = state
+            .canonicalize()
+            .map_err(|_| EngineError::InvalidInput)?;
+        let canonical_root = match &config.download_root {
+            Some(root) => Some(
+                root.canonicalize()
+                    .map_err(|_| EngineError::DestinationRefused)?,
+            ),
+            None => None,
+        };
         let service = Arc::new(Service {
             repository: repository.clone(),
             transport: transport.clone(),
@@ -149,6 +165,8 @@ impl Resident {
             commands,
             config,
             state,
+            canonical_state,
+            canonical_root,
         });
         let restored = service.restore().await?;
         Ok(Self {
@@ -405,18 +423,26 @@ impl Service {
         if !crate::publishable_name(leaf) {
             return Err(EngineError::DestinationRefused);
         }
+        // Comparing the paths as written answers only the spelling in front of
+        // us: on Windows a different case, an 8.3 alias or a junction all name
+        // the same directory while comparing unequal. The parent must exist to
+        // publish into anyway, so it is resolved by the filesystem, and every
+        // comparison below is between answers from the filesystem itself.
+        let parent = resolved.parent().ok_or(EngineError::DestinationRefused)?;
+        let parent = parent
+            .canonicalize()
+            .map_err(|_| EngineError::DestinationRefused)?;
         // The engine's own tree holds the database, its journals and the part
         // files. A download landing in there would be handing a remote server a
         // say in the engine's own state.
-        if resolved.starts_with(&self.state) {
+        if parent.starts_with(&self.canonical_state) {
             return Err(EngineError::DestinationRefused);
         }
-        if let Some(root) = &self.config.download_root {
-            if !resolved.starts_with(root) {
-                return Err(EngineError::DestinationRefused);
-            }
+        match &self.canonical_root {
+            Some(root) if !parent.starts_with(root) => return Err(EngineError::DestinationRefused),
+            _ => {}
         }
-        Ok(resolved)
+        Ok(parent.join(leaf))
     }
 
     async fn job(&self, id: JobId) -> Result<Job, EngineError> {
@@ -455,8 +481,12 @@ fn summarize(job: &Job) -> JobSummary {
     let projection = job.projection();
     JobSummary {
         job: job.id().get(),
-        state: format!("{:?}", job.state()),
-        reason: job.reason().map(|reason| format!("{reason:?}")),
+        // Closed names, for the same reason the error codes are closed: a future
+        // variant carrying a path must not put it on the wire by being printed.
+        state: crate::job_state(job.state()).to_owned(),
+        reason: job
+            .reason()
+            .map(|reason| crate::stop_reason(&reason).to_owned()),
         durable_bytes: projection.durable_bytes,
         total: job.plan().map(|(total, _)| total),
     }

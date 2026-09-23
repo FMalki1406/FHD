@@ -42,6 +42,26 @@ const legacy = {
 };
 const pureDependencies = new Set(['serde', 'thiserror']);
 
+// The workflow names the packages it tests, one step per area, so a failure on a
+// runner whose logs we cannot read still says where it is. The cost of naming
+// them is that a new member could ship untested; this is that cost paid.
+export function checkTestCoverage(metadata, workflow) {
+  const members = metadata.workspace_members
+    .map(id => metadata.packages.find(pkg => pkg.id === id))
+    .filter(Boolean)
+    .map(pkg => pkg.name);
+  const named = new Set();
+  for (const line of workflow.split('\n')) {
+    if (!/cargo \+[\d.]+ test /.test(line)) continue;
+    for (const part of line.split(/\s+/)) {
+      if (part.startsWith('-') || part === 'test' || part === 'run:') continue;
+      named.add(part);
+    }
+  }
+  return members.filter(name => !named.has(name))
+    .map(name => `${name}: no test step in the workflow names this package`);
+}
+
 export function checkArchitecture(metadata) {
   if (!metadata || !Array.isArray(metadata.packages) ||
       !Array.isArray(metadata.workspace_members) || metadata.workspace_members.length === 0) {
@@ -108,7 +128,11 @@ function main(args) {
   const metadata = JSON.parse(json);
   const violations = checkArchitecture(metadata);
   if (violations.length) throw new Error(`Architecture violations:\n${violations.join('\n')}`);
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages).`);
+  // A member that no test step names would ship green and untested.
+  const workflow = readFileSync(fileURLToPath(new URL('../.github/workflows/engine.yml', import.meta.url)), 'utf8');
+  const untested = checkTestCoverage(metadata, workflow);
+  if (untested.length) throw new Error(`Untested workspace members:\n${untested.join('\n')}`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

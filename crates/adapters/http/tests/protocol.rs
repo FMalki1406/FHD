@@ -38,14 +38,19 @@ fn serve(responses: Vec<Vec<u8>>) -> Server {
                 // this thread for the length of the test.
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 loop {
-                    let request = read_request(&mut stream);
-                    if request.is_empty() {
-                        return;
-                    }
-                    let Some(response) = remaining.lock().unwrap().pop_front() else {
+                    let Some(request) = read_request(&mut stream) else {
                         return;
                     };
-                    recorder.lock().unwrap().push(request);
+                    // Popped and recorded together, so `seen[i]` is the request
+                    // that `responses[i]` answered even when connections overlap.
+                    let response = {
+                        let mut remaining = remaining.lock().unwrap();
+                        let Some(response) = remaining.pop_front() else {
+                            return;
+                        };
+                        recorder.lock().unwrap().push(request);
+                        response
+                    };
                     if stream
                         .write_all(&response)
                         .and_then(|()| stream.flush())
@@ -59,16 +64,19 @@ fn serve(responses: Vec<Vec<u8>>) -> Server {
     });
     Server { port, seen }
 }
-fn read_request(stream: &mut TcpStream) -> String {
+/// The whole request head, or nothing if the connection ended or stalled first.
+/// A partial read is a dead connection, not a request: answering it would consume
+/// a scripted response and shift every later pairing by one.
+fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
     while !request.ends_with(b"\r\n\r\n") {
         match stream.read(&mut byte) {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => return None,
             Ok(_) => request.push(byte[0]),
         }
     }
-    String::from_utf8_lossy(&request).into_owned()
+    Some(String::from_utf8_lossy(&request).into_owned())
 }
 fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     let mut out = format!("HTTP/1.1 {status}\r\n").into_bytes();

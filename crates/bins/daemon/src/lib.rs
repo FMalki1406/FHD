@@ -788,37 +788,95 @@ fn run_code(error: &RunError) -> &'static str {
     }
 }
 
-/// Names the system reads as an instruction rather than as a file (§16.4), and
-/// names that read as something they are not. Refused at admission, so such a
-/// request never costs a download first.
+/// Closed names for a job's state, so a wire value never comes from printing a
+/// domain type that may one day carry a payload.
+pub fn job_state(state: fhd_domain::JobState) -> &'static str {
+    use fhd_domain::JobState as S;
+    match state {
+        S::Queued => "Queued",
+        S::Probing => "Probing",
+        S::Transferring => "Transferring",
+        S::Stopping => "Stopping",
+        S::Paused => "Paused",
+        S::RetryWait => "RetryWait",
+        S::NeedsAction => "NeedsAction",
+        S::Verifying => "Verifying",
+        S::Publishing => "Publishing",
+        S::Cancelling => "Cancelling",
+        S::Failed => "Failed",
+        S::Completed => "Completed",
+        S::Cancelled => "Cancelled",
+    }
+}
+
+/// Names the system reads as an instruction rather than as a file, names that
+/// read as something they are not, and names the filesystem will quietly turn
+/// into one of those (§16.4). Refused at admission, so such a request never
+/// costs a download first.
 pub fn publishable_name(leaf: &str) -> bool {
-    const REFUSED: [&str; 9] = [
-        ".lnk",
-        ".url",
-        ".scf",
-        ".library-ms",
-        ".search-ms",
-        ".appref-ms",
-        ".theme",
-        ".desktop",
-        ".inf",
+    /// Extensions whose file is an instruction to the system, wherever they
+    /// appear in the name: `Invoice.pdf.lnk` is a shortcut, not a document.
+    const REFUSED: [&str; 14] = [
+        "lnk",
+        "url",
+        "scf",
+        "library-ms",
+        "search-ms",
+        "searchconnector-ms",
+        "appref-ms",
+        "theme",
+        "themepack",
+        "desktop",
+        "inf",
+        "hta",
+        "msc",
+        "reg",
     ];
-    let lower = leaf.to_ascii_lowercase();
-    if lower.is_empty() || lower.len() > 255 {
+    /// Reserved by the operating system: opening one of these names talks to a
+    /// device, whatever extension follows.
+    const DEVICES: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if leaf.is_empty() || leaf.len() > 255 || leaf == "." || leaf == ".." {
         return false;
     }
+    // Windows drops a trailing dot or space, so `x.lnk.` becomes `x.lnk` on
+    // disk. Checking the name as written would be checking the wrong name.
+    if leaf.ends_with('.') || leaf.ends_with(' ') || leaf.starts_with(' ') {
+        return false;
+    }
+    // A name carrying a stream separator names a stream inside another file.
+    if leaf.contains(':') || leaf.contains('/') || leaf.contains('\\') {
+        return false;
+    }
+    let lower = leaf.to_ascii_lowercase();
     if matches!(lower.as_str(), "autorun.inf" | "desktop.ini" | ".htaccess") {
         return false;
     }
-    if REFUSED.iter().any(|ending| lower.ends_with(ending)) {
+    let mut parts = lower.split('.');
+    let stem = parts.next().unwrap_or_default();
+    if DEVICES.contains(&stem) {
         return false;
     }
-    !leaf
-        .chars()
-        .any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c) || c == '\u{2066}')
+    // Every extension, not only the last: the last one is what the shell reads,
+    // and a trailing dot or a second extension is how that gets hidden.
+    for part in parts {
+        if REFUSED.contains(&part) {
+            return false;
+        }
+    }
+    // Direction overrides and isolates make a name read as something it is not.
+    !leaf.chars().any(|c| {
+        c.is_control()
+            || ('\u{202a}'..='\u{202e}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+            || c == '\u{200e}'
+            || c == '\u{200f}'
+    })
 }
 
-/// Only controlled categories reach the operator: never a URL or server text.
+/// Only controlled categories reach the operator: never a URL or server text./// Only controlled categories reach the operator: never a URL or server text.
 pub fn code(error: &EngineError) -> String {
     match error {
         EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
@@ -835,5 +893,61 @@ pub fn code(error: &EngineError) -> String {
         EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),
         EngineError::Run(error) => run_code(error).into(),
+    }
+}
+
+#[cfg(test)]
+mod names {
+    /// Each of these is a way a name gets past a check that reads it literally.
+    #[test]
+    fn a_name_the_system_would_act_on_is_refused_however_it_is_spelled() {
+        for refused in [
+            "payload.lnk",
+            // Windows drops the trailing dot: this lands as payload.lnk.
+            "payload.lnk.",
+            "payload.lnk ",
+            "Invoice.pdf.lnk",
+            "INVOICE.PDF.LNK",
+            "autorun.inf",
+            "desktop.ini",
+            "setup.hta",
+            "policy.msc",
+            "keys.reg",
+            "pack.themepack",
+            "find.searchConnector-ms",
+            // Device names, with or without an extension.
+            "NUL",
+            "con.txt",
+            "COM1",
+            // A stream inside another file, and separators that are not ours.
+            "safe.txt:hidden.exe",
+            "a/b.bin",
+            "a\\b.bin",
+            // Made to read backwards.
+            "photo\u{202e}gnp.exe",
+            "photo\u{2069}gnp.exe",
+            "",
+            ".",
+            "..",
+        ] {
+            assert!(
+                !super::publishable_name(refused),
+                "accepted {refused:?}, which the system would act on"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_names_are_still_accepted() {
+        for accepted in [
+            "film.mkv",
+            "archive.tar.gz",
+            "installer.exe",
+            "notes.txt",
+            "تقرير.pdf",
+            "data.2026-09-23.csv",
+        ] {
+            assert!(super::publishable_name(accepted), "refused {accepted:?}");
+        }
     }
 }

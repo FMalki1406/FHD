@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkArchitecture } from './check-architecture.mjs';
+import { checkArchitecture, checkTestCoverage } from './check-architecture.mjs';
 
 function metadata(graph) {
   const packages = Object.entries(graph).map(([name, dependencies]) => ({
@@ -99,4 +99,23 @@ test('rejects incomplete or malformed metadata instead of silently skipping memb
   const duplicate = metadata({ 'fhd-domain': [] });
   duplicate.workspace_members.push(duplicate.workspace_members[0]);
   assert.throws(() => checkArchitecture(duplicate), /Duplicate workspace/);
+});
+
+test('a workspace member no test step names is reported rather than shipping untested', () => {
+  const metadata = {
+    packages: [
+      { id: 'a 0.1.0', name: 'fhd-domain', dependencies: [] },
+      { id: 'b 0.1.0', name: 'fhd-newcomer', dependencies: [] },
+    ],
+    workspace_members: ['a 0.1.0', 'b 0.1.0'],
+  };
+  const workflow = [
+    '      - name: Test domain',
+    '        run: cargo +1.98.1 test -p fhd-domain --locked',
+  ].join('\n');
+  assert.deepEqual(checkTestCoverage(metadata, workflow), [
+    'fhd-newcomer: no test step in the workflow names this package',
+  ]);
+  const covered = `${workflow}\n        run: cargo +1.98.1 test -p fhd-newcomer --locked`;
+  assert.deepEqual(checkTestCoverage(metadata, covered), []);
 });
