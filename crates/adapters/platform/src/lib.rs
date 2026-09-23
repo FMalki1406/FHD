@@ -92,7 +92,8 @@ mod imp {
                 SDDL_REVISION_1, SE_FILE_OBJECT,
             },
             EqualSid, GetAce, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser,
-            ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+            INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
             PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
         System::{
@@ -446,12 +447,28 @@ mod imp {
     const WRITE_RIGHTS: u32 = 0x0002   // FILE_WRITE_DATA / FILE_ADD_FILE
         | 0x0004  // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
         | 0x0010  // FILE_WRITE_EA
+        // FILE_DELETE_CHILD: deleting the database or a part file destroys work
+        // just as surely as rewriting it, and a grant of this alone carries none
+        // of the other bits. Leaving it out reported such a directory as clean.
+        | 0x0040
         | 0x0100  // FILE_WRITE_ATTRIBUTES
         | 0x0001_0000  // DELETE
         | 0x0004_0000  // WRITE_DAC
         | 0x0008_0000  // WRITE_OWNER
         | 0x1000_0000  // GENERIC_ALL
         | 0x4000_0000; // GENERIC_WRITE
+
+    /// ACE types whose layout begins with a header, a mask and a SID, and which
+    /// grant rather than deny. Type 0 is the plain allow entry; type 9 is the
+    /// callback form, whose condition Windows evaluates and which can be written
+    /// to be true for everyone.
+    pub(crate) const ALLOW_TYPES: [u8; 2] = [0, 9];
+    /// Denies and audits. Anything not in either list is unknown to this build and
+    /// is reported rather than skipped: the next type Microsoft adds must not
+    /// punch a silent hole.
+    pub(crate) const NON_GRANTING_TYPES: [u8; 5] = [1, 2, 3, 10, 11];
+    /// Placeholders that are legitimately inherit-only and name no real account.
+    const PLACEHOLDERS: [&str; 2] = ["S-1-3-0", "S-1-3-1"];
 
     /// Who, besides this account and the system and the administrators, the
     /// directory's access list lets write into it.
@@ -470,16 +487,17 @@ mod imp {
     pub fn foreign_writers(path: &std::path::Path) -> io::Result<ForeignWriters> {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
         let mut dacl: *mut ACL = ptr::null_mut();
+        let mut owner: *mut c_void = ptr::null_mut();
         let mut descriptor: *mut c_void = ptr::null_mut();
         // SAFETY: `wide` is a null-terminated path that outlives the call, and the
-        // two out-parameters are valid. On success the system allocates one
-        // descriptor which owns the ACL memory; `Local` frees it exactly once.
+        // out-parameters are valid. On success the system allocates one descriptor
+        // owning both the owner SID and the ACL; `Local` frees it exactly once.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 wide.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
@@ -490,42 +508,86 @@ mod imp {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _owned = Local(descriptor);
+        let scope = user_scope()?;
+        let trusted = [scope.identity.as_str(), "S-1-5-18", "S-1-5-32-544"];
+        let known = |sid: *mut c_void| {
+            trusted
+                .iter()
+                .any(|text| parse_sid(text).is_some_and(|known| equal(known.0, sid)))
+        };
+        let mut foreign: Vec<String> = Vec::new();
+
+        // The owner first, because it is not in the access list at all. An owner
+        // holds WRITE_DAC whatever the list says, so a stranger who pre-creates
+        // this directory, leaves a list naming only trusted accounts, and keeps
+        // ownership can re-grant themselves at any moment. Reading the list alone
+        // called that directory clean.
+        if owner.is_null() {
+            foreign.push("<no owner>".to_owned());
+        } else if !known(owner) {
+            foreign.push(sid_text(owner).unwrap_or_else(|| "<unreadable owner>".to_owned()));
+        }
+
         // A null access list is not an empty one: it grants everyone everything.
         // Reporting it as "no foreign writers" would invert the answer.
         if dacl.is_null() {
-            return Ok(ForeignWriters(vec!["S-1-1-0".to_owned()]));
+            foreign.push("S-1-1-0".to_owned());
+            return Ok(ForeignWriters(foreign));
         }
-        let scope = user_scope()?;
-        let trusted = [scope.identity.as_str(), "S-1-5-18", "S-1-5-32-544"];
         // SAFETY: `dacl` points at an ACL inside the descriptor kept alive above.
         let count = unsafe { (*dacl).AceCount };
-        let mut foreign = Vec::new();
         for index in 0..u32::from(count) {
             let mut ace: *mut c_void = ptr::null_mut();
             // SAFETY: `index` is below the count the same ACL reported.
             if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                foreign.push("<unreadable entry>".to_owned());
+                continue;
+            }
+            // SAFETY: every ACE begins with a header, whatever follows it. The
+            // header is read on its own, before anything is projected through a
+            // type the memory might not be.
+            let (kind, flags) = unsafe {
+                let header = ace.cast::<ACE_HEADER>();
+                ((*header).AceType, u32::from((*header).AceFlags))
+            };
+            // Denies and audits grant nothing. A type this build does not know is
+            // reported rather than skipped: the alternative is a new entry type
+            // quietly widening a directory we then call clean.
+            if NON_GRANTING_TYPES.contains(&kind) {
+                continue;
+            }
+            if !ALLOW_TYPES.contains(&kind) {
+                foreign.push(format!("<unknown entry type {kind}>"));
                 continue;
             }
             let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
-            // SAFETY: every ACE begins with a header, whatever its body.
-            let (kind, flags, mask) = unsafe {
-                (
-                    (*ace).Header.AceType,
-                    u32::from((*ace).Header.AceFlags),
-                    (*ace).Mask,
-                )
-            };
-            // Only plain allow entries grant anything here; a deny entry narrows
-            // and an inherit-only entry describes children, not this directory.
-            if kind != 0 || flags & INHERIT_ONLY_ACE != 0 || mask & WRITE_RIGHTS == 0 {
+            // SAFETY: both allowed types begin with header, mask and SID, and the
+            // type was checked above.
+            let mask = unsafe { (*ace).Mask };
+            if mask & WRITE_RIGHTS == 0 {
                 continue;
             }
-            // SAFETY: in an ACCESS_ALLOWED_ACE the SID begins at `SidStart`.
+            // SAFETY: in both allowed types the SID begins at `SidStart`.
             let sid = unsafe { ptr::addr_of!((*ace).SidStart).cast::<c_void>().cast_mut() };
-            if trusted
-                .iter()
-                .any(|known| parse_sid(known).is_some_and(|known| equal(known.0, sid)))
+            // An inherit-only entry does not apply to this directory -- but its
+            // children are the asset. The database and every part file are created
+            // inside it, and an inherit-only grant reaches every one of them. Only
+            // an entry that inherits to nothing is genuinely about nothing.
+            if flags & INHERIT_ONLY_ACE != 0
+                && flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) == 0
             {
+                continue;
+            }
+            // CREATOR OWNER and CREATOR GROUP are placeholders that name no
+            // account; they are replaced at creation by the real owner, which the
+            // check above already covers.
+            if PLACEHOLDERS
+                .iter()
+                .any(|text| parse_sid(text).is_some_and(|holder| equal(holder.0, sid)))
+            {
+                continue;
+            }
+            if known(sid) {
                 continue;
             }
             let text = sid_text(sid).unwrap_or_else(|| "<unreadable>".to_owned());
@@ -817,6 +879,111 @@ mod tests {
         assert!(
             foreign.sids().iter().any(|found| found == "S-1-5-11"),
             "a stranger with write access went unreported: {foreign:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every way the check used to say "clean" about a directory somebody else
+    /// could write. A security review found all four and demonstrated each one
+    /// against live Windows; this is what stops them coming back.
+    #[cfg(windows)]
+    #[test]
+    fn the_ways_this_check_used_to_fail_open() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!(
+            "fhd-failopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let sid = user_scope().unwrap().identity;
+        let mine = format!("*{sid}:(OI)(CI)F");
+
+        let icacls = |dir: &std::path::Path, arguments: &[String]| {
+            let out = Command::new("icacls")
+                .arg(dir)
+                .args(arguments)
+                .output()
+                .expect("icacls runs");
+            assert!(
+                out.status.success(),
+                "icacls {arguments:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let make = |name: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            icacls(
+                &dir,
+                &[
+                    "/inheritance:r".to_owned(),
+                    "/grant".to_owned(),
+                    mine.clone(),
+                ],
+            );
+            assert!(
+                foreign_writers(&dir).unwrap().is_empty(),
+                "the baseline for {name} is not clean"
+            );
+            dir
+        };
+
+        // 1. Delete-child only. No write bit, but every account on the machine
+        //    could delete the job database and every partial file.
+        let dir = make("delete-child");
+        icacls(
+            &dir,
+            &["/grant".to_owned(), "*S-1-5-11:(DC,RD,RA,REA,X)".to_owned()],
+        );
+        assert!(
+            !foreign_writers(&dir).unwrap().is_empty(),
+            "a grant of delete-child alone was reported clean"
+        );
+
+        // 2. Inherit-only. The directory itself grants nothing, and everything
+        //    created inside it -- which is the whole asset -- is writable.
+        let dir = make("inherit-only");
+        icacls(
+            &dir,
+            &["/grant".to_owned(), "*S-1-5-11:(OI)(CI)(IO)M".to_owned()],
+        );
+        let found = foreign_writers(&dir).unwrap();
+        assert!(
+            !found.is_empty(),
+            "an inherit-only grant to everyone was reported clean"
+        );
+
+        // 3. An entry type this build does not know. Skipping it was how a
+        //    conditional allow entry -- which Windows evaluates, and which can be
+        //    written so it is true for everyone -- granted full control while the
+        //    directory read as clean. Unknown types are reported now, so the next
+        //    type Microsoft adds cannot open a hole in silence.
+        assert!(
+            imp::ALLOW_TYPES.contains(&9),
+            "the conditional allow entry must be inspected, not skipped"
+        );
+        for unknown in 12u8..=16 {
+            assert!(
+                !imp::NON_GRANTING_TYPES.contains(&unknown) && !imp::ALLOW_TYPES.contains(&unknown),
+                "type {unknown} is classified, so this no longer proves anything"
+            );
+        }
+
+        // 4. The owner, which is not in the access list at all. Creating a
+        //    directory owned by somebody else needs a privilege a test cannot
+        //    assume, so what is asserted is the half that can be: the owner is
+        //    read, and this account is accepted as its own. The other half -- a
+        //    foreign owner being reported -- rests on the code path, and is
+        //    called out as such in the review record rather than claimed covered.
+        let dir = make("owned");
+        assert!(
+            foreign_writers(&dir).unwrap().is_empty(),
+            "the account that created a directory must be allowed to own it"
         );
 
         let _ = std::fs::remove_dir_all(&base);

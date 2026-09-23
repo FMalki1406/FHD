@@ -82,6 +82,12 @@ jobs:
       - name: Platform - an account is recognised under either spelling
         if: runner.os == 'Windows'
         run: cargo +1.98.1 test -p fhd-platform --locked either_spelling
+      - name: Platform - a stranger who may write a directory is reported
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked stranger_may_write
+      - name: Platform - a new directory is protected from what it inherits
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked until_it_is_protected
       # Each test above is named by a step, and a step that matched nothing would
       # pass in silence. This fails if the crate grows a test no step runs.
       - name: Platform - every test here is named by a step

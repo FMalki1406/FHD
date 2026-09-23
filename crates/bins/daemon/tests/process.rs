@@ -301,6 +301,90 @@ fn a_wrong_digest_keeps_the_file_unpublished_across_a_resume() {
     }
 }
 
+/// A directory holding two jobs that name one file still continues.
+///
+/// Refusing the whole batch was correct for requests an operator just typed and
+/// catastrophic for a directory being continued: one duplicated destination
+/// locked every unrelated job out of ever resuming, and the only remedy was
+/// deleting the directory and its progress. The duplicate is skipped now.
+#[test]
+fn a_duplicated_destination_does_not_lock_the_whole_directory() {
+    let state = Directory::new("process-dupe");
+    let first = content(32 * 1024);
+    let second = content(40 * 1024);
+    let third = content(24 * 1024);
+    let (port_one, _) = serve(first.clone(), 0);
+    let (port_two, _) = serve(second, 0);
+    let (port_three, _) = serve(third.clone(), 0);
+    let root = state.0.join("downloads");
+    std::fs::create_dir_all(&root).unwrap();
+    let engine_dir = state.engine().to_string_lossy().into_owned();
+    let contested = root.join("contested.bin");
+    let separate = root.join("separate.bin");
+
+    let mut resident = Resident(
+        Command::new(engine())
+            .args([
+                engine_dir.as_str(),
+                "--serve",
+                "--download-root",
+                &root.to_string_lossy(),
+                "--allow-http",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the resident starts"),
+    );
+
+    // Two links aiming at one file, plus one unrelated job that must survive.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for (port, target) in [
+        (port_one, &contested),
+        (port_two, &contested),
+        (port_three, &separate),
+    ] {
+        loop {
+            let (code, _, _) = run(
+                &[
+                    &engine_dir,
+                    "--client",
+                    "add",
+                    &target.to_string_lossy(),
+                    "--allow-http",
+                ],
+                &format!(
+                    "http://127.0.0.1:{port}/file
+"
+                ),
+            );
+            if code == Some(0) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let (code, _, _) = run(&[&engine_dir, "--client", "stop"], "");
+    assert_eq!(code, Some(0));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(resident.0.try_wait(), Ok(None)) {
+        assert!(Instant::now() < deadline, "the resident ignored shutdown");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The directory still continues. Before, this returned ENGINE-INVALID-INPUT
+    // and the unrelated job could never be resumed again.
+    let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
+    assert_eq!(
+        code,
+        Some(0),
+        "a duplicated destination locked the directory.
+stdout: {out}
+stderr: {err}"
+    );
+}
+
 /// A refused argument leaves nothing behind, in any mode.
 ///
 /// Exiting non-zero is not enough. The question is whether anything happened

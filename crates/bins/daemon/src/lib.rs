@@ -488,6 +488,25 @@ impl Engine {
             let Some(url) = reference.url() else {
                 continue;
             };
+            // Two remembered jobs may name one file. `open_many` refuses a batch
+            // that does, which is right for requests an operator just typed --
+            // but here the batch is everything the directory remembers, so
+            // refusing it would make one duplicated destination lock every other
+            // job out of being continued, with no way back except deleting the
+            // directory and its progress. The later one is left behind instead,
+            // said out loud, and the rest of the directory keeps working.
+            if requests
+                .iter()
+                .any(|earlier: &Request| earlier.destination == *path)
+            {
+                tracing::event!(
+                    target: "fhd",
+                    tracing::Level::WARN,
+                    code = "CONTINUE-DESTINATION-TAKEN",
+                    job_id = job.id().get(),
+                );
+                continue;
+            }
             requests.push(Request {
                 url: url.to_owned(),
                 destination: path.clone(),

@@ -355,10 +355,14 @@ impl Service {
             fhd_app::Principal::new(1).map_err(EngineError::Admission)?,
             digest(
                 b"FHD.request.v1\0",
+                // Identical to the one-shot path in `Engine::open_many`, and for
+                // the same reason: what to fetch and where it lands. The expected
+                // digest is deliberately absent -- it changes neither, and having
+                // it here while the other path dropped it meant the same request
+                // resolved to two jobs over IPC and one everywhere else.
                 &[
                     request.url.as_bytes(),
                     request.destination.as_bytes(),
-                    &expected.unwrap_or_default(),
                     &request.max_bytes.to_le_bytes(),
                     &[u8::from(allow_http)],
                 ],
