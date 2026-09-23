@@ -15,4 +15,9 @@ tokio = { version = "=1.51.4", features = ["rt", "sync", "time"] }
 zeroize = "=1.9.0"
 
 [dev-dependencies]
+# Probe only: shows whether a typed rustls error survives reqwest's error chain,
+# so the decision to keep classifying TLS failures by text is made against what
+# the libraries expose rather than against a guess. Already in the lock via
+# reqwest, so this adds no new source.
+rustls = { version = "=0.23.45", default-features = false }
 tokio = { version = "=1.51.4", features = ["macros", "rt-multi-thread", "time"] }

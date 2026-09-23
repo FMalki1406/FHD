@@ -92,7 +92,7 @@ jobs:
             | sed -n 's/^tests::\(.*\): test$/\1/p' | sort)
           covered=$(for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
-              either_spelling; do
+              either_spelling stranger_may_write until_it_is_protected; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))

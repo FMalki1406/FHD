@@ -323,6 +323,7 @@ dependencies = [
  "fhd-domain",
  "getrandom 0.4.3",
  "reqwest",
+ "rustls",
  "sha2",
  "tokio",
  "zeroize",

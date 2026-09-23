@@ -273,27 +273,86 @@ impl HttpTransport {
     }
 }
 
-/// A refused certificate, TLS handshake or name lookup needs a person, not a retry.
-/// Heuristic over the error chain: reqwest does not expose these as typed variants.
-fn connection_error(error: reqwest::Error) -> TransportError {
-    let mut text = String::new();
-    let mut source: Option<&dyn std::error::Error> = Some(&error);
-    while let Some(current) = source {
-        text.push_str(&current.to_string().to_ascii_lowercase());
-        text.push(' ');
-        source = current.source();
+/// What a connection failure was, as far as the libraries let us tell.
+///
+/// **Measured, not assumed.** Against a real HTTPS server with an untrusted
+/// certificate, the deepest error reqwest hands us is an `io::Error(Other)` whose
+/// text is `invalid peer certificate: UnknownIssuer`, and
+/// `downcast_ref::<rustls::Error>()` is `None` at every level, including behind
+/// `io::Error::get_ref()`. So **no typed TLS error survives the chain**; the only
+/// thing available is text. That is a limit of the dependency, recorded here
+/// rather than worked around.
+///
+/// The text is not arbitrary, though: it is rustls's own `Display`, and it is
+/// `invalid peer certificate: ` followed by the `CertificateError` variant name.
+/// Reading that prefix is much narrower than searching for the word
+/// "certificate" anywhere in the chain, which is what this did before -- a server
+/// message mentioning a certificate could reach that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The peer's certificate was rejected: unknown issuer, expired, wrong name,
+    /// malformed, or revoked.
+    Certificate,
+    /// The certificate was not rejected -- we could not establish whether it had
+    /// been revoked. A different fact, and a different conversation with the
+    /// operator, though the answer is the same today: stop.
+    RevocationUnknown,
+    /// TLS failed for some other reason, or a name did not resolve.
+    Other,
+}
+
+/// Which `CertificateError` variants mean "we could not check", as opposed to
+/// "we checked and it is bad". Compared against rustls 0.23's `Display` output.
+const REVOCATION_UNKNOWN: [&str; 2] = ["UnknownRevocationStatus", "ExpiredRevocationList"];
+
+/// Classifies the deepest line of an error chain. Pure, so both answers can be
+/// tested without a network.
+fn refusal(text: &str) -> Option<Refusal> {
+    if let Some(variant) = text.split("invalid peer certificate: ").nth(1) {
+        let variant = variant.split(|c: char| !c.is_ascii_alphanumeric()).next()?;
+        return Some(if REVOCATION_UNKNOWN.contains(&variant) {
+            Refusal::RevocationUnknown
+        } else {
+            Refusal::Certificate
+        });
     }
-    let unactionable = [
-        "certificate",
+    let lowered = text.to_ascii_lowercase();
+    // Kept deliberately broad, and deliberately on the stopping side: anything
+    // that looks like TLS or a failed lookup needs a person. A certificate
+    // failure must never fall through to a retry, because retrying is how a
+    // refusal quietly becomes a bypass.
+    [
         "tls",
         "handshake",
+        "certificate",
         "dns error",
         "lookup address",
-    ];
-    if unactionable.iter().any(|needle| text.contains(needle)) {
-        return TransportError::UserAction(StopReason::Policy);
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    .then_some(Refusal::Other)
+}
+
+fn connection_error(error: reqwest::Error) -> TransportError {
+    let mut found = None;
+    let mut source: Option<&dyn std::error::Error> = Some(&error);
+    while let Some(current) = source {
+        let line = current.to_string();
+        // The deepest match wins: rustls's own words sit at the bottom of the
+        // chain, under reqwest's generic "client error (Connect)".
+        if let Some(refusal) = refusal(&line) {
+            found = Some(refusal);
+        }
+        source = current.source();
     }
-    TransportError::Transient
+    match found {
+        // Every one of these stops the job. The distinction is what the operator
+        // is told, not whether the engine tries again.
+        Some(Refusal::Certificate | Refusal::RevocationUnknown | Refusal::Other) => {
+            TransportError::UserAction(StopReason::Policy)
+        }
+        None => TransportError::Transient,
+    }
 }
 
 fn single(headers: &HeaderMap, name: HeaderName) -> Option<&[u8]> {
@@ -589,5 +648,92 @@ impl ByteStream for HttpStream {
             self.remaining -= take as u64;
             Ok(take)
         })
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{refusal, Refusal};
+
+    /// The words rustls actually produces, taken from a measured run against a
+    /// real HTTPS server and from its `CertificateError` variants. If a future
+    /// version changes this wording, these fail rather than silently turning a
+    /// refused certificate into a retry.
+    #[test]
+    fn a_rejected_certificate_is_told_apart_from_an_unknown_revocation_status() {
+        for bad in [
+            "invalid peer certificate: UnknownIssuer",
+            "invalid peer certificate: Expired",
+            "invalid peer certificate: NotValidYet",
+            "invalid peer certificate: BadEncoding",
+            "invalid peer certificate: Revoked",
+            "invalid peer certificate: NotValidForName",
+        ] {
+            assert_eq!(
+                refusal(bad),
+                Some(Refusal::Certificate),
+                "{bad} was not read as a rejected certificate"
+            );
+        }
+        // Not rejected -- unknown. We checked and could not find out.
+        for unknown in [
+            "invalid peer certificate: UnknownRevocationStatus",
+            "invalid peer certificate: ExpiredRevocationList",
+        ] {
+            assert_eq!(
+                refusal(unknown),
+                Some(Refusal::RevocationUnknown),
+                "{unknown} was read as a rejection, which it is not"
+            );
+        }
+    }
+
+    /// Nothing about a certificate may be read as ordinary, because the caller
+    /// retries ordinary failures and a retried refusal is a refusal bypassed.
+    #[test]
+    fn no_certificate_condition_is_ever_ordinary() {
+        for line in [
+            "invalid peer certificate: UnknownIssuer",
+            "invalid peer certificate: UnknownRevocationStatus",
+            "invalid peer certificate: SomethingRustlsAddedLater",
+            "received fatal alert: HandshakeFailure",
+            "dns error: failed to lookup address information",
+        ] {
+            assert!(
+                refusal(line).is_some(),
+                "{line} would have been retried instead of stopping"
+            );
+        }
+    }
+
+    /// And an ordinary failure stays ordinary: a reset connection is exactly what
+    /// retrying exists for, and treating it as policy would strand the job.
+    #[test]
+    fn a_reset_connection_is_still_worth_retrying() {
+        for line in [
+            "connection reset by peer",
+            "operation timed out",
+            "error sending request for url (https://example.test/file)",
+            "An established connection was aborted by the software in your host machine.",
+        ] {
+            assert_eq!(refusal(line), None, "{line} was treated as unactionable");
+        }
+    }
+
+    /// A server may say the word "certificate" in its own message; that is not a
+    /// TLS failure. The structured prefix is what carries the meaning, and this
+    /// is the case the old substring search got wrong.
+    #[test]
+    fn a_servers_own_words_are_not_a_tls_verdict() {
+        assert_eq!(
+            refusal("invalid peer certificate: UnknownIssuer"),
+            Some(Refusal::Certificate)
+        );
+        // Text that merely contains the word still stops the job -- deliberately
+        // conservative -- but it is not reported as a certificate verdict.
+        assert_eq!(
+            refusal("the server said: your certificate of completion is ready"),
+            Some(Refusal::Other)
+        );
     }
 }

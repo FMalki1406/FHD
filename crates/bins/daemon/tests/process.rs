@@ -203,6 +203,169 @@ fn adding_a_checksum_later_conflicts_instead_of_forking_the_job() {
     );
 }
 
+/// A conflicting checksum on one job does not touch another job in the same
+/// directory, and the directory still continues.
+///
+/// The regression this guards against was not that one request failed -- it was
+/// that the whole directory became unusable, so every unrelated job in it lost
+/// its progress with no way to get it back.
+#[test]
+fn a_checksum_conflict_leaves_other_jobs_and_resume_intact() {
+    let state = Directory::new("process-neighbour");
+    let first = content(32 * 1024);
+    let second = content(48 * 1024);
+    let (port_one, _) = serve(first.clone(), 0);
+    let (port_two, _) = serve(second.clone(), 0);
+    let engine_dir = state.engine().to_string_lossy().into_owned();
+    let one = state.0.join("one.bin");
+    let two = state.0.join("two.bin");
+
+    // Two independent jobs, each admitted and published on its own run.
+    for (port, target) in [(port_one, &one), (port_two, &two)] {
+        let (code, out, err) = run(
+            &[&engine_dir, &target.to_string_lossy(), "--allow-http"],
+            &format!("http://127.0.0.1:{port}/file\n"),
+        );
+        assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    }
+    assert_eq!(std::fs::read(&one).unwrap(), first);
+    assert_eq!(std::fs::read(&two).unwrap(), second);
+
+    // The first request comes back with a checksum, which conflicts.
+    let (code, _, err) = run(
+        &[
+            &engine_dir,
+            &one.to_string_lossy(),
+            "--allow-http",
+            "--sha256",
+            &hex(&expected_digest(&first)),
+        ],
+        &format!("http://127.0.0.1:{port_one}/file\n"),
+    );
+    assert_ne!(code, Some(0));
+    assert!(err.contains("COMMAND-CONFLICT"), "stderr: {err}");
+
+    // The neighbour is untouched and the directory still continues: both jobs
+    // are still there and both files still hold what they held.
+    let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
+    assert_eq!(
+        code,
+        Some(0),
+        "the conflict broke resume.\nstdout: {out}\nstderr: {err}"
+    );
+    assert_eq!(out.lines().count(), 2, "a job went missing: {out}");
+    assert_eq!(std::fs::read(&one).unwrap(), first);
+    assert_eq!(std::fs::read(&two).unwrap(), second);
+}
+
+/// A wrong checksum stops the file being published, on the resume path too.
+///
+/// Exiting non-zero is the weaker half. What matters is that the destination is
+/// never created -- and that running again does not quietly publish it either,
+/// which is the path an operator takes when they think a failure was transient.
+#[test]
+fn a_wrong_digest_keeps_the_file_unpublished_across_a_resume() {
+    let state = Directory::new("process-nopublish");
+    let body = content(64 * 1024);
+    let (port, _) = serve(body, 0);
+    let destination = state.0.join("never.bin");
+    let engine_dir = state.engine().to_string_lossy().into_owned();
+    let target = destination.to_string_lossy().into_owned();
+    let line = format!("http://127.0.0.1:{port}/file\n");
+    let wrong = hex(&[0x11; 32]);
+
+    let (code, _, _) = run(
+        &[&engine_dir, &target, "--allow-http", "--sha256", &wrong],
+        &line,
+    );
+    assert_ne!(code, Some(0));
+    assert!(!destination.exists(), "published despite a wrong digest");
+
+    // Running again, and then explicitly releasing the stopped job, must both
+    // still refuse to publish.
+    for extra in [vec![], vec!["--resume"]] {
+        let mut arguments = vec![
+            engine_dir.as_str(),
+            target.as_str(),
+            "--allow-http",
+            "--sha256",
+            wrong.as_str(),
+        ];
+        arguments.extend(extra);
+        let (code, out, err) = run(&arguments, &line);
+        assert_ne!(code, Some(0), "stdout: {out}\nstderr: {err}");
+        assert!(
+            !destination.exists(),
+            "a rerun published a file whose digest never matched"
+        );
+    }
+}
+
+/// A refused argument leaves nothing behind, in any mode.
+///
+/// Exiting non-zero is not enough. The question is whether anything happened
+/// first: a state directory created, a job admitted, a link written to the
+/// database, or the link printed where it would be read later. A signed URL is a
+/// credential, so "we refused it, but we had already stored it" is not a refusal.
+#[test]
+fn a_refused_argument_has_no_side_effect_in_any_mode() {
+    let secret = "http://127.0.0.1:1/signed?token=SUPERSECRETVALUE";
+    let cases: Vec<Vec<String>> = vec![
+        vec!["<dest>".into(), "--frobnicate".into()],
+        vec![
+            "<dest>".into(),
+            "--allow-http".into(),
+            "--frobnicate".into(),
+        ],
+        vec!["--continue".into(), "--sha256".into(), hex(&[0x22; 32])],
+        vec!["--serve".into(), "--sha256".into(), hex(&[0x22; 32])],
+        vec!["--serve".into(), "--frobnicate".into()],
+        vec!["--continue".into(), "--frobnicate".into()],
+        vec![
+            "--client".into(),
+            "add".into(),
+            "<dest>".into(),
+            "--sensitve".into(),
+        ],
+        vec![
+            "--client".into(),
+            "add".into(),
+            "<dest>".into(),
+            "--sha256".into(),
+            hex(&[0x22; 32]),
+        ],
+    ];
+    for case in cases {
+        let state = Directory::new("process-noeffect");
+        let engine_dir = state.engine();
+        let destination = state.0.join("never.bin");
+        let mut arguments = vec![engine_dir.to_string_lossy().into_owned()];
+        arguments.extend(case.iter().map(|argument| {
+            if argument == "<dest>" {
+                destination.to_string_lossy().into_owned()
+            } else {
+                argument.clone()
+            }
+        }));
+        let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let (code, out, err) = run(&borrowed, &format!("{secret}\n"));
+
+        assert_ne!(code, Some(0), "{case:?} was accepted.\nstderr: {err}");
+        assert!(!destination.exists(), "{case:?} left a file behind");
+        // Nothing was set up: no database, no parts, no directory at all. The
+        // refusal has to come before the engine touches the disk.
+        assert!(
+            !engine_dir.exists(),
+            "{case:?} created the state directory before refusing it"
+        );
+        // And the link never reaches an operator's terminal or a log scraper.
+        assert!(
+            !out.contains("SUPERSECRETVALUE") && !err.contains("SUPERSECRETVALUE"),
+            "{case:?} printed the link.\nstdout: {out}\nstderr: {err}"
+        );
+    }
+}
+
 /// A flag nothing on that path reads is refused, not swallowed.
 ///
 /// `--continue` is every job the directory remembers and `--serve` is whatever a
@@ -386,4 +549,96 @@ impl Drop for Resident {
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Two jobs may hold the same destination, and the second one to finish is
+/// refused rather than overwriting the first.
+///
+/// `Service::add` means to stop this -- "two jobs aiming at one name would race
+/// for it" -- but `claimed_by_other` only fires when a *different* reference maps
+/// to the path, and the reference is derived from the path, so two requests for
+/// one destination share it and the check never triggers. This measures what that
+/// actually costs instead of reasoning about it: the second job is admitted, runs,
+/// and is stopped at publication because the name is taken.
+#[test]
+fn two_jobs_may_share_a_destination_and_the_file_survives_it() {
+    let state = Directory::new("process-collide");
+    let first = content(32 * 1024);
+    let second = content(48 * 1024);
+    let (port_one, _) = serve(first.clone(), 0);
+    let (port_two, _) = serve(second.clone(), 0);
+    let root = state.0.join("downloads");
+    std::fs::create_dir_all(&root).unwrap();
+    let engine_dir = state.engine().to_string_lossy().into_owned();
+    let target = root.join("contested.bin");
+
+    let mut resident = Resident(
+        Command::new(engine())
+            .args([
+                engine_dir.as_str(),
+                "--serve",
+                "--download-root",
+                &root.to_string_lossy(),
+                "--allow-http",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the resident starts"),
+    );
+
+    // Two different links, one destination. Both are accepted today.
+    let mut accepted = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for port in [port_one, port_two] {
+        loop {
+            let (code, _, _) = run(
+                &[
+                    &engine_dir,
+                    "--client",
+                    "add",
+                    &target.to_string_lossy(),
+                    "--allow-http",
+                ],
+                &format!("http://127.0.0.1:{port}/file\n"),
+            );
+            if code == Some(0) {
+                accepted += 1;
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    assert_eq!(
+        accepted, 2,
+        "recorded behaviour: both are accepted. If this ever fails because the \
+         second is refused, the gap is closed and this test should say so."
+    );
+
+    // Whatever the race does, the published file must be one of the two bodies
+    // whole -- never a mixture, and never truncated.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !target.exists() {
+        assert!(Instant::now() < deadline, "neither job published");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let published = std::fs::read(&target).unwrap();
+    assert!(
+        published == first || published == second,
+        "the destination holds neither body whole: {} bytes",
+        published.len()
+    );
+
+    let (code, _, _) = run(&[&engine_dir, "--client", "stop"], "");
+    assert_eq!(code, Some(0));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(resident.0.try_wait(), Ok(None)) {
+        assert!(Instant::now() < deadline, "the resident ignored shutdown");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
