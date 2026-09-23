@@ -170,11 +170,8 @@ impl Coordinator {
     fn part_directory(&self, job: &Job) -> PathBuf {
         self.ports
             .destinations
-            .resolve(job.spec().destination())
-            .ok()
-            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| self.directory.clone())
+            .parts_for(job.spec().destination())
+            .unwrap_or_else(|_| self.directory.clone())
     }
 
     /// Reports every origin outcome to this governor. Without one the coordinator

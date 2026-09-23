@@ -50,6 +50,10 @@ impl Destinations for Registry {
             .cloned()
             .ok_or(AppError::InvalidInput)
     }
+
+    fn parts_for(&self, destination: DestinationRef) -> Result<PathBuf, AppError> {
+        crate::private_parts_directory(&self.resolve(destination)?)
+    }
 }
 
 /// Everything a request needs to become a job, and the channel that carries it to

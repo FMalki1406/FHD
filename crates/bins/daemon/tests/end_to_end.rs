@@ -531,3 +531,76 @@ async fn a_sensitive_link_is_not_remembered_so_it_cannot_be_continued() {
         "a sensitive link must not survive the run that used it"
     );
 }
+
+/// What another account is left able to do to a part file, measured on a real
+/// download rather than argued from the flags the code opens files with.
+///
+/// Parts moved next to their destination so a download could land on a disk the
+/// engine does not live on. Inside the engine's directory they were covered by
+/// a list it had set; a download folder belongs to the user, and on a data
+/// volume here it grants `Authenticated Users` write -- so the move took a
+/// protection away and this is what puts it back.
+///
+/// The folder is given that grant deliberately, as the worst ordinary case, and
+/// the result is read back with `icacls`, which knows nothing about our code.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_file_is_not_readable_by_the_accounts_the_download_folder_allows() {
+    let body = content(2 * 1024 * 1024 + 3);
+    let (port, _served) = serve(body.clone(), 0);
+    let state = Directory::new("parts-acl-state");
+    let downloads = Directory::new("parts-acl-downloads");
+    let folder = downloads.0.join("Downloads");
+    std::fs::create_dir_all(&folder).expect("the download folder is created");
+
+    let granted = std::process::Command::new("icacls")
+        .arg(&folder)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)M"])
+        .output()
+        .expect("icacls runs");
+    assert!(
+        granted.status.success(),
+        "this test needs icacls to grant Modify to S-1-5-11; without it the \
+         protection is uncovered rather than covered: {}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+
+    let destination = folder.join("result.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+    let mut settings = config(&state, destination.clone(), 4);
+    settings.expected_sha256 = Some(expected_digest(&body));
+    let engine = Engine::open(settings, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert_eq!(
+        engine.run(receiver).await.unwrap(),
+        SessionEnd::Published(destination.clone()),
+        "reason: {:?}",
+        engine.reason().await.unwrap()
+    );
+
+    let parts = folder.join(".fhd-parts");
+    assert!(parts.is_dir(), "no private directory was made for the part");
+    let listed = std::process::Command::new("icacls")
+        .arg(&parts)
+        .output()
+        .expect("icacls runs");
+    let acl = String::from_utf8_lossy(&listed.stdout).to_string();
+
+    assert!(
+        !acl.contains("Authenticated Users") && !acl.contains("S-1-5-11"),
+        "the grant on the download folder reached the part directory:\n{acl}"
+    );
+    // Inheritance is closed, so a grant added to the folder later cannot arrive
+    // either. `icacls` marks inherited entries with a leading (I).
+    assert!(
+        !acl.contains("(I)"),
+        "the part directory still inherits from the download folder:\n{acl}"
+    );
+    // And this account can still use it, or the download above would not have
+    // finished -- asserted anyway so a refusal-of-everything cannot pass.
+    assert!(
+        acl.contains("(F)"),
+        "the part directory grants this account nothing:\n{acl}"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
+}

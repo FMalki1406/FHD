@@ -45,12 +45,11 @@ pub enum EngineError {
     DestinationRefused,
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
-    /// Publication renames within a volume; this destination is on another one.
     /// The job is waiting for a decision; run again with Intent::Resume.
     NeedsDecision(Option<StopReason>),
     /// The state directory's own access list lets accounts other than this one,
     /// the system and the administrators write into it. It holds the job record
-    /// and every partial file, so the engine will not adopt it. The count is how
+    /// and the receipts, so the engine will not adopt it. The count is how
     /// many such principals were found; the SIDs stay out of the code, which is
     /// carried across layers and logged.
     ExposedStateDirectory(u32),
@@ -93,6 +92,46 @@ impl Destinations for FixedDestinations {
             .cloned()
             .ok_or(AppError::InvalidInput)
     }
+
+    fn parts_for(&self, destination: DestinationRef) -> Result<PathBuf, AppError> {
+        private_parts_directory(&self.resolve(destination)?)
+    }
+}
+
+/// The private directory a destination's part file is written in.
+///
+/// Parts moved next to their destination so that publication stays a link
+/// within one directory, which is what lets a download land on a disk the
+/// engine does not live on. Inside the engine's own directory they were covered
+/// by an access list it had set; the user's download folder is not ours, and on
+/// a data volume here it grants `Authenticated Users` write. Writing the part
+/// straight into it would hand every account on the machine the bytes of a
+/// download in progress.
+///
+/// So the part goes in a directory beside the destination that this engine
+/// creates with its own list -- this account, the system, the administrators,
+/// inheritance closed -- and the part inherits that. Same volume as the
+/// destination, so the link is unaffected.
+///
+/// **What this does not reach.** An account holding `FILE_DELETE_CHILD` on the
+/// download folder can still rename or remove this directory, because that
+/// right lives on the parent and no list we write on a child takes it away.
+/// That destroys a download in progress. It does not substitute one: the whole
+/// file is verified against its digest before it is published, so bytes that
+/// are not ours never become the user's file. The ceiling here is the folder
+/// the user chose, and we do not raise it.
+pub(crate) fn private_parts_directory(destination: &Path) -> Result<PathBuf, AppError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(AppError::InvalidInput)?;
+    let directory = parent.join(".fhd-parts");
+    fhd_platform::create_protected_directory(&directory).map_err(|_| AppError::InvalidInput)?;
+    // Applied whether or not we made it this time: a directory that survived an
+    // earlier run, or that somebody created first, is not assumed to carry the
+    // list we would have given it.
+    fhd_platform::protect_new_directory(&directory).map_err(|_| AppError::InvalidInput)?;
+    Ok(directory)
 }
 
 /// This build accepts requests only from the local operator.
@@ -119,7 +158,10 @@ pub enum Intent {
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Application-owned directory for the database and the part files.
+    /// Application-owned directory for the job record, the receipts and the
+    /// engine's own bookkeeping. Part files no longer live here: they go in a
+    /// private directory beside each destination, so publication stays a link
+    /// within one directory and the destination may be on another disk.
     pub state_directory: PathBuf,
     pub destination: PathBuf,
     /// Connections one job may use.
