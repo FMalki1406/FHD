@@ -9,6 +9,7 @@ fhd-app = { path = "../../application" }
 fhd-domain = { path = "../../domain" }
 fhd-http = { path = "../../adapters/http" }
 fhd-persistence = { path = "../../adapters/persistence" }
+fhd-platform = { path = "../../adapters/platform" }
 fhd-runtime = { path = "../../runtime" }
 fhd-ipc = { path = "../../adapters/ipc" }
 fhd-protocol = { path = "../../protocol" }

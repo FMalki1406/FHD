@@ -119,6 +119,14 @@ fn parse() -> Result<Invocation, &'static str> {
             _ => return Err(usage()),
         }
     }
+    // A checksum belongs to one request the operator named. `--continue` is every
+    // job the directory remembers and `--serve` is whatever a client asks for
+    // later, so neither has a request to attach it to -- and neither reads the
+    // field. Accepting it there would be the same silent drop that let `--sha256`
+    // be parsed, validated and then ignored on the one-shot path.
+    if (cont || serve) && config.expected_sha256.is_some() {
+        return Err("--sha256 belongs to a single request");
+    }
     Ok(Invocation {
         config,
         sensitive,
@@ -140,11 +148,26 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
                 },
                 None => fail("ENGINE-INVALID-INPUT"),
             };
-            let flags: Vec<String> = args.collect();
-            let sensitive = flags.iter().any(|argument| argument == "--sensitive");
-            // A client may ask for cleartext; the engine still decides whether it
-            // is allowed, so asking is not the same as getting it.
-            let allow_http = flags.iter().any(|argument| argument == "--allow-http");
+            // Refused rather than ignored, exactly as the engine's own parser
+            // does. Swallowing the rest meant a one-character typo in
+            // `--sensitive` wrote the link to disk in cleartext and still
+            // reported success -- the flag exists precisely to keep a signed URL
+            // off the disk, and the operator had no way to tell it had not
+            // applied.
+            let mut sensitive = false;
+            let mut allow_http = false;
+            for argument in args {
+                match argument.as_str() {
+                    "--sensitive" => sensitive = true,
+                    // A client may ask for cleartext; the engine still decides
+                    // whether it is allowed, so asking is not the same as getting.
+                    "--allow-http" => allow_http = true,
+                    _ => {
+                        eprintln!("{}", usage());
+                        std::process::exit(2);
+                    }
+                }
+            }
             // The link comes on standard input, never as an argument: arguments
             // are visible to every process on the machine.
             let Ok(url) = read_url(std::io::stdin()) else {
@@ -284,8 +307,16 @@ async fn main() {
     // bytes against its own record, published the file and exited zero while the
     // digest the operator gave it was never compared to anything.
     if let Some(expected) = config.expected_sha256 {
-        if let Some(request) = requests.first_mut() {
-            request.expected_sha256 = Some(expected);
+        // Total on purpose: `if let ... {}` with no else would re-encode "a digest
+        // with nowhere to go is discarded quietly", which is the defect this
+        // exists to close. `read_requests` cannot return an empty list today, and
+        // this stays correct if that ever changes.
+        match requests.first_mut() {
+            Some(request) => request.expected_sha256 = Some(expected),
+            None => {
+                eprintln!("ENGINE-INVALID-INPUT");
+                std::process::exit(2);
+            }
         }
     }
     let several = requests.len() > 1;

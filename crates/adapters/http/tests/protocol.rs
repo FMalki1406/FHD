@@ -589,3 +589,78 @@ async fn a_reference_is_bound_once_and_can_be_forgotten() {
     transport.unbind(source());
     transport.bind(source(), binding()).unwrap();
 }
+
+/// What a TLS failure actually looks like by the time it reaches us.
+///
+/// The classifier reads the error text, which decides an actionable question --
+/// a rejected certificate needs a person; a dropped connection deserves a retry
+/// -- from a string that belongs to another crate. This does not assert the
+/// classification; it records the SHAPE of the chain, so the decision to keep
+/// matching text or to stop is made against what the libraries expose rather than
+/// against a guess. Run it deliberately and read the output.
+#[tokio::test]
+#[ignore = "probe: prints the error chain a TLS failure produces"]
+async fn what_a_tls_failure_exposes() {
+    use std::io::Write;
+    // A listener that completes the TCP handshake and then sends bytes that are
+    // not TLS. No certificate is needed to make rustls reject a connection, and
+    // no certificate can be minted offline here.
+    // A real HTTPS server with an untrusted certificate when one is given
+    // (FHD_TLS_PORT), otherwise a listener that answers a TLS hello with bytes
+    // that are not TLS. The two failures are different and both are worth seeing.
+    let port = match std::env::var("FHD_TLS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        Some(port) => port,
+        None => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.write_all(b"this is not a TLS record\r\n\r\n");
+                    let _ = stream.flush();
+                }
+            });
+            port
+        }
+    };
+
+    let client = reqwest::Client::builder().build().unwrap();
+    let error = client
+        .get(format!("https://127.0.0.1:{port}/file"))
+        .send()
+        .await
+        .expect_err("a plaintext answer to a TLS hello must fail");
+
+    println!("--- reqwest::Error ---");
+    println!(
+        "  is_connect={} is_request={}",
+        error.is_connect(),
+        error.is_request()
+    );
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut depth = 0;
+    while let Some(current) = source {
+        let rustls = current.downcast_ref::<rustls::Error>();
+        let io = current.downcast_ref::<std::io::Error>();
+        println!("  [{depth}] {current}");
+        println!(
+            "        rustls::Error={:?}  io::Error={:?}",
+            rustls.map(|e| format!("{e:?}")),
+            io.map(|e| e.kind())
+        );
+        // An io::Error often carries the real cause behind get_ref rather than
+        // behind source, and that is where a typed TLS error tends to hide.
+        if let Some(inner) = io.and_then(|e| e.get_ref()) {
+            println!(
+                "        io.get_ref() -> {inner}  rustls::Error={:?}",
+                inner
+                    .downcast_ref::<rustls::Error>()
+                    .map(|e| format!("{e:?}"))
+            );
+        }
+        source = current.source();
+        depth += 1;
+    }
+}

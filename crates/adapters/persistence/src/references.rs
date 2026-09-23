@@ -29,11 +29,18 @@ impl SqliteRepository {
             let destination_id = stored_id(destination.get());
             let path = path.to_str().ok_or(PersistenceError::Corrupt)?.to_owned();
             let transaction = inner.db.transaction()?;
-            // Recording the same request twice is one row: a rerun is not a change.
+            // Recording the same request twice is one row: a rerun is not a
+            // change. But a row already marked sensitive keeps its link off the
+            // disk: `WHERE sensitive = 0` means a later run that forgets the flag
+            // cannot write the credential this one deliberately withheld. Marking
+            // a link sensitive is one-way for the life of the row, because the
+            // alternative is a signed URL landing in a plain database because
+            // somebody mistyped a flag.
             transaction.execute(
                 "INSERT INTO sources(source_id,url,allow_http,sensitive) VALUES(?1,?2,?3,?4)
                  ON CONFLICT(source_id) DO UPDATE SET url=excluded.url,
-                 allow_http=excluded.allow_http, sensitive=excluded.sensitive",
+                 allow_http=excluded.allow_http, sensitive=excluded.sensitive
+                 WHERE sensitive = 0",
                 rusqlite::params![
                     source_id,
                     reference.url(),

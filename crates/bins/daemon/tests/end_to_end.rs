@@ -2,6 +2,7 @@
 //! real part files. No fakes anywhere in this path.
 mod harness;
 
+use fhd_app::AppError;
 use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request};
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
@@ -65,17 +66,31 @@ async fn downloads_verifies_and_publishes_over_real_adapters() {
     );
     drop(engine);
 
-    // A changed request is a different request: its own job, not a replay and not a
-    // conflict. This one asks for a digest the file does not have.
+    // The same URL and the same destination, asking for a digest the file does not
+    // have, is a conflict -- not a second job.
+    //
+    // This used to open its own job, because the expected digest was folded into
+    // the idempotency receipt. That made two jobs aim at one name, which
+    // `open_many` then refuses outright, so a directory in that state could never
+    // be continued again and every other job in it was lost with it. The digest is
+    // out of the receipt key now: it changes neither what is fetched nor where it
+    // lands, so a changed one meets `Receipt::replay` and is refused where the
+    // operator can see it.
     let mut different = config(&state, destination.clone(), 4);
     different.expected_sha256 = Some([9; 32]);
+    // Admission happens when the engine runs, not when it opens, so the conflict
+    // surfaces there.
     let engine = Engine::open(different, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Settled(JobState::NeedsAction)
+    let outcome = engine.run(receiver).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(EngineError::Admission(AppError::IdempotencyConflict))
+        ),
+        "a changed digest on the same request must conflict, not fork the job: {outcome:?}"
     );
-    assert_eq!(engine.reason().await.unwrap(), Some(StopReason::Integrity));
+    drop(engine);
     // The file published by the first request is untouched.
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }

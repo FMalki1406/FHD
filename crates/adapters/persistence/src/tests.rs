@@ -767,6 +767,52 @@ mod transfer_state {
     }
 }
 
+/// A link marked sensitive stays off the disk even if a later run forgets the
+/// flag. Without this, one mistyped character in `--sensitive` overwrote the row
+/// with the signed URL in cleartext, and the operator was told nothing.
+#[tokio::test]
+async fn a_sensitive_link_cannot_be_downgraded_by_a_later_run() {
+    let directory = Directory::new();
+    let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+        .await
+        .unwrap();
+    let source = fhd_domain::SourceRef::new(77).unwrap();
+    let destination = fhd_domain::DestinationRef::new(77).unwrap();
+    let path = directory.0.join("file.bin");
+    let store: &dyn fhd_app::ReferenceStore = &repo;
+
+    store
+        .record(
+            source,
+            fhd_app::SourceReference::sensitive(true),
+            destination,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+    // The same source, now with the link in hand and the flag forgotten.
+    store
+        .record(
+            source,
+            fhd_app::SourceReference::new("https://example.test/signed?token=SECRET".into(), true)
+                .unwrap(),
+            destination,
+            path,
+        )
+        .await
+        .unwrap();
+
+    let sources = store.sources().await.unwrap();
+    let (_, reference) = sources
+        .iter()
+        .find(|(reference, _)| *reference == source)
+        .expect("the source is still recorded");
+    assert!(
+        reference.is_sensitive() && reference.url().is_none(),
+        "the sensitive link was overwritten with a credential"
+    );
+}
+
 #[tokio::test]
 async fn references_round_trip_and_a_sensitive_link_never_reaches_the_disk() {
     let directory = Directory::new();

@@ -82,6 +82,12 @@ jobs:
       - name: Platform - an account is recognised under either spelling
         if: runner.os == 'Windows'
         run: cargo +1.98.1 test -p fhd-platform --locked either_spelling
+      - name: Platform - a stranger who may write a directory is reported
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked stranger_may_write
+      - name: Platform - a new directory is protected from what it inherits
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked until_it_is_protected
       # Each test above is named by a step, and a step that matched nothing would
       # pass in silence. This fails if the crate grows a test no step runs.
       - name: Platform - every test here is named by a step
@@ -92,7 +98,7 @@ jobs:
             | sed -n 's/^tests::\(.*\): test$/\1/p' | sort)
           covered=$(for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
-              either_spelling; do
+              either_spelling stranger_may_write until_it_is_protected; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))
@@ -107,8 +113,11 @@ jobs:
         run: cargo +1.98.1 test -p fhd-http --locked
       - name: Test runtime
         run: cargo +1.98.1 test -p fhd-runtime --locked
+      # Named separately, and NOT overlapping: every file under tests/ is an
+      # auto-discovered target, so an unqualified `test -p fhd-daemon` would run
+      # the process suite as well and it would cost its wall time twice.
       - name: Test engine end to end
-        run: cargo +1.98.1 test -p fhd-daemon --locked
+        run: cargo +1.98.1 test -p fhd-daemon --locked --lib --test end_to_end --test resident
       # The library suites never start the program. Argument parsing, the
       # one-shot/serve/client dispatch and the control surface between two real
       # processes are only covered here.
