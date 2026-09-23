@@ -149,10 +149,16 @@ mod imp {
     /// below medium integrity may open it at all -- which is what keeps a
     /// sandboxed process of the same account out (§3.1, §16.1).
     fn owner_only_descriptor(sid: &str) -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
-        // D: the access control list. A: allow, FA: full access.
-        // S: the mandatory label. ML: medium integrity, NR|NW|NX: no read, write
-        // or execute up, so a lower-integrity process cannot reach the pipe.
-        let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)S:(ML;;NRNWNX;;;ME)");
+        // O: the owner, stated rather than left to the token's default. An
+        // elevated process on Windows stamps objects with the Administrators
+        // group as owner, and the client's check compares against the user, so
+        // leaving it implicit would make that check fail on exactly the machines
+        // where the engine runs with more rights, not fewer.
+        // D: the access control list. A: allow, FA: full access, P: protected,
+        // so nothing is inherited into it.
+        // S: the mandatory label. ML at medium, NR|NW|NX: no read, write or
+        // execute up, so a lower-integrity process cannot reach the pipe.
+        let sddl = format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)S:(ML;;NRNWNX;;;ME)");
         let wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
             .encode_wide()
             .chain(once(0))
@@ -274,7 +280,9 @@ mod imp {
         let owner_sid = String::from_utf16_lossy(slice);
         drop(owned_text);
         if owner_sid != user_scope()?.identity {
-            // Someone else's pipe wearing our name: say nothing to it.
+            // Someone else's pipe wearing our name: say nothing to it. Note this
+            // compares the account, not the group: a pipe an administrator owns
+            // is not ours even when we could take it.
             return Err(io::Error::other("the endpoint is owned by another user"));
         }
         // SAFETY: the handle is a valid, overlapped pipe handle that we own and
@@ -314,6 +322,26 @@ mod tests {
             "not a SID: {}",
             scope.identity
         );
+    }
+
+    /// The owner is stated in the descriptor, so it is the account either way:
+    /// an elevated process would otherwise stamp the Administrators group and
+    /// fail its own client check.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_pipe_we_made_is_owned_by_the_account_that_made_it() {
+        let name = format!(
+            r"\\.\pipe\fhd-owner-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let _server = create_pipe(&name, true).expect("create");
+        // open_pipe refuses anything whose owner is not this account, so its
+        // success is the assertion.
+        open_pipe(&name).expect("the pipe is owned by this account");
     }
 
     #[cfg(windows)]

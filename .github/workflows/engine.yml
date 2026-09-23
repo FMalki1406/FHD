@@ -61,8 +61,14 @@ jobs:
         run: cargo +1.98.1 test -p fhd-domain -p fhd-app -p fhd-config -p fhd-telemetry --locked
       - name: Test protocol
         run: cargo +1.98.1 test -p fhd-protocol --locked
-      - name: Test platform primitives
-        run: cargo +1.98.1 test -p fhd-platform --locked
+      # One step per test: a job's step names are readable without a token and its
+      # logs are not, so on a runner we cannot reproduce this is the diagnosis.
+      - name: Platform - the account and session are readable
+        run: cargo +1.98.1 test -p fhd-platform --locked the_scope
+      - name: Platform - a pipe is owned by the account that made it
+        run: cargo +1.98.1 test -p fhd-platform --locked owned_by_the_account
+      - name: Platform - a pipe we made is one we will talk to
+        run: cargo +1.98.1 test -p fhd-platform --locked one_we_will_talk_to
       - name: Test IPC
         run: cargo +1.98.1 test -p fhd-ipc --locked
       - name: Test storage and persistence adapters
