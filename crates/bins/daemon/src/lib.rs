@@ -232,9 +232,16 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| EngineError::InvalidInput)?;
+        // Only a directory we made. `create_protected_directory` passes the mode
+        // to `mkdir(2)`, so ours already carries it and this is a no-op for them;
+        // running it unconditionally narrowed an operator's existing directory to
+        // 0700 without asking, which is the surprise the paragraph below says we
+        // decline to cause. Left in for the case where the mode did not take.
+        if created {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| EngineError::InvalidInput)?;
+        }
     }
     // Unix states the permissions it wants above. Windows inherits instead, and
     // what it inherits depends entirely on where the operator put this directory:
