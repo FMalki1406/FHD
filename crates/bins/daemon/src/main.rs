@@ -3,7 +3,8 @@
 #![forbid(unsafe_code)]
 
 use fhd_daemon::{
-    absolute, read_requests, Engine, EngineConfig, EngineError, Intent, JobOutcome, StderrEvents,
+    absolute, code, read_requests, Engine, EngineConfig, EngineError, Intent, JobOutcome, Resident,
+    StderrEvents,
 };
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::path::PathBuf;
@@ -15,7 +16,9 @@ fn usage() -> &'static str {
      [--allow-http] [--resume] [--sensitive-link]   (one URL per line on stdin, \
      each optionally followed by a tab and its own destination file)\n\
      or:    fhd-engine <state-directory> --continue [--resume]   (no stdin: every \
-     job this directory remembers)"
+     job this directory remembers)\n\
+     or:    fhd-engine <state-directory> --serve [--allow-http]   (resident: takes \
+     work over this user's control surface)"
 }
 
 /// What the command line asked for: the engine's settings, whether links are to be
@@ -24,6 +27,7 @@ struct Invocation {
     config: EngineConfig,
     sensitive: bool,
     cont: bool,
+    serve: bool,
 }
 
 fn parse() -> Result<Invocation, &'static str> {
@@ -31,8 +35,9 @@ fn parse() -> Result<Invocation, &'static str> {
     let state_directory = PathBuf::from(args.next().ok_or(usage())?);
     let second = args.next().ok_or(usage())?;
     let cont = second == "--continue";
-    // Continuing needs no destination: every job kept its own.
-    let destination = if cont {
+    let serve = second == "--serve";
+    // Neither continuing nor serving needs a destination: each job carries its own.
+    let destination = if cont || serve {
         state_directory.clone()
     } else {
         PathBuf::from(second)
@@ -103,6 +108,7 @@ fn parse() -> Result<Invocation, &'static str> {
         config,
         sensitive,
         cont,
+        serve,
     })
 }
 
@@ -114,6 +120,7 @@ async fn main() {
         config,
         sensitive,
         cont,
+        serve,
     } = match parse() {
         Ok(invocation) => invocation,
         Err(message) => {
@@ -121,6 +128,9 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if serve {
+        serve_run(config).await;
+    }
     if cont {
         continue_run(config).await;
     }
@@ -189,6 +199,54 @@ async fn main() {
     }
 }
 
+/// Runs as a resident engine: takes work over this user's control surface until a
+/// client asks it to stop or the operator interrupts.
+async fn serve_run(config: EngineConfig) -> ! {
+    let name = endpoint_name(&config.state_directory);
+    let resident = match Resident::open(config).await {
+        Ok(resident) => resident,
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    };
+    let serving = match resident.bind(fhd_ipc::Endpoint::for_user(&name)) {
+        Ok(serving) => serving,
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    };
+    // Printed only once the endpoint is live, so a caller may use it at once.
+    println!("listening {}", serving.endpoint().0);
+    // Interrupting a resident engine stops the listener; running jobs come to rest
+    // durably rather than being killed.
+    let stop = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    match serving.serve(stop).await {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    }
+}
+
+/// One endpoint per state directory, named by a digest of its path: two engines on
+/// one machine never collide, and the name itself carries no path.
+fn endpoint_name(state: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"FHD.endpoint.v1");
+    hash.update(state.to_string_lossy().as_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Continues every job this state directory remembers, with no link supplied now.
 async fn continue_run(config: EngineConfig) -> ! {
     let engine = match Engine::reopen(config).await {
@@ -232,21 +290,4 @@ fn report(outcomes: Vec<(usize, JobOutcome)>) -> i32 {
         }
     }
     i32::from(failed)
-}
-
-/// Only controlled categories reach the operator: never a URL or server text.
-fn code(error: &EngineError) -> String {
-    match error {
-        EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
-        EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
-        EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
-        EngineError::NeedsDecision(reason) => match reason {
-            Some(reason) => format!("STOPPED-{reason:?}-RERUN-WITH-RESUME").to_uppercase(),
-            None => "STOPPED-RERUN-WITH-RESUME".into(),
-        },
-        EngineError::Persistence(error) => error.code().into(),
-        EngineError::Binding(error) => format!("SOURCE-{error:?}").to_uppercase(),
-        EngineError::Admission(error) => error.code().into(),
-        EngineError::Run(error) => format!("RUN-{error:?}").to_uppercase(),
-    }
 }

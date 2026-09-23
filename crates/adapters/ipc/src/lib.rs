@@ -109,16 +109,25 @@ impl Server {
     /// slow or silent client never blocks another or the engine.
     pub async fn serve<H: Handler>(mut self, handler: Arc<H>, stop: impl Future<Output = ()>) {
         tokio::pin!(stop);
+        // Clients are held here rather than let loose: when the engine stops, their
+        // connections close with it, and nothing they hold outlives the server.
+        let mut clients = tokio::task::JoinSet::new();
         loop {
+            // Reaped without racing the accept: waiting on both would cancel a
+            // connection in progress every time a previous client finished.
+            while clients.try_join_next().is_some() {}
             let accepted = tokio::select! {
                 biased;
-                () = &mut stop => return,
+                () = &mut stop => {
+                    clients.shutdown().await;
+                    return;
+                }
                 accepted = self.accept() => accepted,
             };
             match accepted {
                 Ok(stream) => {
                     let handler = handler.clone();
-                    tokio::spawn(async move { serve_client(stream, handler).await });
+                    clients.spawn(async move { serve_client(stream, handler).await });
                 }
                 // A failed accept is this client's problem, not the engine's: the
                 // listener stays up, because a resident service that quits on one

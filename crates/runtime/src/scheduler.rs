@@ -25,6 +25,9 @@ pub struct SchedulerConfig {
     pub connections: usize,
     /// Ceiling for one job, whatever the engine has spare.
     pub per_job: usize,
+    /// A resident engine waits for more work instead of finishing when the queue
+    /// empties; a one-shot run returns as soon as everything has settled.
+    pub resident: bool,
 }
 impl SchedulerConfig {
     fn valid(&self) -> bool {
@@ -34,8 +37,11 @@ impl SchedulerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Command {
+    /// A job admitted while the scheduler is already running: a resident engine
+    /// takes work as it arrives, not only what it started with.
+    Admit(Box<Job>),
     Pause(JobId),
     Cancel(JobId),
     /// Pauses what is running and returns; queued work is handed back untouched.
@@ -151,14 +157,17 @@ impl Scheduler {
                     &mut used,
                 );
             }
-            if sessions.is_empty() && (stopping || queue.idle()) {
+            // A resident engine with nothing to do is waiting, not finished: it
+            // ends only when told to stop or when no one can tell it anything.
+            let waiting = self.config.resident && open;
+            if sessions.is_empty() && (stopping || (queue.idle() && !waiting)) {
                 break;
             }
             let deadline = self.next_deadline(&queue);
             // Nothing runs, nothing started, and no moment exists at which that
             // could change. Waiting on a command that may never come would strand
             // the queue, so it is handed back instead.
-            if sessions.is_empty() && !started && deadline.is_none() {
+            if sessions.is_empty() && !started && deadline.is_none() && !waiting {
                 break;
             }
             tokio::select! { biased;
@@ -354,6 +363,10 @@ impl Scheduler {
         deferred: &mut VecDeque<(JobId, Control)>,
     ) -> bool {
         let (id, control) = match command {
+            Command::Admit(job) => {
+                self.enqueue(queue, *job);
+                return false;
+            }
             Command::Shutdown => {
                 for (id, entry) in active {
                     if entry.control.try_send(Control::Pause).is_err() {

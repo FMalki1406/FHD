@@ -10,6 +10,8 @@ fhd-domain = { path = "../../domain" }
 fhd-http = { path = "../../adapters/http" }
 fhd-persistence = { path = "../../adapters/persistence" }
 fhd-runtime = { path = "../../runtime" }
+fhd-ipc = { path = "../../adapters/ipc" }
+fhd-protocol = { path = "../../protocol" }
 fhd-storage = { path = "../../adapters/storage" }
 fhd-telemetry = { path = "../../telemetry" }
 sha2 = "=0.11.0"

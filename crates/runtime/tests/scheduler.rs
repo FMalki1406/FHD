@@ -212,6 +212,7 @@ async fn every_job_runs_but_never_more_connections_than_the_engine_allows() {
         max_active: 4,
         connections: 3,
         per_job: 2,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(rig.jobs().await, commands).await;
@@ -239,6 +240,7 @@ async fn one_origin_serves_one_connection_at_a_time_when_that_is_its_cap() {
         max_active: 3,
         connections: 8,
         per_job: 4,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(rig.jobs().await, commands).await;
@@ -256,6 +258,7 @@ async fn a_throttled_origin_is_left_alone_until_the_delay_it_asked_for_has_passe
         max_active: 2,
         connections: 4,
         per_job: 2,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(rig.jobs().await, commands).await;
@@ -282,6 +285,7 @@ async fn shutdown_hands_back_what_never_started_instead_of_running_it() {
         max_active: 1,
         connections: 4,
         per_job: 1,
+        resident: false,
     });
     let (commander, commands) = mpsc::channel(4);
     commander.send(Command::Shutdown).await.unwrap();
@@ -311,6 +315,7 @@ async fn a_queued_job_can_be_cancelled_before_it_ever_reaches_the_network() {
         max_active: 1,
         connections: 4,
         per_job: 1,
+        resident: false,
     });
     let (commander, commands) = mpsc::channel(4);
     commander
@@ -342,6 +347,7 @@ async fn no_grant_survives_the_run_that_made_it() {
         max_active: 3,
         connections: 6,
         per_job: 2,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(rig.jobs().await, commands).await;
@@ -360,6 +366,7 @@ async fn a_throttled_origin_holds_back_every_job_on_it_not_just_the_one_it_answe
         max_active: 2,
         connections: 4,
         per_job: 1,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(rig.jobs().await, commands).await;
@@ -387,6 +394,7 @@ async fn a_job_that_is_resting_is_handed_back_untouched() {
         max_active: 2,
         connections: 4,
         per_job: 2,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(vec![job], commands).await;
@@ -405,6 +413,7 @@ async fn the_same_job_twice_is_refused_rather_than_run_twice() {
         max_active: 2,
         connections: 4,
         per_job: 2,
+        resident: false,
     });
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = scheduler.run(vec![job, twin], commands).await;

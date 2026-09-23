@@ -2,6 +2,9 @@
 //! protocol, storage or state rules of its own.
 #![forbid(unsafe_code)]
 
+mod service;
+pub use service::Resident;
+
 use fhd_app::{
     AddDownload, AppError, Authorizer, Destinations, EntitlementGate, Principal, ReceiptKey,
     ReferenceStore, SourceReference, TransferRepository,
@@ -31,6 +34,8 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum EngineError {
     InvalidInput,
+    /// The control surface could not be claimed for this user.
+    EndpointUnavailable,
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
     /// Publication renames within a volume; this destination is on another one.
@@ -369,6 +374,7 @@ impl Engine {
                 max_active: config.max_active,
                 connections: config.engine_connections,
                 per_job: config.connections,
+                resident: false,
             },
         )
         .map_err(EngineError::Run)?;
@@ -725,4 +731,22 @@ fn read_lines(mut input: impl std::io::Read) -> Result<Vec<String>, EngineError>
 
 pub fn absolute(path: &Path) -> Result<PathBuf, EngineError> {
     std::path::absolute(path).map_err(|_| EngineError::InvalidInput)
+}
+
+/// Only controlled categories reach the operator: never a URL or server text.
+pub fn code(error: &EngineError) -> String {
+    match error {
+        EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
+        EngineError::EndpointUnavailable => "IPC-ENDPOINT-UNAVAILABLE".into(),
+        EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
+        EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
+        EngineError::NeedsDecision(reason) => match reason {
+            Some(reason) => format!("STOPPED-{reason:?}-RERUN-WITH-RESUME").to_uppercase(),
+            None => "STOPPED-RERUN-WITH-RESUME".into(),
+        },
+        EngineError::Persistence(error) => error.code().into(),
+        EngineError::Binding(error) => format!("SOURCE-{error:?}").to_uppercase(),
+        EngineError::Admission(error) => error.code().into(),
+        EngineError::Run(error) => format!("RUN-{error:?}").to_uppercase(),
+    }
 }
