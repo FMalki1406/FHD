@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 fn config(state: &Directory, destination: PathBuf, connections: usize) -> EngineConfig {
     EngineConfig {
-        state_directory: state.0.clone(),
+        state_directory: state.engine(),
         destination,
         connections,
         engine_connections: connections.max(2),
@@ -19,6 +19,7 @@ fn config(state: &Directory, destination: PathBuf, connections: usize) -> Engine
         expected_sha256: None,
         max_bytes: 64 * 1024 * 1024,
         allow_http: true,
+        download_root: None,
         intent: Intent::Start,
     }
 }

@@ -6,17 +6,25 @@
 
 use fhd_protocol::{
     decode_request, decode_response, encode_request, encode_response, Frames, ProtocolError,
-    Request, Response, MAX_FRAME,
+    Request, Response,
 };
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::{future::Future, io, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// A client that sends nothing is dropped rather than held open forever.
+/// A connection that has asked for nothing yet is cheap to make and must stay
+/// cheap to hold: an unauthenticated peer may not occupy the engine for minutes.
+const FIRST_BYTE: Duration = Duration::from_secs(5);
+/// Between requests, a client that has already spoken is given longer.
 const IDLE: Duration = Duration::from_secs(120);
 /// One client may not keep the engine writing forever either.
 const WRITE: Duration = Duration::from_secs(30);
+/// Nor may one answer take forever: the engine says it is busy instead.
+const HANDLE: Duration = Duration::from_secs(20);
+/// Connections served at once. Every one of them costs a read buffer and a
+/// reassembly buffer, so the count is a declared budget rather than a surprise.
+const MAX_CLIENTS: usize = 32;
 
 #[derive(Debug)]
 pub enum IpcError {
@@ -52,8 +60,15 @@ impl From<ProtocolError> for IpcError {
 
 /// Where this user's engine listens. The path is derived from the platform's own
 /// per-user runtime location; it is never in a world-writable directory.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Endpoint(pub String);
+/// A socket path carries the user's home directory on Unix. It is not a secret,
+/// but it is theirs, so it is not printed by accident.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Endpoint(<redacted>)")
+    }
+}
 
 #[cfg(windows)]
 impl Endpoint {
@@ -93,8 +108,10 @@ impl Endpoint {
                 return candidate;
             }
         }
-        // Nowhere of our own to put it: the caller learns that from bind.
-        PathBuf::from(".fhd-run")
+        // Nowhere of this user's own to put it. An empty path fails to bind,
+        // which is the right answer: a socket in the working directory could be
+        // anywhere, including somewhere another user can reach.
+        PathBuf::new()
     }
 }
 
@@ -133,6 +150,18 @@ impl Server {
             // Reaped without racing the accept: waiting on both would cancel a
             // connection in progress every time a previous client finished.
             while clients.try_join_next().is_some() {}
+            // At the ceiling, wait for a client to leave before taking another.
+            // Accepting anyway would let one process hold the engine's memory.
+            if clients.len() >= MAX_CLIENTS {
+                tokio::select! {
+                    biased;
+                    () = &mut stop => {
+                        clients.shutdown().await;
+                        return;
+                    }
+                    _ = clients.join_next() => continue,
+                }
+            }
             let accepted = tokio::select! {
                 biased;
                 () = &mut stop => {
@@ -171,6 +200,9 @@ mod platform {
         pub fn bind(endpoint: Endpoint) -> Result<Self, IpcError> {
             endpoint.usable()?;
             let path = PathBuf::from(&endpoint.0);
+            if !path.is_absolute() {
+                return Err(IpcError::Untrusted);
+            }
             let directory = path.parent().ok_or(IpcError::Untrusted)?.to_path_buf();
             std::fs::create_dir_all(&directory)?;
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
@@ -210,15 +242,20 @@ mod platform {
         }
     }
 
-    /// The uid that owns this process, learned by making a file and reading it
-    /// back: no unsafe call, and it works the same on Linux and macOS.
+    /// The uid that owns this process, learned once by making a file and reading
+    /// it back: no unsafe call, the same answer on Linux and macOS, and no write
+    /// on the path of every connection afterwards.
     fn our_uid(directory: &Path) -> Result<u32, IpcError> {
-        let probe = directory.join(".owner-probe");
+        static OURS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        if let Some(uid) = OURS.get() {
+            return Ok(*uid);
+        }
+        let probe = directory.join(format!(".owner-probe-{}", std::process::id()));
         let file = std::fs::File::create(&probe)?;
         let uid = file.metadata()?.uid();
         drop(file);
         let _ = std::fs::remove_file(&probe);
-        Ok(uid)
+        Ok(*OURS.get_or_init(|| uid))
     }
 
     /// The directory must be ours, a real directory, and closed to everyone else.
@@ -308,6 +345,8 @@ mod platform {
     /// one as it takes the previous client, so a caller that arrives in between
     /// waits briefly instead of being told the engine is unreachable.
     const ERROR_PIPE_BUSY: i32 = 231;
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+    const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 
     /// Connects to this user's engine.
     pub async fn connect(
@@ -315,7 +354,13 @@ mod platform {
     ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, IpcError> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match ClientOptions::new().open(&endpoint.0) {
+            match ClientOptions::new()
+                // A fake server must not be able to act as us: identification
+                // lets it check who we are and nothing more. Set here rather
+                // than relied upon as somebody else's default.
+                .security_qos_flags(SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT)
+                .open(&endpoint.0)
+            {
                 Ok(client) => return Ok(client),
                 Err(error)
                     if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
@@ -341,12 +386,15 @@ where
 {
     let mut frames = Frames::new();
     let mut buffer = vec![0u8; 16 * 1024];
+    let mut spoken = false;
     loop {
-        let read = match tokio::time::timeout(IDLE, stream.read(&mut buffer)).await {
+        let patience = if spoken { IDLE } else { FIRST_BYTE };
+        let read = match tokio::time::timeout(patience, stream.read(&mut buffer)).await {
             Ok(Ok(0)) | Err(_) => return,
             Ok(Ok(read)) => read,
             Ok(Err(_)) => return,
         };
+        spoken = true;
         if frames.push(&buffer[..read]).is_err() {
             return;
         }
@@ -357,7 +405,17 @@ where
                 Err(_) => return,
             };
             let (id, response) = match decode_request(&frame) {
-                Ok((id, request)) => (id, handler.handle(request).await),
+                // An answer that never comes would hold this connection, and on
+                // Windows one of a small number of pipe instances with it.
+                Ok((id, request)) => (
+                    id,
+                    match tokio::time::timeout(HANDLE, handler.handle(request)).await {
+                        Ok(response) => response,
+                        Err(_) => Response::Failed {
+                            code: "ENGINE-BUSY".to_owned(),
+                        },
+                    },
+                ),
                 // The frame was whole and wrong: name the fault and keep going,
                 // so a client with one bad message is not left guessing.
                 Err(error) => (
@@ -367,8 +425,19 @@ where
                     },
                 ),
             };
-            let Ok(bytes) = encode_response(id, &response) else {
-                return;
+            // A response this contract cannot carry is still answered: dropping
+            // the connection would leave the client guessing.
+            let bytes = match encode_response(id, &response) {
+                Ok(bytes) => bytes,
+                Err(_) => match encode_response(
+                    id,
+                    &Response::Failed {
+                        code: "IPC-INTERNAL".to_owned(),
+                    },
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                },
             };
             if tokio::time::timeout(WRITE, stream.write_all(&bytes))
                 .await
@@ -406,9 +475,6 @@ where
                 return Err(IpcError::Protocol(ProtocolError::Malformed));
             }
             return Ok(response);
-        }
-        if read > MAX_FRAME {
-            return Err(IpcError::Protocol(ProtocolError::TooLarge));
         }
     }
 }

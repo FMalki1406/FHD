@@ -17,6 +17,9 @@ const MAX_URL: usize = 16_384;
 const MAX_PATH: usize = 32_768;
 /// A listing is paged rather than unbounded, so one answer always fits a frame.
 pub const MAX_JOBS_PER_PAGE: usize = 512;
+/// The largest single read a transport is expected to hand `Frames`. It only
+/// widens the reassembly allowance so a legal pipelined read is not refused.
+pub const MAX_READ: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -287,7 +290,9 @@ impl Frames {
     /// Adds received bytes. Refuses the peer once it has announced a frame too
     /// large, rather than accumulating towards it.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
-        if self.buffer.len().saturating_add(bytes.len()) > 4 + MAX_FRAME {
+        // One whole frame plus whatever of the next one arrived with it: a peer
+        // pipelining legally must not be mistaken for one announcing too much.
+        if self.buffer.len().saturating_add(bytes.len()) > 4 + MAX_FRAME + MAX_READ {
             return Err(ProtocolError::TooLarge);
         }
         self.buffer.extend_from_slice(bytes);
@@ -317,7 +322,11 @@ impl Frames {
             self.buffer[2],
             self.buffer[3],
         ]) as usize;
-        if length > MAX_FRAME || length == 0 {
+        if length == 0 {
+            // A frame of nothing is not a size problem; it is not the contract.
+            return Err(ProtocolError::Malformed);
+        }
+        if length > MAX_FRAME {
             return Err(ProtocolError::TooLarge);
         }
         Ok(Some(length))
@@ -482,9 +491,33 @@ mod tests {
         let mut frames = Frames::new();
         let header = u32::try_from(MAX_FRAME + 1).unwrap().to_be_bytes();
         assert_eq!(frames.push(&header), Err(ProtocolError::TooLarge));
-        // Nothing was kept for it: the peer cannot grow our memory by announcing.
+        // A frame of nothing is not a size problem; the peer is told which it is.
         let mut zero = Frames::new();
-        assert_eq!(zero.push(&[0, 0, 0, 0]), Err(ProtocolError::TooLarge));
+        assert_eq!(zero.push(&[0, 0, 0, 0]), Err(ProtocolError::Malformed));
+    }
+
+    /// A read may finish one frame and carry the beginning of the next; refusing
+    /// that would break any peer that pipelines, which the contract allows.
+    #[test]
+    fn a_read_that_completes_one_frame_and_starts_another_is_accepted() {
+        let big = Request::Add(AddRequest {
+            url: format!("https://example.test/{}", "u".repeat(MAX_URL - 40)),
+            destination: "/downloads/large".into(),
+            sensitive: false,
+            expected_sha256: None,
+            max_bytes: 1 << 30,
+            allow_http: false,
+        });
+        let first = encode_request(1, &big).unwrap();
+        let second = encode_request(2, &Request::Shutdown).unwrap();
+        let mut frames = Frames::new();
+        let mut stream: Vec<u8> = first.clone();
+        stream.extend_from_slice(&second);
+        frames.push(&stream).unwrap();
+        let one = frames.next_frame().unwrap().unwrap();
+        assert_eq!(decode_request(&one).unwrap().0, 1);
+        let two = frames.next_frame().unwrap().unwrap();
+        assert_eq!(decode_request(&two).unwrap().1, Request::Shutdown);
     }
 
     #[test]

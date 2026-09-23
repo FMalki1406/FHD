@@ -13,7 +13,7 @@ use std::{
 
 fn settings(state: &Directory) -> EngineConfig {
     EngineConfig {
-        state_directory: state.0.clone(),
+        state_directory: state.engine(),
         destination: state.0.clone(),
         connections: 2,
         engine_connections: 4,
@@ -21,6 +21,9 @@ fn settings(state: &Directory) -> EngineConfig {
         expected_sha256: None,
         max_bytes: 64 * 1024 * 1024,
         allow_http: true,
+        // The tests write beside the state directory, which is where their
+        // temporary tree lives; a real engine is given the user's downloads.
+        download_root: Some(state.0.clone()),
         intent: Intent::Start,
     }
 }
@@ -211,6 +214,80 @@ async fn a_request_the_engine_refuses_is_answered_with_a_code_not_a_message() {
         }
         other => panic!("the engine accepted a destination it cannot publish to: {other:?}"),
     }
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
+}
+
+/// The client proposes a destination; the engine decides. These are the ones it
+/// must not accept, each refused before a single byte is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destinations_the_engine_will_not_write_to_are_refused_at_admission() {
+    let state = Directory::new("destinations");
+    let address = endpoint("destinations");
+    let serving = Resident::open(settings(&state))
+        .await
+        .unwrap()
+        .bind(address.clone())
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let engine = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+
+    let refused = [
+        // Inside the engine's own tree: a remote server would get a say in the
+        // engine's database, its journals or its part files.
+        state.engine().join("state-wal").display().to_string(),
+        state
+            .engine()
+            .join("parts")
+            .join("1-1.part")
+            .display()
+            .to_string(),
+        // Climbing out of the allowed root by spelling.
+        state
+            .0
+            .join("..")
+            .join("elsewhere.bin")
+            .display()
+            .to_string(),
+        // Names the system reads as an instruction rather than as a file.
+        state.0.join("x.desktop").display().to_string(),
+        state.0.join("autorun.inf").display().to_string(),
+        state.0.join("shortcut.lnk").display().to_string(),
+        // Relative: nothing says where it lands.
+        "downloads/x.bin".to_string(),
+    ];
+    for (index, destination) in refused.into_iter().enumerate() {
+        let answer = ask(
+            &mut client,
+            index as u64 + 1,
+            &Request::Add(AddRequest {
+                url: "http://127.0.0.1:1/file".into(),
+                destination: destination.clone(),
+                sensitive: false,
+                expected_sha256: None,
+                max_bytes: 1024,
+                allow_http: true,
+            }),
+        )
+        .await
+        .unwrap();
+        match answer {
+            Response::Failed { code } => assert!(
+                !code.contains('/') && !code.contains('\\'),
+                "{code} carries a path"
+            ),
+            other => panic!("accepted {destination}: {other:?}"),
+        }
+    }
+    // Nothing was created for any of them.
+    assert!(!state.engine().join("state-wal").exists());
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
 }

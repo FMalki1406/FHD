@@ -14,6 +14,12 @@ use std::{
 
 pub struct Directory(pub PathBuf);
 impl Directory {
+    /// The engine's own tree. Downloads land beside it, never inside it.
+    pub fn engine(&self) -> PathBuf {
+        self.0.join("engine")
+    }
+}
+impl Directory {
     pub fn new(label: &str) -> Self {
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -115,7 +121,7 @@ pub fn part_bytes(state: &Directory) -> u64 {
             })
             .sum()
     }
-    walk(&state.0.join("parts"))
+    walk(&state.engine().join("parts"))
 }
 pub fn expected_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};

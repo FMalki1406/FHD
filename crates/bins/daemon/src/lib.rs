@@ -39,6 +39,10 @@ pub enum EngineError {
     /// Another engine still owns this state directory. Its own shutdown releases
     /// it, which can take a moment after it has returned.
     StateBusy,
+    /// The destination is not somewhere this engine will write: outside the
+    /// allowed root, inside its own state tree, or a name the system reads as an
+    /// instruction rather than a file.
+    DestinationRefused,
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
     /// Publication renames within a volume; this destination is on another one.
@@ -117,6 +121,10 @@ pub struct EngineConfig {
     pub expected_sha256: Option<[u8; 32]>,
     pub max_bytes: u64,
     pub allow_http: bool,
+    /// Where downloads may land. `None` allows anywhere on the engine's volume
+    /// outside its own tree; a resident engine should be given one, so a client
+    /// cannot choose a system location.
+    pub download_root: Option<PathBuf>,
     pub intent: Intent,
 }
 
@@ -742,21 +750,90 @@ pub fn absolute(path: &Path) -> Result<PathBuf, EngineError> {
     std::path::absolute(path).map_err(|_| EngineError::InvalidInput)
 }
 
+/// A closed set of names for what stopped a job. Formatting the enum would put
+/// whatever a future variant carries -- a path, a server's words -- on the wire.
+fn stop_reason(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::SourceChanged => "SOURCE-CHANGED",
+        StopReason::Authentication => "AUTHENTICATION",
+        StopReason::Storage => "STORAGE",
+        StopReason::Integrity => "INTEGRITY",
+        StopReason::Network => "NETWORK",
+        StopReason::Policy => "POLICY",
+        StopReason::Unknown => "UNKNOWN",
+        StopReason::Destination => "DESTINATION",
+    }
+}
+
+fn binding_code(error: &BindingError) -> &'static str {
+    match error {
+        BindingError::AlreadyBound => "SOURCE-ALREADY-BOUND",
+        BindingError::InvalidUrl => "SOURCE-INVALID-URL",
+        BindingError::InsecureHttp => "SOURCE-INSECURE-HTTP",
+        BindingError::InvalidCredential => "SOURCE-INVALID-CREDENTIAL",
+        BindingError::TooManyOrigins => "SOURCE-TOO-MANY-ORIGINS",
+    }
+}
+
+fn run_code(error: &RunError) -> &'static str {
+    match error {
+        RunError::InvalidConfig => "RUN-INVALID-CONFIG",
+        RunError::NotRunnable(_) => "RUN-NOT-RUNNABLE",
+        RunError::Domain(_) => "RUN-DOMAIN",
+        RunError::Commit(_) => "RUN-COMMIT",
+        RunError::Repository => "RUN-REPOSITORY",
+        RunError::Writer(_) => "RUN-WRITER",
+        RunError::Storage(_) => "RUN-STORAGE",
+        RunError::Invariant => "RUN-INVARIANT",
+    }
+}
+
+/// Names the system reads as an instruction rather than as a file (§16.4), and
+/// names that read as something they are not. Refused at admission, so such a
+/// request never costs a download first.
+pub fn publishable_name(leaf: &str) -> bool {
+    const REFUSED: [&str; 9] = [
+        ".lnk",
+        ".url",
+        ".scf",
+        ".library-ms",
+        ".search-ms",
+        ".appref-ms",
+        ".theme",
+        ".desktop",
+        ".inf",
+    ];
+    let lower = leaf.to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 255 {
+        return false;
+    }
+    if matches!(lower.as_str(), "autorun.inf" | "desktop.ini" | ".htaccess") {
+        return false;
+    }
+    if REFUSED.iter().any(|ending| lower.ends_with(ending)) {
+        return false;
+    }
+    !leaf
+        .chars()
+        .any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c) || c == '\u{2066}')
+}
+
 /// Only controlled categories reach the operator: never a URL or server text.
 pub fn code(error: &EngineError) -> String {
     match error {
         EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
         EngineError::EndpointUnavailable => "IPC-ENDPOINT-UNAVAILABLE".into(),
         EngineError::StateBusy => "STATE-DIRECTORY-BUSY".into(),
+        EngineError::DestinationRefused => "DESTINATION-REFUSED".into(),
         EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
         EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
         EngineError::NeedsDecision(reason) => match reason {
-            Some(reason) => format!("STOPPED-{reason:?}-RERUN-WITH-RESUME").to_uppercase(),
+            Some(reason) => format!("STOPPED-{}-RERUN-WITH-RESUME", stop_reason(reason)),
             None => "STOPPED-RERUN-WITH-RESUME".into(),
         },
         EngineError::Persistence(error) => error.code().into(),
-        EngineError::Binding(error) => format!("SOURCE-{error:?}").to_uppercase(),
+        EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),
-        EngineError::Run(error) => format!("RUN-{error:?}").to_uppercase(),
+        EngineError::Run(error) => run_code(error).into(),
     }
 }

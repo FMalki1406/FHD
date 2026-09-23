@@ -52,6 +52,7 @@ fn parse() -> Result<Invocation, &'static str> {
         expected_sha256: None,
         max_bytes: 100 * 1024 * 1024 * 1024,
         allow_http: false,
+        download_root: None,
         intent: Intent::Start,
     };
     while let Some(argument) = args.next() {
@@ -97,6 +98,12 @@ fn parse() -> Result<Invocation, &'static str> {
                     .map_err(|_| "invalid active job count")?
             }
             "--allow-http" => config.allow_http = true,
+            // Policy for a resident engine: clients may land files here and
+            // nowhere else, whatever they ask for.
+            "--download-root" => {
+                let root = PathBuf::from(args.next().ok_or("missing download root")?);
+                config.download_root = Some(absolute(&root).map_err(|_| "invalid download root")?);
+            }
             // A signed link is a credential: remember the job, not the link.
             "--sensitive-link" => sensitive = true,
             // Releasing a stopped job is the operator's decision, never automatic.

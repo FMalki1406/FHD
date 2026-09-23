@@ -264,6 +264,12 @@ impl Service {
             let Some(url) = reference.url() else {
                 continue;
             };
+            // Policy is what this run was started with, not what an earlier run
+            // was allowed: a job recorded with cleartext permitted stays parked
+            // until an operator starts the engine that way again.
+            if reference.allow_http() && !self.config.allow_http {
+                continue;
+            }
             if self
                 .bind(job.spec().source(), url, reference.allow_http())
                 .is_err()
@@ -290,8 +296,10 @@ impl Service {
     /// Admits one request: checks it, records what it points at, and hands the job
     /// to the scheduler. Anything refused is refused before a byte is fetched.
     async fn add(&self, request: AddRequest) -> Result<JobId, EngineError> {
-        let destination_path = PathBuf::from(&request.destination);
-        if !destination_path.is_absolute() || !same_volume(&self.state, &destination_path)? {
+        // The client proposes; this decides. A destination is refused here rather
+        // than after a whole file has been fetched.
+        let destination_path = self.allowed_destination(&request.destination)?;
+        if !same_volume(&self.state, &destination_path)? {
             return Err(EngineError::CrossVolume);
         }
         let expected = match &request.expected_sha256 {
@@ -338,8 +346,6 @@ impl Service {
                 ],
             ),
         );
-        self.destinations
-            .insert(destination, destination_path.clone());
         let id = AddDownload::new(self.repository.as_ref(), &LocalOperator, &LocalOperator)
             .execute(key, spec)
             .await
@@ -354,16 +360,63 @@ impl Service {
             source,
             stored,
             destination,
-            destination_path,
+            destination_path.clone(),
         )
         .await
         .map_err(|_| EngineError::Admission(AppError::PersistenceUnavailable))?;
+        // Only now, once the database holds both: the map is a cache of what was
+        // accepted, never a claim staked before anything was.
+        self.destinations
+            .insert(destination, destination_path.clone());
         let job = self.job(id).await?;
         // Already finished or resting: admitted, but nothing for the queue.
         if matches!(job.state(), JobState::Queued) {
             let _ = self.commands.send(Command::Admit(Box::new(job))).await;
         }
         Ok(id)
+    }
+
+    /// Where a client's bytes may land. A local peer is the same user, so this is
+    /// not a wall against that user -- it is a wall against a request choosing a
+    /// name that the engine itself, or the system, gives meaning to.
+    fn allowed_destination(&self, proposed: &str) -> Result<PathBuf, EngineError> {
+        let path = PathBuf::from(proposed);
+        if !path.is_absolute() {
+            return Err(EngineError::DestinationRefused);
+        }
+        // `..` never reaches the filesystem: it is resolved here, so a path that
+        // climbs out of an allowed place cannot be admitted by spelling.
+        let mut resolved = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    if !resolved.pop() {
+                        return Err(EngineError::DestinationRefused);
+                    }
+                }
+                std::path::Component::CurDir => {}
+                other => resolved.push(other.as_os_str()),
+            }
+        }
+        let leaf = resolved
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .ok_or(EngineError::DestinationRefused)?;
+        if !crate::publishable_name(leaf) {
+            return Err(EngineError::DestinationRefused);
+        }
+        // The engine's own tree holds the database, its journals and the part
+        // files. A download landing in there would be handing a remote server a
+        // say in the engine's own state.
+        if resolved.starts_with(&self.state) {
+            return Err(EngineError::DestinationRefused);
+        }
+        if let Some(root) = &self.config.download_root {
+            if !resolved.starts_with(root) {
+                return Err(EngineError::DestinationRefused);
+            }
+        }
+        Ok(resolved)
     }
 
     async fn job(&self, id: JobId) -> Result<Job, EngineError> {
