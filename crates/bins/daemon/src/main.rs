@@ -12,14 +12,32 @@ use tokio::sync::mpsc;
 fn usage() -> &'static str {
     "usage: fhd-engine <state-directory> <destination-file> [--connections N] \
      [--engine-connections N] [--max-active N] [--max-bytes N] [--sha256 HEX] \
-     [--allow-http] [--resume]   (one URL per line on stdin, each optionally \
-     followed by a tab and its own destination file)"
+     [--allow-http] [--resume] [--sensitive-link]   (one URL per line on stdin, \
+     each optionally followed by a tab and its own destination file)\n\
+     or:    fhd-engine <state-directory> --continue [--resume]   (no stdin: every \
+     job this directory remembers)"
 }
 
-fn parse() -> Result<EngineConfig, &'static str> {
+/// What the command line asked for: the engine's settings, whether links are to be
+/// kept out of the database, and whether this run was told anything at all.
+struct Invocation {
+    config: EngineConfig,
+    sensitive: bool,
+    cont: bool,
+}
+
+fn parse() -> Result<Invocation, &'static str> {
     let mut args = std::env::args().skip(1);
     let state_directory = PathBuf::from(args.next().ok_or(usage())?);
-    let destination = PathBuf::from(args.next().ok_or(usage())?);
+    let second = args.next().ok_or(usage())?;
+    let cont = second == "--continue";
+    // Continuing needs no destination: every job kept its own.
+    let destination = if cont {
+        state_directory.clone()
+    } else {
+        PathBuf::from(second)
+    };
+    let mut sensitive = false;
     let mut config = EngineConfig {
         state_directory: absolute(&state_directory).map_err(|_| "invalid state directory")?,
         destination: absolute(&destination).map_err(|_| "invalid destination")?,
@@ -74,27 +92,45 @@ fn parse() -> Result<EngineConfig, &'static str> {
                     .map_err(|_| "invalid active job count")?
             }
             "--allow-http" => config.allow_http = true,
+            // A signed link is a credential: remember the job, not the link.
+            "--sensitive-link" => sensitive = true,
             // Releasing a stopped job is the operator's decision, never automatic.
             "--resume" => config.intent = Intent::Resume,
             _ => return Err(usage()),
         }
     }
-    Ok(config)
+    Ok(Invocation {
+        config,
+        sensitive,
+        cont,
+    })
 }
 
 #[tokio::main]
 async fn main() {
     // Engine events go to standard error; the published path goes to standard output.
     let _ = tracing::subscriber::set_global_default(StderrEvents);
-    let config = match parse() {
-        Ok(config) => config,
+    let Invocation {
+        config,
+        sensitive,
+        cont,
+    } = match parse() {
+        Ok(invocation) => invocation,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
         }
     };
+    if cont {
+        continue_run(config).await;
+    }
     let requests = match read_requests(std::io::stdin(), &config.destination) {
-        Ok(requests) => requests,
+        Ok(mut requests) => {
+            for request in &mut requests {
+                request.sensitive = sensitive;
+            }
+            requests
+        }
         Err(_) => {
             eprintln!("expected one URL per line on stdin");
             std::process::exit(2);
@@ -129,34 +165,7 @@ async fn main() {
     if several {
         let (_keep, commands) = mpsc::channel(4);
         match engine.run_all(commands).await {
-            Ok(outcomes) => {
-                let mut failed = false;
-                for (index, outcome) in outcomes {
-                    match outcome {
-                        JobOutcome::Published(path) => {
-                            println!("{index} published {}", path.display())
-                        }
-                        JobOutcome::Settled(state, reason) => {
-                            failed |= state != fhd_domain::JobState::Completed;
-                            match reason {
-                                Some(reason) => {
-                                    println!("{index} stopped in {state:?} ({reason:?})")
-                                }
-                                None => println!("{index} stopped in {state:?}"),
-                            }
-                        }
-                        JobOutcome::NeedsDecision(reason) => {
-                            failed = true;
-                            println!("{index} {}", code(&EngineError::NeedsDecision(reason)));
-                        }
-                        JobOutcome::Failed(error) => {
-                            failed = true;
-                            println!("{index} {}", code(&EngineError::Run(error)));
-                        }
-                    }
-                }
-                std::process::exit(if failed { 1 } else { 0 });
-            }
+            Ok(outcomes) => std::process::exit(report(outcomes)),
             Err(error) => {
                 eprintln!("{}", code(&error));
                 std::process::exit(2);
@@ -180,10 +189,56 @@ async fn main() {
     }
 }
 
+/// Continues every job this state directory remembers, with no link supplied now.
+async fn continue_run(config: EngineConfig) -> ! {
+    let engine = match Engine::reopen(config).await {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    };
+    let (_keep, commands) = mpsc::channel(4);
+    match engine.run_all(commands).await {
+        Ok(outcomes) => std::process::exit(report(outcomes)),
+        Err(error) => {
+            eprintln!("{}", code(&error));
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Prints one line per request and says whether anything is still unfinished.
+fn report(outcomes: Vec<(usize, JobOutcome)>) -> i32 {
+    let mut failed = false;
+    for (index, outcome) in outcomes {
+        match outcome {
+            JobOutcome::Published(path) => println!("{index} published {}", path.display()),
+            JobOutcome::Settled(state, reason) => {
+                failed |= state != fhd_domain::JobState::Completed;
+                match reason {
+                    Some(reason) => println!("{index} stopped in {state:?} ({reason:?})"),
+                    None => println!("{index} stopped in {state:?}"),
+                }
+            }
+            JobOutcome::NeedsDecision(reason) => {
+                failed = true;
+                println!("{index} {}", code(&EngineError::NeedsDecision(reason)));
+            }
+            JobOutcome::Failed(error) => {
+                failed = true;
+                println!("{index} {}", code(&EngineError::Run(error)));
+            }
+        }
+    }
+    i32::from(failed)
+}
+
 /// Only controlled categories reach the operator: never a URL or server text.
 fn code(error: &EngineError) -> String {
     match error {
         EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
+        EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
         EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
         EngineError::NeedsDecision(reason) => match reason {
             Some(reason) => format!("STOPPED-{reason:?}-RERUN-WITH-RESUME").to_uppercase(),

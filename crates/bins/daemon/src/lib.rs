@@ -4,7 +4,7 @@
 
 use fhd_app::{
     AddDownload, AppError, Authorizer, Destinations, EntitlementGate, Principal, ReceiptKey,
-    TransferRepository,
+    ReferenceStore, SourceReference, TransferRepository,
 };
 use fhd_domain::{
     DestinationRef, Job, JobCommand, JobSpec, JobState, Priority, RetryPolicy, SourceRef,
@@ -31,6 +31,8 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum EngineError {
     InvalidInput,
+    /// Nothing this run could continue: no recorded job with a usable link.
+    NothingToContinue,
     /// Publication renames within a volume; this destination is on another one.
     CrossVolume,
     /// The job is waiting for a decision; run again with Intent::Resume.
@@ -117,6 +119,10 @@ pub struct Request {
     pub url: String,
     pub destination: PathBuf,
     pub expected_sha256: Option<[u8; 32]>,
+    /// A link that must not be written to disk, such as a signed one. The job is
+    /// remembered without it, so a later run stops for a person rather than
+    /// fetching from a credential left behind.
+    pub sensitive: bool,
 }
 
 /// How one request ended. A job needing a decision does not fail its neighbours.
@@ -222,6 +228,7 @@ impl Engine {
             url: url.to_owned(),
             destination: config.destination.clone(),
             expected_sha256: config.expected_sha256,
+            sensitive: false,
         };
         Self::open_many(config, vec![request]).await
     }
@@ -253,6 +260,7 @@ impl Engine {
         let transport = HttpTransport::new(HttpConfig::default()).map_err(EngineError::Binding)?;
         let mut destinations = HashMap::new();
         let mut admitted = Vec::with_capacity(requests.len());
+        let mut references = Vec::with_capacity(requests.len());
         for request in &requests {
             if !request.destination.is_absolute() {
                 return Err(EngineError::InvalidInput);
@@ -285,6 +293,14 @@ impl Engine {
                         .map_err(EngineError::Binding)?,
                 )
                 .map_err(EngineError::Binding)?;
+            // What this job points at, so a later run can continue it unaided.
+            let reference = if request.sensitive {
+                SourceReference::sensitive(config.allow_http)
+            } else {
+                SourceReference::new(request.url.clone(), config.allow_http)
+                    .map_err(EngineError::Admission)?
+            };
+            references.push((source, reference, destination, request.destination.clone()));
             admitted.push(Admitted {
                 key: ReceiptKey::new(
                     Principal::new(1).map_err(EngineError::Admission)?,
@@ -356,6 +372,11 @@ impl Engine {
             },
         )
         .map_err(EngineError::Run)?;
+        for (source, reference, destination, path) in references {
+            ReferenceStore::record(repository.as_ref(), source, reference, destination, path)
+                .await
+                .map_err(|_| EngineError::Admission(AppError::PersistenceUnavailable))?;
+        }
         Ok(Self {
             repository,
             coordinator,
@@ -364,6 +385,61 @@ impl Engine {
             intent: config.intent,
             id: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Reopens what an earlier run recorded: every job in the state directory,
+    /// fetched through the links it was given then. A job whose link was marked
+    /// sensitive is not resumed here -- nothing on disk can say where it came from,
+    /// so it waits for a person to supply the link again.
+    pub async fn reopen(config: EngineConfig) -> Result<Self, EngineError> {
+        if !config.state_directory.is_absolute() {
+            return Err(EngineError::InvalidInput);
+        }
+        let repository = Arc::new(
+            SqliteRepository::open(config.state_directory.join("state"), Limits::default())
+                .await
+                .map_err(EngineError::Persistence)?,
+        );
+        let store: &dyn ReferenceStore = repository.as_ref();
+        let sources: HashMap<_, _> = store
+            .sources()
+            .await
+            .map_err(EngineError::Admission)?
+            .into_iter()
+            .collect();
+        let destinations: HashMap<_, _> = store
+            .destinations()
+            .await
+            .map_err(EngineError::Admission)?
+            .into_iter()
+            .collect();
+        let mut requests = Vec::new();
+        for job in repository
+            .load_jobs()
+            .await
+            .map_err(EngineError::Admission)?
+        {
+            let (Some(reference), Some(path)) = (
+                sources.get(&job.spec().source()),
+                destinations.get(&job.spec().destination()),
+            ) else {
+                continue;
+            };
+            let Some(url) = reference.url() else {
+                continue;
+            };
+            requests.push(Request {
+                url: url.to_owned(),
+                destination: path.clone(),
+                expected_sha256: job.spec().expected_sha256(),
+                sensitive: false,
+            });
+        }
+        drop(repository);
+        if requests.is_empty() {
+            return Err(EngineError::NothingToContinue);
+        }
+        Self::open_many(config, requests).await
     }
 
     /// Admits the request (replaying an earlier one with the same key) and settles
@@ -618,6 +694,7 @@ pub fn read_requests(
             url: url.to_owned(),
             destination,
             expected_sha256: None,
+            sensitive: false,
         });
     }
     if requests.is_empty() {

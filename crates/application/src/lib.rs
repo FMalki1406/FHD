@@ -3,7 +3,7 @@
 pub mod storage;
 pub mod transport;
 
-use fhd_domain::{ByteRange, DestinationRef, Generation, Job, JobEvent, JobId, JobSpec};
+use fhd_domain::{ByteRange, DestinationRef, Generation, Job, JobEvent, JobId, JobSpec, SourceRef};
 use std::{future::Future, pin::Pin};
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -218,6 +218,73 @@ impl PublishIntent {
 
 /// Resolves an opaque destination reference to a path the storage adapter may use.
 /// The adapter, not this port, enforces the path policy (§10.7).
+/// What a source points at, for a run that was not told again. A link the caller
+/// marked sensitive is never stored: `url` comes back as `None`, and the job is a
+/// matter for a person rather than something to fetch from a remembered credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceReference {
+    url: Option<String>,
+    allow_http: bool,
+    sensitive: bool,
+}
+impl SourceReference {
+    pub fn new(url: String, allow_http: bool) -> Result<Self, AppError> {
+        if url.is_empty() || url.len() > 16_384 {
+            return Err(AppError::InvalidInput);
+        }
+        Ok(Self {
+            url: Some(url),
+            allow_http,
+            sensitive: false,
+        })
+    }
+    /// A link that must not touch the disk: only the fact of the source is kept.
+    pub fn sensitive(allow_http: bool) -> Self {
+        Self {
+            url: None,
+            allow_http,
+            sensitive: true,
+        }
+    }
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+    pub fn allow_http(&self) -> bool {
+        self.allow_http
+    }
+    pub fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+}
+/// Never prints the link: a signed URL is a credential, and this type is carried
+/// through layers that log.
+impl std::fmt::Debug for SourceReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceReference")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("allow_http", &self.allow_http)
+            .field("sensitive", &self.sensitive)
+            .finish()
+    }
+}
+
+/// Remembers what each admitted job points at, so a later run can continue it.
+/// Writes are idempotent: the same reference recorded twice is one row.
+pub trait ReferenceStore: Send + Sync {
+    fn record(
+        &self,
+        source: SourceRef,
+        reference: SourceReference,
+        destination: DestinationRef,
+        path: std::path::PathBuf,
+    ) -> PortFuture<'_, Result<(), CommitError>>;
+    /// Every recorded source, with its link when one was stored.
+    fn sources(&self) -> PortFuture<'_, Result<Vec<(SourceRef, SourceReference)>, AppError>>;
+    fn destinations(
+        &self,
+    ) -> PortFuture<'_, Result<Vec<(DestinationRef, std::path::PathBuf)>, AppError>>;
+}
+
 pub trait Destinations: Send + Sync {
     fn resolve(&self, destination: DestinationRef) -> Result<std::path::PathBuf, AppError>;
 }

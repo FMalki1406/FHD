@@ -766,3 +766,61 @@ mod transfer_state {
         assert_eq!(repo.publish_intent(job.id()).await.unwrap(), None);
     }
 }
+
+#[tokio::test]
+async fn references_round_trip_and_a_sensitive_link_never_reaches_the_disk() {
+    let directory = Directory::new();
+    let repository = SqliteRepository::open(directory.0.clone(), Limits::default())
+        .await
+        .unwrap();
+    let plain = fhd_domain::SourceRef::new(11).unwrap();
+    let secret = fhd_domain::SourceRef::new(12).unwrap();
+    let first = fhd_domain::DestinationRef::new(21).unwrap();
+    let second = fhd_domain::DestinationRef::new(22).unwrap();
+    let store: &dyn fhd_app::ReferenceStore = &repository;
+    store
+        .record(
+            plain,
+            fhd_app::SourceReference::new("https://example.test/a".into(), false).unwrap(),
+            first,
+            PathBuf::from("/tmp/a.bin"),
+        )
+        .await
+        .unwrap();
+    store
+        .record(
+            secret,
+            fhd_app::SourceReference::sensitive(false),
+            second,
+            PathBuf::from("/tmp/b.bin"),
+        )
+        .await
+        .unwrap();
+    // Recording the same request again is one row, not a second one.
+    store
+        .record(
+            plain,
+            fhd_app::SourceReference::new("https://example.test/a".into(), false).unwrap(),
+            first,
+            PathBuf::from("/tmp/a.bin"),
+        )
+        .await
+        .unwrap();
+
+    let mut sources = store.sources().await.unwrap();
+    sources.sort_by_key(|(source, _)| source.get());
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0].1.url(), Some("https://example.test/a"));
+    assert_eq!(sources[1].1.url(), None);
+    assert!(sources[1].1.is_sensitive());
+    let mut destinations = store.destinations().await.unwrap();
+    destinations.sort_by_key(|(destination, _)| destination.get());
+    assert_eq!(destinations[1].1, PathBuf::from("/tmp/b.bin"));
+
+    // The file itself must not contain the sensitive link, whatever the API says.
+    drop(repository);
+    let bytes = fs::read(directory.0.join("admission.sqlite")).unwrap_or_default();
+    assert!(!String::from_utf8_lossy(&bytes).contains("example.test/b"));
+    // A redacted debug print is the only way this type can reach a log.
+    assert!(!format!("{:?}", sources[0].1).contains("example.test"));
+}

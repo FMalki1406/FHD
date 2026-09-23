@@ -1,6 +1,6 @@
 //! The whole engine over real adapters: a local HTTP server, SQLite on disk and
 //! real part files. No fakes anywhere in this path.
-use fhd_daemon::{Engine, EngineConfig, Intent, JobOutcome, Request};
+use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request};
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use std::{
@@ -437,11 +437,13 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
             url: format!("http://127.0.0.1:{one}/file"),
             destination: state.0.join("first.bin"),
             expected_sha256: Some(expected_digest(&first)),
+            sensitive: false,
         },
         Request {
             url: format!("http://127.0.0.1:{two}/file"),
             destination: state.0.join("second.bin"),
             expected_sha256: Some(expected_digest(&second)),
+            sensitive: false,
         },
     ];
     // One connection each and room for both: the two jobs genuinely overlap, each
@@ -468,4 +470,74 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
     assert_eq!(std::fs::read(state.0.join("second.bin")).unwrap(), second);
     // Both parts were released once their bytes reached their final names.
     assert_eq!(part_bytes(&state), 0, "part files left behind");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
+    let body = content(2 * 1024 * 1024 + 33);
+    let (port, _) = serve(body.clone(), 0);
+    let state = Directory::new("continue");
+    let destination = state.0.join("remembered.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // First run: pause it, so there is unfinished work worth continuing.
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (control, receiver) = mpsc::channel(1);
+    let pause = async {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        control.send(Control::Pause).await.unwrap();
+    };
+    // Pausing may lose the race with a fast local server; either way the second run
+    // is the one under test, and it is told nothing.
+    let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
+    outcome.unwrap();
+    drop(engine);
+
+    // Second run knows nothing but the directory: no URL, no destination given.
+    let mut settings = config(&state, state.0.clone(), 2);
+    settings.intent = Intent::Resume;
+    let engine = Engine::reopen(settings).await.unwrap();
+    let (_keep, commands) = mpsc::channel(4);
+    let outcomes = engine.run_all(commands).await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0].1 {
+        JobOutcome::Published(path) => assert_eq!(path, &destination),
+        // Already finished before the pause landed: the remembered job was still
+        // found and settled, which is what continuing has to prove.
+        JobOutcome::Settled(JobState::Completed, _) => {}
+        other => panic!("continuing ended as {other:?}"),
+    }
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sensitive_link_is_not_remembered_so_it_cannot_be_continued() {
+    let body = content(64 * 1024);
+    let (port, _) = serve(body, 0);
+    let state = Directory::new("sensitive");
+    let destination = state.0.join("secret.bin");
+    let request = Request {
+        url: format!("http://127.0.0.1:{port}/file"),
+        destination,
+        expected_sha256: None,
+        sensitive: true,
+    };
+    let engine = Engine::open_many(config(&state, state.0.join("unused.bin"), 1), vec![request])
+        .await
+        .unwrap();
+    let (_keep, commands) = mpsc::channel(4);
+    engine.run_all(commands).await.unwrap();
+    drop(engine);
+
+    // The link was never written, so there is nothing here to continue with.
+    let settings = config(&state, state.0.clone(), 1);
+    assert!(
+        matches!(
+            Engine::reopen(settings).await,
+            Err(EngineError::NothingToContinue)
+        ),
+        "a sensitive link must not survive the run that used it"
+    );
 }
