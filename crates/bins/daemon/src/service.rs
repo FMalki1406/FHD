@@ -493,7 +493,11 @@ fn summarize(job: &Job) -> JobSummary {
 }
 
 fn decode_digest(hex: &str) -> Result<[u8; 32], EngineError> {
-    if hex.len() != 64 {
+    // Bytes, not characters: slicing a 64-byte string that holds a multi-byte
+    // character would cut across a boundary and panic. The protocol layer already
+    // refuses non-ASCII, but this function is reachable from any in-process
+    // caller of the handler, and the guarantee lives in another crate.
+    if hex.len() != 64 || !hex.is_ascii() {
         return Err(EngineError::InvalidInput);
     }
     let mut digest = [0u8; 32];

@@ -107,8 +107,11 @@ jobs:
         run: cargo +1.98.1 test -p fhd-http --locked
       - name: Test runtime
         run: cargo +1.98.1 test -p fhd-runtime --locked
+      # Named separately, and NOT overlapping: every file under tests/ is an
+      # auto-discovered target, so an unqualified `test -p fhd-daemon` would run
+      # the process suite as well and it would cost its wall time twice.
       - name: Test engine end to end
-        run: cargo +1.98.1 test -p fhd-daemon --locked
+        run: cargo +1.98.1 test -p fhd-daemon --locked --lib --test end_to_end --test resident
       # The library suites never start the program. Argument parsing, the
       # one-shot/serve/client dispatch and the control surface between two real
       # processes are only covered here.

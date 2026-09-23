@@ -84,7 +84,7 @@ fn a_wrong_digest_on_the_command_line_fails_the_run() {
     let (port, _) = serve(body, 0);
     let destination = state.0.join("downloaded.bin");
 
-    let (code, _, err) = run(
+    let (code, out, err) = run(
         &[
             &state.engine().to_string_lossy(),
             &destination.to_string_lossy(),
@@ -97,6 +97,14 @@ fn a_wrong_digest_on_the_command_line_fails_the_run() {
 
     assert_ne!(code, Some(0), "a mismatched digest must not exit zero");
     assert!(!destination.exists(), "nothing is published: {err}");
+    // The cause, not just the failure. A binary that cannot even open its state
+    // directory also exits non-zero and publishes nothing, and it never reaches
+    // `--sha256` at all -- so without this the test would pass while the thing it
+    // exists to check was dead.
+    assert!(
+        out.contains("NeedsAction"),
+        "it must stop on integrity, not earlier.\nstdout: {out}\nstderr: {err}"
+    );
 }
 
 /// Plain HTTP without `--allow-http` is refused before anything is fetched.
@@ -110,7 +118,7 @@ fn cleartext_is_refused_unless_the_operator_asks_for_it() {
     let (port, served) = serve(body, 0);
     let destination = state.0.join("downloaded.bin");
 
-    let (code, _, _) = run(
+    let (code, out, err) = run(
         &[
             &state.engine().to_string_lossy(),
             &destination.to_string_lossy(),
@@ -124,6 +132,13 @@ fn cleartext_is_refused_unless_the_operator_asks_for_it() {
         served.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "the refusal happens before any request is sent"
+    );
+    // The cause, not just the failure: a binary that cannot open its state
+    // directory also exits non-zero, publishes nothing and sends no request, and
+    // never reaches the cleartext decision at all.
+    assert!(
+        err.contains("SOURCE-INSECURE-HTTP") || out.contains("SOURCE-INSECURE-HTTP"),
+        "refused for the wrong reason.\nstdout: {out}\nstderr: {err}"
     );
 }
 
@@ -140,6 +155,114 @@ fn an_unknown_client_command_is_refused_with_usage() {
     assert!(err.contains("usage:"), "stderr was: {err}");
 }
 
+/// Adding a checksum to a command line that already ran is a conflict, not a
+/// second job -- and `--continue` still works afterwards.
+///
+/// This pins a regression that the fix for `--sha256` introduced and a review
+/// caught. Folding the expected digest into the idempotency receipt made the same
+/// command line resolve to two different jobs once the flag started being applied.
+/// Both named one destination, so the next `--continue` refused the whole
+/// directory with `ENGINE-INVALID-INPUT` and no way back except deleting it --
+/// taking every other job's progress with it.
+#[test]
+fn adding_a_checksum_later_conflicts_instead_of_forking_the_job() {
+    let state = Directory::new("process-receipt");
+    let body = content(32 * 1024);
+    let (port, _) = serve(body.clone(), 0);
+    let destination = state.0.join("twice.bin");
+    let line = format!("http://127.0.0.1:{port}/file\n");
+    let engine_dir = state.engine().to_string_lossy().into_owned();
+    let target = destination.to_string_lossy().into_owned();
+
+    let (code, out, err) = run(&[&engine_dir, &target, "--allow-http"], &line);
+    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+
+    // The same request, now carrying the digest it always had in fact.
+    let (code, _, err) = run(
+        &[
+            &engine_dir,
+            &target,
+            "--allow-http",
+            "--sha256",
+            &hex(&expected_digest(&body)),
+        ],
+        &line,
+    );
+    assert_ne!(code, Some(0), "a changed request must not silently fork");
+    assert!(
+        err.contains("COMMAND-CONFLICT"),
+        "it must be refused as a conflict, not something else.\nstderr: {err}"
+    );
+
+    // And the directory is still usable, which is the part that was lost.
+    let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
+    assert_eq!(
+        code,
+        Some(0),
+        "--continue must still work.\nstdout: {out}\nstderr: {err}"
+    );
+}
+
+/// A flag nothing on that path reads is refused, not swallowed.
+///
+/// `--continue` is every job the directory remembers and `--serve` is whatever a
+/// client asks for later, so neither has one request to attach a checksum to --
+/// and neither reads the field. Accepting it was the same defect as parsing
+/// `--sha256` and dropping it: the operator asks for an integrity check, gets
+/// exit 0, and is never told the check did not happen.
+#[test]
+fn a_checksum_is_refused_where_nothing_would_read_it() {
+    let state = Directory::new("process-modes");
+    let digest = hex(&[0x22; 32]);
+    for arguments in [
+        vec!["--continue", "--sha256", &digest],
+        vec!["--serve", "--sha256", &digest],
+    ] {
+        let mut full = vec![state.engine().to_string_lossy().into_owned()];
+        full.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+        let borrowed: Vec<&str> = full.iter().map(String::as_str).collect();
+        let (code, out, err) = run(&borrowed, "");
+        assert_ne!(
+            code,
+            Some(0),
+            "{arguments:?} accepted a checksum it ignores.\nstdout: {out}\nstderr: {err}"
+        );
+        assert!(
+            err.contains("--sha256"),
+            "the refusal must name the flag.\nstderr: {err}"
+        );
+    }
+}
+
+/// The client refuses an argument it does not understand.
+///
+/// This one costs a credential when it is wrong: `--sensitive` exists so a signed
+/// link is never written to disk, and a one-character typo used to be collected,
+/// ignored, and answered with `accepted 1` and exit 0.
+#[test]
+fn the_client_refuses_an_argument_it_does_not_understand() {
+    let state = Directory::new("process-clientflags");
+    let destination = state.0.join("whatever.bin");
+    for flag in ["--sensitve", "--frobnicate", "--sha256"] {
+        let (code, out, err) = run(
+            &[
+                &state.engine().to_string_lossy(),
+                "--client",
+                "add",
+                &destination.to_string_lossy(),
+                flag,
+            ],
+            "http://127.0.0.1:1/file\n",
+        );
+        assert_eq!(
+            code,
+            Some(2),
+            "{flag} was swallowed.\nstdout: {out}\nstderr: {err}"
+        );
+        assert!(err.contains("usage:"), "stderr was: {err}");
+    }
+}
+
 /// Two processes over the real control surface: one serving, one commanding.
 ///
 /// This is the only test anywhere that opens the pipe or socket between separate
@@ -154,19 +277,24 @@ fn a_client_process_commands_a_serving_process() {
     let body = content(48 * 1024);
     let (port, _) = serve(body.clone(), 0);
 
-    let mut resident = Command::new(engine())
-        .args([
-            &state.engine().to_string_lossy() as &str,
-            "--serve",
-            "--download-root",
-            &root.to_string_lossy(),
-            "--allow-http",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the resident starts");
+    let mut resident = Resident(
+        Command::new(engine())
+            .args([
+                &state.engine().to_string_lossy() as &str,
+                "--serve",
+                "--download-root",
+                &root.to_string_lossy(),
+                "--allow-http",
+            ])
+            .stdin(Stdio::null())
+            // Not piped: nothing reads these, and the resident writes a line per
+            // commit. A larger body would fill the pipe and block it forever,
+            // turning an assertion into a hang.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the resident starts"),
+    );
 
     // The surface appears when the resident is ready; polling it is the signal,
     // and a fixed sleep would be either flaky or slow.
@@ -211,7 +339,7 @@ fn a_client_process_commands_a_serving_process() {
     assert_eq!(code, Some(0));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match resident.try_wait().expect("wait on the resident") {
+        match resident.0.try_wait().expect("wait on the resident") {
             Some(status) => {
                 assert!(status.success(), "the resident exited with {status}");
                 break;
@@ -240,6 +368,20 @@ fn a_client_without_an_engine_fails_promptly() {
         started.elapsed() < Duration::from_secs(20),
         "it should not hang: {err}"
     );
+}
+
+/// Kills the serving process however the test ends. Without this, any assertion
+/// between the spawn and the shutdown leaves an engine holding a named pipe and a
+/// temporary directory, and the next run on that machine meets a live squatter on
+/// its own endpoint.
+struct Resident(std::process::Child);
+impl Drop for Resident {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

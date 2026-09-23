@@ -49,6 +49,12 @@ pub enum EngineError {
     CrossVolume,
     /// The job is waiting for a decision; run again with Intent::Resume.
     NeedsDecision(Option<StopReason>),
+    /// The state directory's own access list lets accounts other than this one,
+    /// the system and the administrators write into it. It holds the job record
+    /// and every partial file, so the engine will not adopt it. The count is how
+    /// many such principals were found; the SIDs stay out of the code, which is
+    /// carried across layers and logged.
+    ExposedStateDirectory(u32),
     Persistence(PersistenceError),
     Binding(BindingError),
     Admission(AppError),
@@ -198,11 +204,13 @@ fn own_parts(state: &Path) -> Result<FileStorage, EngineError> {
 /// Creates the engine's own tree: no link may stand in for a directory, and on
 /// Unix only the owner may read it. The destination stays the user's business.
 fn own_directory(path: &Path) -> Result<(), EngineError> {
-    match std::fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+    // Whether this run made the directory decides what may be done to it: one we
+    // created gets permissions of our own, one we found gets inspected.
+    let created = match std::fs::create_dir(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(_) => return Err(EngineError::InvalidInput),
-    }
+    };
     let metadata = std::fs::symlink_metadata(path).map_err(|_| EngineError::InvalidInput)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(EngineError::InvalidInput);
@@ -219,6 +227,28 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| EngineError::InvalidInput)?;
+    }
+    // Unix states the permissions it wants above. Windows inherits instead, and
+    // what it inherits depends entirely on where the operator put this directory:
+    // a child of %LOCALAPPDATA%\Temp picks up entries for packaged applications,
+    // and one on a data volume or at a drive root picks up Authenticated Users
+    // with Modify -- every account on the machine. Since this directory holds the
+    // job record and every partial file, inheriting either would mean something
+    // other than this engine can rewrite what a download has already saved.
+    //
+    // So a directory we just made gets permissions of its own, and one that was
+    // already there is inspected and refused if it is open to anyone else. We do
+    // not rewrite what we did not create: the operator may have pointed at
+    // something shared or redirected, and changing its permissions silently is a
+    // worse surprise than declining to use it.
+    if created {
+        fhd_platform::protect_new_directory(path).map_err(|_| EngineError::InvalidInput)?;
+    }
+    let foreign = fhd_platform::foreign_writers(path).map_err(|_| EngineError::InvalidInput)?;
+    if !foreign.is_empty() {
+        return Err(EngineError::ExposedStateDirectory(
+            foreign.sids().len() as u32
+        ));
     }
     Ok(())
 }
@@ -329,13 +359,20 @@ impl Engine {
             admitted.push(Admitted {
                 key: ReceiptKey::new(
                     Principal::new(1).map_err(EngineError::Admission)?,
-                    // The whole request: the same URL elsewhere is another job.
+                    // What to fetch and where it lands: the same URL elsewhere is
+                    // another job. The expected digest is deliberately NOT here.
+                    // It changes neither of those, and folding it in made the same
+                    // command line before and after `--sha256` started being
+                    // applied resolve to two different jobs aiming at one name --
+                    // which `open_many` then refuses outright, leaving `--continue`
+                    // permanently broken for that directory. Out of the key, a
+                    // changed digest meets `Receipt::replay` instead and is
+                    // refused loudly as a conflict.
                     digest(
                         b"FHD.request.v1\0",
                         &[
                             request.url.as_bytes(),
                             request.destination.to_string_lossy().as_bytes(),
-                            &request.expected_sha256.unwrap_or_default(),
                             &config.max_bytes.to_le_bytes(),
                             &[u8::from(config.allow_http)],
                         ],
@@ -889,6 +926,7 @@ pub fn code(error: &EngineError) -> String {
             Some(reason) => format!("STOPPED-{}-RERUN-WITH-RESUME", stop_reason(reason)),
             None => "STOPPED-RERUN-WITH-RESUME".into(),
         },
+        EngineError::ExposedStateDirectory(_) => "STATE-DIRECTORY-EXPOSED".into(),
         EngineError::Persistence(error) => error.code().into(),
         EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),

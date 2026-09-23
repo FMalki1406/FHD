@@ -29,6 +29,24 @@ impl UserScope {
     }
 }
 
+/// Who may write to a directory besides the people we already trust.
+///
+/// "Trusted" is the account that runs the engine, the system account, and the
+/// local administrators: an administrator can take ownership and SYSTEM can read
+/// anything, so listing them would be noise rather than a finding.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ForeignWriters(Vec<String>);
+impl ForeignWriters {
+    /// The SIDs, as text, of every principal outside the trusted set that the
+    /// directory's own access list grants write access to.
+    pub fn sids(&self) -> &[String] {
+        &self.0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::*;
@@ -47,6 +65,17 @@ mod imp {
             session: 0,
         })
     }
+
+    /// Unix states the permissions it wants with `set_permissions`, so there is
+    /// nothing to inspect here: the mode is set, not inherited.
+    pub fn foreign_writers(_: &std::path::Path) -> io::Result<ForeignWriters> {
+        Ok(ForeignWriters::default())
+    }
+
+    /// The caller sets the mode on Unix; there is no inherited list to replace.
+    pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -59,9 +88,12 @@ mod imp {
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                ConvertStringSidToSidW, SDDL_REVISION_1,
+                ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
+                SDDL_REVISION_1, SE_FILE_OBJECT,
             },
-            EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+            EqualSid, GetAce, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser,
+            ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
+            PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
         System::{
             RemoteDesktop::ProcessIdToSessionId,
@@ -407,6 +439,198 @@ mod imp {
     /// system to refuse if the name already exists, which is how a squatter is
     /// detected rather than silently joined. Must be called inside a Tokio
     /// runtime with the I/O driver enabled.
+    /// Everything that counts as writing. `GENERIC_WRITE` and `GENERIC_ALL` are
+    /// included because an inherited entry may still carry the generic form, and
+    /// `WRITE_DAC`/`WRITE_OWNER` because either one lets the holder grant itself
+    /// the rest.
+    const WRITE_RIGHTS: u32 = 0x0002   // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0004  // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0010  // FILE_WRITE_EA
+        | 0x0100  // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000  // DELETE
+        | 0x0004_0000  // WRITE_DAC
+        | 0x0008_0000  // WRITE_OWNER
+        | 0x1000_0000  // GENERIC_ALL
+        | 0x4000_0000; // GENERIC_WRITE
+
+    /// Who, besides this account and the system and the administrators, the
+    /// directory's access list lets write into it.
+    ///
+    /// The engine never set permissions on Windows, and what a directory inherits
+    /// depends entirely on where it is: under `%LOCALAPPDATA%` the inherited list
+    /// is owner, SYSTEM and Administrators, while a directory made on a data
+    /// volume or at a drive root inherits `Authenticated Users: Modify` -- every
+    /// account on the machine. That directory holds the job database and every
+    /// partial file, so it decides whether "the same user" means anything at rest.
+    ///
+    /// This reports rather than repairs: the caller refuses a directory it cannot
+    /// vouch for, which is honest about a path the operator chose. Changing the
+    /// permissions of a folder the operator pointed at would be a surprise, and on
+    /// a shared or redirected folder a destructive one.
+    pub fn foreign_writers(path: &std::path::Path) -> io::Result<ForeignWriters> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated path that outlives the call, and the
+        // two out-parameters are valid. On success the system allocates one
+        // descriptor which owns the ACL memory; `Local` frees it exactly once.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _owned = Local(descriptor);
+        // A null access list is not an empty one: it grants everyone everything.
+        // Reporting it as "no foreign writers" would invert the answer.
+        if dacl.is_null() {
+            return Ok(ForeignWriters(vec!["S-1-1-0".to_owned()]));
+        }
+        let scope = user_scope()?;
+        let trusted = [scope.identity.as_str(), "S-1-5-18", "S-1-5-32-544"];
+        // SAFETY: `dacl` points at an ACL inside the descriptor kept alive above.
+        let count = unsafe { (*dacl).AceCount };
+        let mut foreign = Vec::new();
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `index` is below the count the same ACL reported.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                continue;
+            }
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: every ACE begins with a header, whatever its body.
+            let (kind, flags, mask) = unsafe {
+                (
+                    (*ace).Header.AceType,
+                    u32::from((*ace).Header.AceFlags),
+                    (*ace).Mask,
+                )
+            };
+            // Only plain allow entries grant anything here; a deny entry narrows
+            // and an inherit-only entry describes children, not this directory.
+            if kind != 0 || flags & INHERIT_ONLY_ACE != 0 || mask & WRITE_RIGHTS == 0 {
+                continue;
+            }
+            // SAFETY: in an ACCESS_ALLOWED_ACE the SID begins at `SidStart`.
+            let sid = unsafe { ptr::addr_of!((*ace).SidStart).cast::<c_void>().cast_mut() };
+            if trusted
+                .iter()
+                .any(|known| parse_sid(known).is_some_and(|known| equal(known.0, sid)))
+            {
+                continue;
+            }
+            let text = sid_text(sid).unwrap_or_else(|| "<unreadable>".to_owned());
+            if !foreign.contains(&text) {
+                foreign.push(text);
+            }
+        }
+        Ok(ForeignWriters(foreign))
+    }
+
+    /// Gives a directory we just created an access list of its own: this account,
+    /// the system and the administrators, and inheritance switched off.
+    ///
+    /// Only for a directory this process created. What a new directory inherits
+    /// depends on where it sits -- under `%LOCALAPPDATA%\Temp` it picks up entries
+    /// for packaged applications, and on a data volume or a drive root it picks up
+    /// `Authenticated Users: Modify`. Since the state directory holds the job
+    /// record and every partial file, it gets stated permissions rather than
+    /// inherited ones.
+    ///
+    /// A directory we did not create is never touched: the operator may have
+    /// pointed at something shared or redirected, and rewriting its permissions
+    /// would be a worse surprise than refusing it.
+    pub fn protect_new_directory(path: &std::path::Path) -> io::Result<()> {
+        let sid = user_scope()?.identity;
+        // OICI: the same entries are inherited by what we create inside, so the
+        // parts and the database do not each need their own call. P: protected,
+        // so nothing the parent grants leaks back in.
+        let sddl = format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        let wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated wide string that outlives the call,
+        // and `descriptor` is a valid out-parameter the system allocates into.
+        let built = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if built == 0 || descriptor.is_null() {
+            return Err(last_error());
+        }
+        let owned = Local(descriptor);
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let (mut present, mut defaulted) = (0, 0);
+        // SAFETY: `descriptor` is a valid descriptor built above, and the three
+        // out-parameters are valid for the call.
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+        };
+        if read == 0 || present == 0 || dacl.is_null() {
+            return Err(last_error());
+        }
+        let target: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        // SAFETY: `target` is a null-terminated path and `dacl` points inside the
+        // descriptor, which `owned` keeps alive until after this call returns.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                target.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        drop(owned);
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+
+    /// Whether two SID pointers name the same account.
+    fn equal(a: *mut c_void, b: *mut c_void) -> bool {
+        // SAFETY: both point at valid SIDs owned by their callers for this call.
+        unsafe { EqualSid(a, b) != 0 }
+    }
+
+    /// A SID as text, for a message a person has to act on.
+    fn sid_text(sid: *mut c_void) -> Option<String> {
+        let mut text: *mut u16 = ptr::null_mut();
+        // SAFETY: `sid` is a valid SID and `text` a valid out-parameter the
+        // system allocates into.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return None;
+        }
+        let owned = Local(text.cast());
+        let mut length = 0;
+        // SAFETY: the system returned a null-terminated wide string.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: `length` is the count of units before the terminator.
+        let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        drop(owned);
+        Some(value)
+    }
+
     pub fn create_pipe(
         name: &str,
         first: bool,
@@ -524,11 +748,130 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
-pub use imp::{process_cpu, user_scope};
+pub use imp::{foreign_writers, process_cpu, protect_new_directory, user_scope};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory nobody outside the trusted set may write is reported clean,
+    /// and one that grants a foreign account write access is reported by name.
+    ///
+    /// The second half is what makes this test worth having: a check that always
+    /// answers "clean" would pass the first half alone, and the engine would adopt
+    /// a directory every account on the machine can rewrite.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_a_stranger_may_write_is_reported() {
+        use std::process::Command;
+        let base = std::env::temp_dir().join(format!(
+            "fhd-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let private = base.join("private");
+        let shared = base.join("shared");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+
+        // Inheritance is switched off and a single entry for this account is
+        // written, which is what a directory the engine may adopt looks like.
+        let sid = user_scope().unwrap().identity;
+        let ok = Command::new("icacls")
+            .arg(&private)
+            .args(["/inheritance:r", "/grant"])
+            .arg(format!("*{sid}:(OI)(CI)F"))
+            .output()
+            .expect("icacls runs");
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert!(
+            foreign_writers(&private).unwrap().is_empty(),
+            "a directory only this account may write must be clean"
+        );
+
+        // The same, plus write access for a well-known account that is not us:
+        // S-1-5-11 is Authenticated Users, which is exactly what a data volume
+        // hands out by inheritance.
+        let ok = Command::new("icacls")
+            .arg(&shared)
+            .args(["/inheritance:r", "/grant"])
+            .arg(format!("*{sid}:(OI)(CI)F"))
+            .arg("/grant")
+            .arg("*S-1-5-11:(OI)(CI)M")
+            .output()
+            .expect("icacls runs");
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        let foreign = foreign_writers(&shared).unwrap();
+        assert!(
+            foreign.sids().iter().any(|found| found == "S-1-5-11"),
+            "a stranger with write access went unreported: {foreign:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory made under a parent that hands out write access to others is
+    /// exposed until it is given permissions of its own, and clean afterwards.
+    ///
+    /// `%LOCALAPPDATA%\Temp` is the real case, not a contrived one: on this
+    /// machine it grants write access to three packaged-application principals,
+    /// and anything created inside inherits them. So the check finds a fresh
+    /// directory there exposed, and `protect_new_directory` is what clears it.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_directory_is_exposed_by_what_it_inherits_until_it_is_protected() {
+        let base = std::env::temp_dir().join(format!(
+            "fhd-protect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let inherited = foreign_writers(&base).unwrap();
+
+        protect_new_directory(&base).unwrap();
+        assert!(
+            foreign_writers(&base).unwrap().is_empty(),
+            "stated permissions still let someone else write: {:?}",
+            foreign_writers(&base).unwrap()
+        );
+
+        // And what the engine creates inside it inherits the stated list, so the
+        // database and the part files do not each need their own call.
+        let child = base.join("parts");
+        std::fs::create_dir(&child).unwrap();
+        assert!(foreign_writers(&child).unwrap().is_empty());
+
+        // Recorded rather than asserted: a machine whose temp directory is
+        // already owner-only would see nothing here, and that is not a failure.
+        // The assertion that matters is that protection clears whatever was there.
+        println!("inherited foreign writers before protection: {inherited:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Unix sets its own mode, so the check has nothing to report there. Pinning
+    /// it stops the non-Windows arm quietly becoming something else.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_reports_no_foreign_writers() {
+        assert!(foreign_writers(std::path::Path::new("/tmp"))
+            .unwrap()
+            .is_empty());
+    }
 
     /// A name no other test in this process will claim.
     #[cfg(windows)]
