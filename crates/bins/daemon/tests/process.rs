@@ -374,13 +374,36 @@ fn a_duplicated_destination_does_not_lock_the_whole_directory() {
     }
 
     // The directory still continues. Before, this returned ENGINE-INVALID-INPUT
-    // and the unrelated job could never be resumed again.
+    // and exited 2, and the unrelated job could never be resumed again.
+    //
+    // What is asserted is that the directory is not locked, not that every job
+    // succeeds: a job may still come to rest needing a decision, and whether it
+    // does depends on timing. Asserting exit 0 would be asserting the race.
     let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
-    assert_eq!(
+    assert_ne!(
         code,
-        Some(0),
-        "a duplicated destination locked the directory.
+        Some(2),
+        "the directory was refused as a whole.
 stdout: {out}
+stderr: {err}"
+    );
+    assert!(
+        !out.contains("ENGINE-INVALID-INPUT") && !err.contains("ENGINE-INVALID-INPUT"),
+        "the duplicate locked the directory.
+stdout: {out}
+stderr: {err}"
+    );
+    // Each remembered job is reported on its own line, so the survivors are
+    // reachable rather than collectively refused.
+    assert!(
+        out.lines().count() >= 2,
+        "the unrelated jobs did not survive.
+stdout: {out}
+stderr: {err}"
+    );
+    assert!(
+        err.contains("CONTINUE-DESTINATION-TAKEN"),
+        "the duplicate was not the thing that was skipped.
 stderr: {err}"
     );
 }
