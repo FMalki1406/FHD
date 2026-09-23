@@ -45,12 +45,11 @@ pub enum EngineError {
     DestinationRefused,
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
-    /// Publication renames within a volume; this destination is on another one.
     /// The job is waiting for a decision; run again with Intent::Resume.
     NeedsDecision(Option<StopReason>),
     /// The state directory's own access list lets accounts other than this one,
     /// the system and the administrators write into it. It holds the job record
-    /// and every partial file, so the engine will not adopt it. The count is how
+    /// and the receipts, so the engine will not adopt it. The count is how
     /// many such principals were found; the SIDs stay out of the code, which is
     /// carried across layers and logged.
     ExposedStateDirectory(u32),
@@ -93,6 +92,83 @@ impl Destinations for FixedDestinations {
             .cloned()
             .ok_or(AppError::InvalidInput)
     }
+
+    fn parts_for(&self, destination: DestinationRef) -> Result<PathBuf, AppError> {
+        private_parts_directory(&self.resolve(destination)?)
+    }
+}
+
+/// The private directory a destination's part file is written in.
+///
+/// Parts moved next to their destination so that publication stays a link
+/// within one directory, which is what lets a download land on a disk the
+/// engine does not live on. Inside the engine's own directory they were covered
+/// by an access list it had set; the user's download folder is not ours, and on
+/// a data volume here it grants `Authenticated Users` write. Writing the part
+/// straight into it would hand every account on the machine the bytes of a
+/// download in progress.
+///
+/// So the part goes in a directory beside the destination that this engine
+/// creates with its own list -- this account, the system, the administrators,
+/// inheritance closed -- and the part inherits that. Same volume as the
+/// destination, so the link is unaffected.
+///
+/// **What this does not reach**, measured rather than assumed -- an earlier
+/// version of this comment said two things a review disproved.
+///
+/// It said `Authenticated Users: Modify` on the download folder leaves the
+/// holder able to rename or remove this directory. It does not: that mask is
+/// `0x1301BF` and `FILE_DELETE_CHILD` (`0x40`) is clear. Measured against a
+/// live part file, an Authenticated-Users principal was denied read, write,
+/// create, delete and rename. The residual applies to a folder that grants Full
+/// Control or delete-child explicitly, not to the ordinary data-volume default.
+///
+/// And it said a substituted part can never be published because the file is
+/// verified against its digest. That holds only when the caller supplied one.
+/// With no `--sha256`, verification computes the digest from the file itself
+/// and compares it with itself, so tampering is invisible to it; a review
+/// overwrote sixteen bytes of a live part and the engine published them. What
+/// stops substitution here is this directory's access list, not verification --
+/// so the list is the control, and it is the thing that has to be right.
+///
+/// The ceiling is still the folder the user chose, and we do not raise it.
+pub(crate) fn private_parts_directory(destination: &Path) -> Result<PathBuf, AppError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(AppError::InvalidInput)?;
+    let directory = parent.join(".fhd-parts");
+    let created =
+        fhd_platform::create_protected_directory(&directory).map_err(|_| AppError::InvalidInput)?;
+    if created {
+        return Ok(directory);
+    }
+    // One we found, not one we made -- and a download folder that grants write
+    // lets any account on the machine make it first. Replacing its access list
+    // is not enough, because whoever created it owns it, and an owner holds
+    // WRITE_DAC whatever the list says: ours goes on, theirs goes back, and the
+    // part file inherits theirs. A review demonstrated exactly that, and read
+    // and wrote a live part file through it.
+    //
+    // So it is inspected the way the state directory is, and refused rather than
+    // adopted. `foreign_writers` reads the owner too, which is the part that
+    // matters here.
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|_| AppError::InvalidInput)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(AppError::InvalidInput);
+        }
+    }
+    let exposed = fhd_platform::foreign_writers(&directory).map_err(|_| AppError::InvalidInput)?;
+    if !exposed.is_empty() {
+        return Err(AppError::InvalidInput);
+    }
+    Ok(directory)
 }
 
 /// This build accepts requests only from the local operator.
@@ -119,7 +195,10 @@ pub enum Intent {
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Application-owned directory for the database and the part files.
+    /// Application-owned directory for the job record, the receipts and the
+    /// engine's own bookkeeping. Part files go in a private directory beside
+    /// each destination instead, so publication stays a link within one
+    /// directory and the destination may be on another disk.
     pub state_directory: PathBuf,
     pub destination: PathBuf,
     /// Connections one job may use.
@@ -419,7 +498,6 @@ impl Engine {
                     retry: RetryPolicy::new(5, 1000, 60_000)
                         .map_err(|_| EngineError::InvalidInput)?,
                 },
-                config.state_directory.join("parts"),
             )
             .map_err(EngineError::Run)?
             .with_governor(governor.clone()),

@@ -287,6 +287,29 @@ pub trait ReferenceStore: Send + Sync {
 
 pub trait Destinations: Send + Sync {
     fn resolve(&self, destination: DestinationRef) -> Result<std::path::PathBuf, AppError>;
+
+    /// Where this destination's part file belongs.
+    ///
+    /// Asked rather than derived, because the answer needs operating-system
+    /// permissions to be right and those live in the composition root. A part
+    /// beside its destination keeps publication a link within one directory --
+    /// that is what lets a download land on a disk the engine does not live on
+    /// -- but the user's download folder is not ours, and on a data volume it
+    /// commonly grants every account on the machine write access. So the
+    /// implementation returns a directory it has made private, next to the
+    /// destination, rather than the destination folder itself.
+    ///
+    /// The default keeps the destination's own folder, for implementations with
+    /// no permissions to apply -- tests, and platforms where this is not yet
+    /// answered. It is the weaker answer, and callers do not get to assume
+    /// otherwise.
+    fn parts_for(&self, destination: DestinationRef) -> Result<std::path::PathBuf, AppError> {
+        let path = self.resolve(destination)?;
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .ok_or(AppError::InvalidInput)
+    }
 }
 
 /// Durable transfer state. Each call is one transaction; nothing is acknowledged

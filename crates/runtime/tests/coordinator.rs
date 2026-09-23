@@ -80,7 +80,6 @@ fn rig_with(
         BufferPool::new(1024 * 1024).unwrap(),
         Arc::new(FixedClock),
         config,
-        std::env::temp_dir(),
     )
     .unwrap();
     Rig {
@@ -440,7 +439,6 @@ fn buffer_budget_below_one_block_per_connection_is_rejected() {
         BufferPool::new(512 * 1024).unwrap(),
         Arc::new(FixedClock),
         config(),
-        std::env::temp_dir(),
     );
     assert!(matches!(result, Err(RunError::InvalidConfig)));
 }

@@ -168,7 +168,6 @@ fn rig(jobs: u64, content: &[u8], limits: OriginLimits) -> Rig {
             writer_capacity: 8,
             retry: RetryPolicy::new(4, 1000, 10_000).unwrap(),
         },
-        directory.clone(),
     )
     .unwrap()
     .with_governor(governor.clone());
