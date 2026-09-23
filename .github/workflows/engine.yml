@@ -59,8 +59,12 @@ jobs:
       # runner we cannot reproduce, the failing step name is the whole diagnosis.
       - name: Test domain and application
         run: cargo +1.98.1 test -p fhd-domain -p fhd-app -p fhd-config -p fhd-telemetry --locked
-      - name: Test protocol and IPC
-        run: cargo +1.98.1 test -p fhd-protocol -p fhd-ipc -p fhd-platform --locked
+      - name: Test protocol
+        run: cargo +1.98.1 test -p fhd-protocol --locked
+      - name: Test platform primitives
+        run: cargo +1.98.1 test -p fhd-platform --locked
+      - name: Test IPC
+        run: cargo +1.98.1 test -p fhd-ipc --locked
       - name: Test storage and persistence adapters
         run: cargo +1.98.1 test -p fhd-storage -p fhd-persistence --locked
       - name: Test HTTP adapter
