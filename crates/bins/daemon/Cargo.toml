@@ -22,6 +22,12 @@ tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 # Measurements only: what a batched commit would cost against the same
 # durability settings the repository uses.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+# Measurements only: processor time, to say where the work goes.
+fhd-platform = { path = "../../adapters/platform" }
+# Measurement only: a candidate for the engine's internal checkpoint digests,
+# weighed against the SHA-256 the published file's verification must keep.
+blake3 = "=1.8.2"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2"] }
 fhd-runtime = { path = "../../runtime" }
 sha2 = "=0.11.0"
 tokio = { version = "=1.51.4", features = ["macros", "rt-multi-thread", "time"] }
