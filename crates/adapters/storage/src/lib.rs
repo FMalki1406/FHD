@@ -253,6 +253,28 @@ struct FilePart {
     // Released after every open data/metadata handle of this part.
     _lock: Option<Arc<File>>,
 }
+/// The part file's own permissions, not only its directory's.
+///
+/// A part now lives beside its destination rather than inside the engine's own
+/// directory, and on Unix `create_new` leaves the default `0666 & ~umask` --
+/// commonly `0644`, readable by everyone. The directory is `0700`, so nothing
+/// gets in through it today; a file that protects itself does not depend on
+/// that staying true, and a review named the gap.
+///
+/// Windows takes its access list from the directory it is created in, which the
+/// composition root has made private, so there is nothing to set here.
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600)
+    }
+    #[cfg(not(unix))]
+    {
+        options
+    }
+}
+
 impl FilePart {
     fn open_inner(
         path: &Path,
@@ -267,9 +289,7 @@ impl FilePart {
         check_optional(&part_path)?;
         check_optional(&metadata_path)?;
         // Create-new never truncates a surviving generation or unrelated file.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = owner_only(OpenOptions::new().read(true).write(true))
             .create_new(create)
             .open(&part_path)
             .map_err(|error| {
@@ -280,9 +300,7 @@ impl FilePart {
                 }
             })?;
 
-        let mut metadata = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut metadata = owner_only(OpenOptions::new().read(true).write(true))
             .create_new(create)
             .open(&metadata_path)
             .map_err(io)?;

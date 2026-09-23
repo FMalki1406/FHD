@@ -614,15 +614,24 @@ async fn a_part_file_does_not_inherit_what_the_download_folder_grants() {
     // A finished job discards its part, and a discarded part cannot be asked
     // anything. If the pause lost the race there is nothing here to measure, and
     // that is reported rather than passed over.
+    // Under `.fhd-parts/<engine>/`, so the walk is recursive: each engine owns
+    // its own directory there so two of them cannot claim one part name.
     let parts = folder.join(".fhd-parts");
-    let mut found = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&parts) {
+    fn collect(path: &std::path::Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
         for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|kind| kind == "part") {
-                found.push(entry.path());
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, found);
+            } else if path.extension().is_some_and(|kind| kind == "part") {
+                found.push(path);
             }
         }
     }
+    let mut found = Vec::new();
+    collect(&parts, &mut found);
     assert!(
         !found.is_empty(),
         "no part file survived the pause, so nothing here was measured: {parts:?}"
@@ -719,5 +728,94 @@ async fn a_parts_directory_we_did_not_create_is_refused() {
     assert!(
         acl.contains("Authenticated Users") || acl.contains("S-1-5-11"),
         "the planted directory was taken over instead of refused:\n{acl}"
+    );
+}
+
+/// Two engines downloading into one folder do not fight over a part file.
+///
+/// Each engine has its own job record and each numbers its jobs from one, so
+/// sharing a download folder they both wanted `1-1.part`. A review ran that: the
+/// second engine took the first one's file over, re-downloaded into it from
+/// zero, and published its own content correctly -- while the first engine's
+/// progress was destroyed with nothing said. The bytes published were never
+/// wrong; the loss was silent, which is what makes it a defect rather than a
+/// race worth tolerating.
+///
+/// So each engine's parts live under a directory named for the state directory
+/// that holds its job record: stable across a restart, so the same engine finds
+/// its own part and resumes, and distinct between engines, so neither can reach
+/// the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
+    let first_body = content(6 * 1024 * 1024);
+    let second_body = content(3 * 1024 * 1024 + 5);
+    let (first_port, first_served) = serve(first_body.clone(), 0);
+    let (second_port, _) = serve(second_body.clone(), 0);
+
+    let shared = Directory::new("two-engines-folder");
+    let folder = shared.0.join("Downloads");
+    std::fs::create_dir_all(&folder).expect("the download folder is created");
+    let first_state = Directory::new("two-engines-a");
+    let second_state = Directory::new("two-engines-b");
+    let first_destination = folder.join("first.bin");
+    let second_destination = folder.join("second.bin");
+
+    // Engine A starts and is paused with progress on disk.
+    let first_url = format!("http://127.0.0.1:{first_port}/file");
+    let engine = Engine::open(
+        config(&first_state, first_destination.clone(), 2),
+        &first_url,
+    )
+    .await
+    .unwrap();
+    let (paused, receiver) = mpsc::channel(1);
+    let run = engine.run(receiver);
+    let pause = async {
+        while first_served.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        paused.send(Control::Pause).await.unwrap();
+    };
+    let (outcome, ()) = tokio::join!(run, pause);
+    outcome.expect("the first run settles");
+    drop(engine);
+
+    // Engine B runs a different download to completion in the same folder.
+    let second_url = format!("http://127.0.0.1:{second_port}/file");
+    let mut settings = config(&second_state, second_destination.clone(), 2);
+    settings.expected_sha256 = Some(expected_digest(&second_body));
+    let other = Engine::open(settings, &second_url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert_eq!(
+        other.run(receiver).await.unwrap(),
+        SessionEnd::Published(second_destination.clone()),
+        "reason: {:?}",
+        other.reason().await.unwrap()
+    );
+    drop(other);
+    assert_eq!(std::fs::read(&second_destination).unwrap(), second_body);
+
+    // Engine A resumes. Its progress must have survived engine B entirely, and
+    // its file must be its own content.
+    if !first_destination.exists() {
+        let resumed = Engine::open(
+            resuming(&first_state, first_destination.clone(), 2),
+            &first_url,
+        )
+        .await
+        .unwrap();
+        let (_control, receiver) = mpsc::channel(1);
+        let outcome = resumed.run(receiver).await.unwrap();
+        assert_eq!(
+            outcome,
+            SessionEnd::Published(first_destination.clone()),
+            "reason: {:?}",
+            resumed.reason().await.unwrap()
+        );
+    }
+    assert_eq!(
+        std::fs::read(&first_destination).unwrap(),
+        first_body,
+        "the first engine's file did not survive the second engine"
     );
 }
