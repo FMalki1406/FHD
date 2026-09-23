@@ -374,15 +374,117 @@ fn a_duplicated_destination_does_not_lock_the_whole_directory() {
     }
 
     // The directory still continues. Before, this returned ENGINE-INVALID-INPUT
-    // and the unrelated job could never be resumed again.
+    // and exited 2, and the unrelated job could never be resumed again.
+    //
+    // What is asserted is that the directory is not locked, not that every job
+    // succeeds: a job may still come to rest needing a decision, and whether it
+    // does depends on timing. Asserting exit 0 would be asserting the race.
     let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
-    assert_eq!(
+    assert_ne!(
         code,
-        Some(0),
-        "a duplicated destination locked the directory.
+        Some(2),
+        "the directory was refused as a whole.
 stdout: {out}
 stderr: {err}"
     );
+    assert!(
+        !out.contains("ENGINE-INVALID-INPUT") && !err.contains("ENGINE-INVALID-INPUT"),
+        "the duplicate locked the directory.
+stdout: {out}
+stderr: {err}"
+    );
+    // Each remembered job is reported on its own line, so the survivors are
+    // reachable rather than collectively refused.
+    assert!(
+        out.lines().count() >= 2,
+        "the unrelated jobs did not survive.
+stdout: {out}
+stderr: {err}"
+    );
+    assert!(
+        err.contains("CONTINUE-DESTINATION-TAKEN"),
+        "the duplicate was not the thing that was skipped.
+stderr: {err}"
+    );
+}
+
+/// A state directory whose path somebody else could rename is refused.
+///
+/// Giving the directory an access list of its own settles who may write into it
+/// and nothing about who may replace it: renaming needs DELETE on the component
+/// or FILE_DELETE_CHILD on its parent, and the directory's own list grants
+/// neither. On this machine every ancestor of a path on a data volume grants
+/// Authenticated Users enough to move a directory aside, so a check made against
+/// the path describes a directory that need not be the one opened a moment later.
+///
+/// Skipped where no such path is available rather than asserting something the
+/// machine cannot show.
+#[test]
+#[cfg(windows)]
+fn a_state_path_others_could_rename_is_refused() {
+    // The exposed condition is built here, not looked for. Asking
+    // `swappable_components` whether a swappable path exists and skipping when it
+    // says no would make the control its own oracle: a control that wrongly
+    // reports everything clean would skip this test and pass.
+    //
+    // So: a directory this account protects, then one child granted DELETE to
+    // Authenticated Users through `icacls`, which knows nothing about our check.
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("fhd-swaptest-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("the base directory is created");
+    fhd_platform::protect_new_directory(&base).expect("the base is protected");
+    let exposed = base.join("exposed");
+    std::fs::create_dir(&exposed).expect("the exposed directory is created");
+
+    let granted = std::process::Command::new("icacls")
+        .arg(&exposed)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)(D)"])
+        .output()
+        .expect("icacls runs");
+    // A missing environment requirement is recorded as a failure, not a skip.
+    // Passing quietly here would mean the control has no coverage at all and
+    // nothing says so.
+    assert!(
+        granted.status.success(),
+        "this test needs icacls to grant DELETE to S-1-5-11; without it the \
+         control is uncovered rather than covered: {}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+
+    let (code, out, err) = run(
+        &[
+            &exposed.join("state").to_string_lossy(),
+            &exposed.join("out.bin").to_string_lossy(),
+            "--allow-http",
+        ],
+        "http://127.0.0.1:1/file\n",
+    );
+    assert_ne!(code, Some(0), "a swappable path was accepted");
+    assert!(
+        err.contains("STATE-PATH-SWAPPABLE") || out.contains("STATE-PATH-SWAPPABLE"),
+        "refused for the wrong reason.\nstdout: {out}\nstderr: {err}"
+    );
+
+    // And the control is not simply refusing everything: the protected base is
+    // accepted. Without this the test above would pass against a check that
+    // always said "swappable".
+    let (code, out, err) = run(
+        &[
+            &base.join("fine").to_string_lossy(),
+            &base.join("fine-out.bin").to_string_lossy(),
+            "--allow-http",
+        ],
+        "http://127.0.0.1:1/file\n",
+    );
+    assert!(
+        !err.contains("STATE-PATH-SWAPPABLE") && !out.contains("STATE-PATH-SWAPPABLE"),
+        "a protected path was refused as swappable.\nstdout: {out}\nstderr: {err}"
+    );
+    let _ = code;
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A refused argument leaves nothing behind, in any mode.

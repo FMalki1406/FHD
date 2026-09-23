@@ -20,8 +20,31 @@ impl Directory {
     }
 }
 impl Directory {
+    /// A base directory nobody outside this account can rename.
+    ///
+    /// The shared temporary directory will not do. Measured on Windows 11, it is
+    /// renameable by packaged-application principals, and on a data volume every
+    /// ancestor grants Authenticated Users enough to move a directory aside -- so
+    /// the engine refuses to put its database and part files there, which is the
+    /// point. A real installation makes a directory of its own under the user's
+    /// local application data, and so does this.
+    fn base() -> PathBuf {
+        #[cfg(windows)]
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        #[cfg(not(windows))]
+        let root = std::env::temp_dir();
+        let base = root.join("fhd-tests");
+        let _ = std::fs::create_dir_all(&base);
+        // Permissions of its own, as an installer would give it. Without this the
+        // base inherits whatever its parent hands out.
+        let _ = fhd_platform::protect_new_directory(&base);
+        std::fs::canonicalize(&base).unwrap_or(base)
+    }
+
     pub fn new(label: &str) -> Self {
-        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = Self::base();
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = base.join(format!(
             "fhd-e2e-{label}-{}-{}",

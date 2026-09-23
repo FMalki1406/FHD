@@ -29,6 +29,69 @@ impl UserScope {
     }
 }
 
+/// What an owner means for a directory we are asked to adopt.
+///
+/// Split out from the Win32 call so the rule can be exercised without the
+/// privilege that creating a directory owned by somebody else requires. What is
+/// tested here is the decision; that the owner is read at all, and that a real
+/// foreign-owned directory is refused, is a separate check needing a second
+/// account -- recorded as such rather than claimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerVerdict {
+    /// Ours, or an account that can take ownership anyway.
+    Trusted,
+    /// Somebody else. An owner holds WRITE_DAC whatever the access list says, so
+    /// they can re-grant themselves at any moment.
+    Foreign,
+    /// The system reported no owner. Refused rather than assumed.
+    Missing,
+}
+
+/// Decides what an owner SID means, given who we are.
+///
+/// `owner` is `None` when the descriptor carried none. The trusted set is this
+/// account, the system, and the local administrators: an administrator can take
+/// ownership regardless, so naming them a finding would be noise.
+pub fn judge_owner(owner: Option<&str>, us: &str) -> OwnerVerdict {
+    // `NT SERVICE\TrustedInstaller`, the Windows servicing identity. It is here
+    // for a reason inside the trust model, not because of a privilege ranking:
+    // becoming it requires Administrator or SYSTEM, both already in this set, so
+    // it widens the set by nothing.
+    //
+    // It is needed because the Windows servicing roots are owned by it. Measured
+    // on this machine, 2026-09-23: `C:\` and `C:\Program Files` are
+    // TrustedInstaller's; `C:\Users` and `C:\Users\<name>` are SYSTEM's. An
+    // earlier comment here named `C:\Users` and was wrong -- the load-bearing
+    // component is `C:\` itself, which the walk reads as the delete-child parent
+    // of `C:\Users`. Calling it foreign refuses every path on the system volume.
+    //
+    // And it is trusted only as an *owner*. It is absent from the access-list
+    // trusted sets in `foreign_writers` and `holders`, so an entry granting it
+    // write is still reported.
+    const TRUSTED_INSTALLER: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    match owner {
+        None => OwnerVerdict::Missing,
+        Some(owner) if owner == us => OwnerVerdict::Trusted,
+        Some("S-1-5-18") | Some("S-1-5-32-544") | Some(TRUSTED_INSTALLER) => OwnerVerdict::Trusted,
+        Some(_) => OwnerVerdict::Foreign,
+    }
+}
+
+/// A path component an untrusted account could rename, and who could do it.
+///
+/// Protecting the state directory settles who may write *into* it. It says
+/// nothing about who may move it aside: renaming needs `DELETE` on the component
+/// itself or `FILE_DELETE_CHILD` on its parent, and neither is a right the
+/// directory's own list grants. If any component of the path can be swapped, then
+/// every check made against that path describes a directory that may no longer be
+/// the one we open a moment later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwappableComponent {
+    pub path: std::path::PathBuf,
+    pub principals: Vec<String>,
+}
+
 /// Who may write to a directory besides the people we already trust.
 ///
 /// "Trusted" is the account that runs the engine, the system account, and the
@@ -75,6 +138,35 @@ mod imp {
     /// The caller sets the mode on Unix; there is no inherited list to replace.
     pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Not implemented, and this returns "nothing found" rather than "not
+    /// examined" -- so `STATE-PATH-SWAPPABLE` can never fire on Unix.
+    ///
+    /// An earlier comment here claimed the opposite. It was wrong, and the
+    /// difference matters: a state directory under a group- or world-writable
+    /// parent is accepted on Unix exactly as it would have been before any of
+    /// this work. Closing it needs `openat`/`O_NOFOLLOW`/`RESOLVE_BENEATH`
+    /// walking rather than a permission read. Until then the guarantee names
+    /// Unix as unchecked instead of the code implying it is clean.
+    pub fn swappable_components(_: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
+        Ok(Vec::new())
+    }
+
+    /// Created with its mode, not repaired afterwards.
+    ///
+    /// `create_dir` then `set_permissions` leaves the directory readable by the
+    /// process umask's idea of the world for as long as the two calls take --
+    /// the same create-then-repair window the Windows side was rewritten to
+    /// remove. `DirBuilder::mode` passes the mode to `mkdir(2)`, so there is no
+    /// interval to lose.
+    pub fn create_protected_directory(path: &std::path::Path) -> io::Result<bool> {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -522,10 +614,16 @@ mod imp {
         // this directory, leaves a list naming only trusted accounts, and keeps
         // ownership can re-grant themselves at any moment. Reading the list alone
         // called that directory clean.
-        if owner.is_null() {
-            foreign.push("<no owner>".to_owned());
-        } else if !known(owner) {
-            foreign.push(sid_text(owner).unwrap_or_else(|| "<unreadable owner>".to_owned()));
+        // The same rule `judge_owner` states, applied to what the system said.
+        // Reading it through that function keeps the decision in one place, where
+        // it can be tested without a second account.
+        let owner_text = (!owner.is_null()).then(|| sid_text(owner)).flatten();
+        match judge_owner(owner_text.as_deref(), &scope.identity) {
+            OwnerVerdict::Trusted => {}
+            OwnerVerdict::Missing => foreign.push("<no owner>".to_owned()),
+            OwnerVerdict::Foreign => {
+                foreign.push(owner_text.unwrap_or_else(|| "<unreadable owner>".to_owned()));
+            }
         }
 
         // A null access list is not an empty one: it grants everyone everything.
@@ -611,6 +709,77 @@ mod imp {
     /// A directory we did not create is never touched: the operator may have
     /// pointed at something shared or redirected, and rewriting its permissions
     /// would be a worse surprise than refusing it.
+    /// Creates the state directory **with** its access list, or reports that it
+    /// was already there.
+    ///
+    /// Creating first and setting permissions afterwards leaves a window in which
+    /// the directory carries whatever it inherited -- on a data volume, write
+    /// access for every account on the machine. Windows decides access when a
+    /// handle is opened, so a handle taken in that window survives the list being
+    /// replaced, and a file planted in it is already inside. Handing the list to
+    /// `CreateDirectoryW` closes the window: there is no moment when the
+    /// directory exists under anything but its stated permissions.
+    ///
+    /// Returns whether this call created it. `false` means it was already there,
+    /// and a directory we did not create is inspected rather than rewritten.
+    pub fn create_protected_directory(path: &std::path::Path) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        let (_descriptor, attributes) = owner_only_directory_descriptor()?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        // SAFETY: `wide` is a null-terminated path and `attributes` points at a
+        // SECURITY_ATTRIBUTES whose descriptor lives until this function returns;
+        // the call copies what it needs before that.
+        let made = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+        // Non-zero is success, and success means this call is what created it.
+        if made != 0 {
+            return Ok(true);
+        }
+        let error = last_error();
+        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+
+    /// The access list a state directory gets: this account, the system and the
+    /// administrators, inheritance off, inherited by what is created inside.
+    fn owner_only_directory_descriptor() -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
+        let sid = user_scope()?.identity;
+        let sddl = format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        descriptor_from(&sddl)
+    }
+
+    /// Builds a descriptor from SDDL and the attributes that carry it.
+    fn descriptor_from(sddl: &str) -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated wide string that outlives the call,
+        // and `descriptor` is a valid out-parameter the system allocates into.
+        let built = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if built == 0 || descriptor.is_null() {
+            return Err(last_error());
+        }
+        Ok((
+            Local(descriptor),
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            },
+        ))
+    }
+
     pub fn protect_new_directory(path: &std::path::Path) -> io::Result<()> {
         let sid = user_scope()?.identity;
         // OICI: the same entries are inherited by what we create inside, so the
@@ -665,6 +834,216 @@ mod imp {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         Ok(())
+    }
+
+    /// Rights that let the holder move a directory aside. `DELETE` on the
+    /// component itself, and `FILE_DELETE_CHILD` on its parent, which permits
+    /// deleting a child regardless of that child's own list.
+    /// Rights that let the holder move a component aside. `DELETE` is the
+    /// obvious one; `WRITE_DAC` and `WRITE_OWNER` are here for the reason
+    /// `WRITE_RIGHTS` already gives -- either one lets the holder grant itself
+    /// the rest and then delete at leisure. Leaving them out reported a directory
+    /// whose list said `Everyone:(WDAC,WO)` as unswappable.
+    const RENAME_RIGHTS: u32 = 0x0001_0000 | 0x0004_0000 | 0x0008_0000;
+    /// The same, on the parent: delete-child reaches a component whatever its own
+    /// list says, and either of the other two buys delete-child.
+    const DELETE_CHILD: u32 = 0x0000_0040 | 0x0004_0000 | 0x0008_0000;
+
+    /// Every component of `path`, from the root down, that somebody outside the
+    /// trusted set could rename or delete.
+    ///
+    /// Giving the state directory a list of its own decides who may write into
+    /// it. It does not decide who may replace it: on a data volume every ancestor
+    /// typically grants `Authenticated Users: Modify`, and a directory whose
+    /// parent grants delete-child can be moved aside between the moment it is
+    /// checked and the moment it is opened -- after which every check describes a
+    /// directory that is no longer there.
+    /// Every directory on the way to `path`, root first.
+    fn ancestors(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut chain: Vec<std::path::PathBuf> =
+            path.ancestors().map(std::path::Path::to_path_buf).collect();
+        chain.reverse();
+        chain
+    }
+
+    pub fn swappable_components(path: &std::path::Path) -> io::Result<Vec<SwappableComponent>> {
+        // Both chains, because neither one alone is the set of directories that
+        // can move us. A security review demonstrated the half that was missing:
+        // with `base\gate` granting another account Modify and `base\gate\link`
+        // a junction onto a clean `base\real`, every check passed -- and then
+        // `gate` was used to repoint `link` at the attacker's directory, and the
+        // next open by path landed there. `gate` and `link` are exactly what
+        // canonicalising erases.
+        //
+        // So: the resolved chain catches a junction *we* were pointed through
+        // onto hostile ground, and the typed chain catches the hostile ground
+        // that *holds the junction*. Missing either is a path somebody else can
+        // swap while the check says clean.
+        //
+        // Every component is judged on its own parent rather than on its place
+        // in a list, because two chains concatenated have no single ordering.
+        let mut chain = ancestors(&std::fs::canonicalize(path)?);
+        for component in ancestors(&std::path::absolute(path)?) {
+            if !chain.contains(&component) {
+                chain.push(component);
+            }
+        }
+
+        let mut found = Vec::new();
+        for component in &chain {
+            // An unreadable component is a finding, not a pass. Skipping here
+            // failed open on the one condition an attacker can induce, while
+            // `holders(..)?` a few lines below failed closed on the same one.
+            let metadata = match std::fs::symlink_metadata(component) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    found.push(SwappableComponent {
+                        path: component.clone(),
+                        principals: vec![format!("<unreadable: {}>", error.kind())],
+                    });
+                    continue;
+                }
+            };
+            let mut principals = Vec::new();
+            // A component that is itself a reparse point redirects the path
+            // without anybody renaming anything, so whoever can rewrite its
+            // target can move us. On the resolved chain there should be none; on
+            // the typed chain this is the junction the review used, and it is
+            // reported so its holders are read below rather than erased.
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    principals.push("<reparse point>".to_owned());
+                }
+            }
+            // Who may delete the component outright. A volume root is exempt:
+            // `D:\` carries a DELETE grant that means nothing, because no volume
+            // root can be renamed -- and its delete-child is still checked below
+            // as the parent of the next component, which is the part that bites.
+            if component.parent().is_some() {
+                for holder in holders(component, RENAME_RIGHTS)? {
+                    if !principals.contains(&holder) {
+                        principals.push(holder);
+                    }
+                }
+            }
+            // And its parent: delete-child there reaches this component whatever
+            // its own list says. Taken from the component itself, not from a
+            // neighbouring index, so it stays right across both chains.
+            if let Some(parent) = component.parent() {
+                for holder in holders(parent, DELETE_CHILD)? {
+                    if !principals.contains(&holder) {
+                        principals.push(holder);
+                    }
+                }
+            }
+            if !principals.is_empty() {
+                found.push(SwappableComponent {
+                    path: component.clone(),
+                    principals,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// Untrusted principals an object grants any of `rights` to, its owner
+    /// included.
+    fn holders(path: &std::path::Path, rights: u32) -> io::Result<Vec<String>> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut owner: *mut c_void = ptr::null_mut();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated path outliving the call, and the
+        // out-parameters are valid; the descriptor owns the owner SID and the ACL
+        // and is freed once.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _owned = Local(descriptor);
+        let scope = user_scope()?;
+        let trusted = [scope.identity.as_str(), "S-1-5-18", "S-1-5-32-544"];
+        let mut out: Vec<String> = Vec::new();
+        // The owner, which no access list mentions. An owner holds WRITE_DAC
+        // implicitly, so a component owned by somebody else can be re-granted and
+        // then renamed whatever its list says today -- the same argument the
+        // state directory's own check makes, applied to every ancestor.
+        let owner_text = (!owner.is_null()).then(|| sid_text(owner)).flatten();
+        match judge_owner(owner_text.as_deref(), &scope.identity) {
+            OwnerVerdict::Trusted => {}
+            OwnerVerdict::Missing => out.push("<no owner>".to_owned()),
+            OwnerVerdict::Foreign => {
+                out.push(owner_text.unwrap_or_else(|| "<unreadable owner>".to_owned()));
+            }
+        }
+        if dacl.is_null() {
+            out.push("S-1-1-0".to_owned());
+            return Ok(out);
+        }
+        // SAFETY: `dacl` points inside the descriptor kept alive above.
+        let count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `index` is below the count the ACL reported.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                out.push("<unreadable entry>".to_owned());
+                continue;
+            }
+            // SAFETY: every ACE begins with a header.
+            let (kind, flags) = unsafe {
+                let header = ace.cast::<ACE_HEADER>();
+                ((*header).AceType, u32::from((*header).AceFlags))
+            };
+            // Denies and audits grant nothing; a type this build does not know is
+            // reported, not skipped. `foreign_writers` already learned this and
+            // the rule was not carried over to here.
+            if NON_GRANTING_TYPES.contains(&kind) {
+                continue;
+            }
+            if !ALLOW_TYPES.contains(&kind) {
+                out.push(format!("<unknown entry type {kind}>"));
+                continue;
+            }
+            // Unlike `foreign_writers`, an inherit-only entry really is about
+            // nothing here: this asks who can rename *this* component, and an
+            // entry that applies only to its children cannot. Do not "fix" this
+            // into agreement with the other function.
+            if flags & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: the type was checked, so mask and SID are where they belong.
+            let mask = unsafe { (*ace).Mask };
+            // GENERIC_ALL carries every specific right, delete among them.
+            if mask & (rights | 0x1000_0000) == 0 {
+                continue;
+            }
+            // SAFETY: the SID begins at `SidStart` in both allowed types.
+            let sid = unsafe { ptr::addr_of!((*ace).SidStart).cast::<c_void>().cast_mut() };
+            if trusted
+                .iter()
+                .any(|text| parse_sid(text).is_some_and(|known| equal(known.0, sid)))
+            {
+                continue;
+            }
+            let text = sid_text(sid).unwrap_or_else(|| "<unreadable>".to_owned());
+            if !out.contains(&text) {
+                out.push(text);
+            }
+        }
+        Ok(out)
     }
 
     /// Whether two SID pointers name the same account.
@@ -810,7 +1189,10 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
-pub use imp::{foreign_writers, process_cpu, protect_new_directory, user_scope};
+pub use imp::{
+    create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
+    swappable_components, user_scope,
+};
 
 #[cfg(test)]
 mod tests {
@@ -902,7 +1284,6 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let sid = user_scope().unwrap().identity;
         let mine = format!("*{sid}:(OI)(CI)F");
-
         let icacls = |dir: &std::path::Path, arguments: &[String]| {
             let out = Command::new("icacls")
                 .arg(dir)
@@ -974,12 +1355,10 @@ mod tests {
             );
         }
 
-        // 4. The owner, which is not in the access list at all. Creating a
-        //    directory owned by somebody else needs a privilege a test cannot
-        //    assume, so what is asserted is the half that can be: the owner is
-        //    read, and this account is accepted as its own. The other half -- a
-        //    foreign owner being reported -- rests on the code path, and is
-        //    called out as such in the review record rather than claimed covered.
+        // 4. The owner, which is not in the access list at all. The decision is
+        //    tested on its own in `the_owner_rule_is_decided_not_assumed`; here
+        //    the half that needs a real directory is asserted: this account is
+        //    accepted as the owner of what it created.
         let dir = make("owned");
         assert!(
             foreign_writers(&dir).unwrap().is_empty(),
@@ -987,6 +1366,167 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The three ways the swap check said "clean" about a path somebody else
+    /// could move. A review demonstrated each of them against live Windows; this
+    /// is what stops them coming back.
+    ///
+    /// Everything is built under a base this account protects, so the baseline is
+    /// clean and each case is the only difference from it.
+    #[cfg(windows)]
+    #[test]
+    fn the_ways_the_swap_check_used_to_miss() {
+        use std::process::Command;
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "fhd-swap-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&base).unwrap();
+        protect_new_directory(&base).unwrap();
+        let icacls = |dir: &std::path::Path, arguments: &[String]| {
+            Command::new("icacls")
+                .arg(dir)
+                .args(arguments)
+                .output()
+                .expect("icacls runs")
+                .status
+                .success()
+        };
+
+        // The baseline: a protected directory under a protected base.
+        let plain = base.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(
+            swappable_components(&plain).unwrap().is_empty(),
+            "the baseline is not clean, so nothing below proves anything"
+        );
+
+        // 1. Write-DAC only. No DELETE bit, but the holder can grant itself one.
+        let wdac = base.join("wdac");
+        std::fs::create_dir(&wdac).unwrap();
+        let child = wdac.join("state");
+        std::fs::create_dir(&child).unwrap();
+        assert!(
+            icacls(
+                &wdac,
+                &["/grant".to_owned(), "*S-1-5-11:(WDAC,WO)".to_owned()],
+            ),
+            "this case needs icacls to grant WRITE_DAC; without it the WRITE_DAC \
+             path is uncovered rather than covered"
+        );
+        assert!(
+            !swappable_components(&child).unwrap().is_empty(),
+            "an ancestor granting WRITE_DAC alone was called unswappable"
+        );
+
+        // 2. The junction bypass, built exactly as the security review built it.
+        //
+        //    An earlier version of this case pointed a junction at a target
+        //    inside the same protected base and asserted the two spellings
+        //    agreed. They did -- both were clean -- so the assertion read
+        //    `true == true` and pinned nothing. Worse, the one thing that could
+        //    fail it was the reparse clause, which canonicalising makes dead
+        //    code for this shape.
+        //
+        //    The real bypass is the other way round: a *hostile gate* holding a
+        //    junction onto *clean ground*. Canonicalising erases the gate, so
+        //    every check passed -- and then the gate was used to repoint the
+        //    junction and the next open by path landed in the attacker's
+        //    directory.
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let gate = base.join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        assert!(
+            icacls(
+                &gate,
+                &["/grant".to_owned(), "*S-1-5-11:(OI)(CI)M".to_owned()]
+            ),
+            "this case needs icacls to grant Modify on the gate; without it the \
+             junction bypass is uncovered rather than covered"
+        );
+        let link = gate.join("link");
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        // A directory junction needs no privilege, so failing to make one is a
+        // missing environment requirement and is recorded as one. Skipping
+        // quietly would leave the bypass this case exists for with no coverage
+        // and nothing saying so.
+        assert!(
+            made,
+            "this case needs a directory junction; without it the junction bypass \
+             is uncovered rather than covered"
+        );
+        let through = link.join("inner");
+        std::fs::create_dir(&through).unwrap();
+
+        // The resolved chain is clean, so this is the whole finding: it comes
+        // from the typed chain or not at all.
+        let direct = swappable_components(&target.join("inner")).unwrap();
+        assert!(
+            direct.is_empty(),
+            "the negative control is dirty, so the assertion below would pass \
+             against a check that refuses everything: {direct:?}"
+        );
+        let via = swappable_components(&through).unwrap();
+        assert!(
+            !via.is_empty(),
+            "a path reached through a junction whose holder another account can \
+             rewrite was called unswappable"
+        );
+
+        // 3. A volume root is not a false positive. It carries a DELETE grant
+        //    that means nothing, because no volume root can be renamed.
+        let root = std::path::Path::new("C:\\");
+        let found = swappable_components(root).unwrap();
+        assert!(
+            found.iter().all(|c| c.path != root),
+            "the volume root itself was reported: {found:?}"
+        );
+
+        let _ = Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&link)
+            .output();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What an owner means, decided rather than assumed.
+    ///
+    /// Creating a directory owned by another account needs a privilege a test
+    /// cannot assume, so the rule is split from the system call and checked here.
+    /// **This does not show that a real foreign-owned directory is refused** --
+    /// that needs a second account and is tracked as its own verification item.
+    /// What it shows is that the rule says the right thing when it is asked.
+    #[test]
+    fn the_owner_rule_is_decided_not_assumed() {
+        let us = "S-1-5-21-1-2-3-1001";
+        assert_eq!(judge_owner(Some(us), us), OwnerVerdict::Trusted);
+        // An administrator can take ownership regardless, and the system reads
+        // everything; naming either a finding would be noise.
+        assert_eq!(judge_owner(Some("S-1-5-18"), us), OwnerVerdict::Trusted);
+        assert_eq!(judge_owner(Some("S-1-5-32-544"), us), OwnerVerdict::Trusted);
+        // Anybody else owns WRITE_DAC on it whatever the access list says.
+        assert_eq!(
+            judge_owner(Some("S-1-5-21-1-2-3-1002"), us),
+            OwnerVerdict::Foreign
+        );
+        assert_eq!(judge_owner(Some("S-1-1-0"), us), OwnerVerdict::Foreign);
+        // No owner is refused, not assumed to be ours.
+        assert_eq!(judge_owner(None, us), OwnerVerdict::Missing);
     }
 
     /// A directory made under a parent that hands out write access to others is

@@ -55,6 +55,11 @@ pub enum EngineError {
     /// many such principals were found; the SIDs stay out of the code, which is
     /// carried across layers and logged.
     ExposedStateDirectory(u32),
+    /// Some component of the path to the state directory could be renamed by an
+    /// account outside the trusted set, so the directory checked is not
+    /// guaranteed to be the directory opened. The count is how many components,
+    /// not which: the code crosses layers and is logged.
+    SwappableStatePath(u32),
     Persistence(PersistenceError),
     Binding(BindingError),
     Admission(AppError),
@@ -206,11 +211,14 @@ fn own_parts(state: &Path) -> Result<FileStorage, EngineError> {
 fn own_directory(path: &Path) -> Result<(), EngineError> {
     // Whether this run made the directory decides what may be done to it: one we
     // created gets permissions of our own, one we found gets inspected.
-    let created = match std::fs::create_dir(path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(_) => return Err(EngineError::InvalidInput),
-    };
+    //
+    // Created *with* its access list rather than created and then repaired.
+    // Creating first leaves a window in which the directory carries whatever it
+    // inherited -- on a data volume that is write access for every account on the
+    // machine -- and Windows decides access when a handle is opened, so a handle
+    // taken in that window outlives the repair.
+    let created =
+        fhd_platform::create_protected_directory(path).map_err(|_| EngineError::InvalidInput)?;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| EngineError::InvalidInput)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(EngineError::InvalidInput);
@@ -236,19 +244,34 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
     // job record and every partial file, inheriting either would mean something
     // other than this engine can rewrite what a download has already saved.
     //
-    // So a directory we just made gets permissions of its own, and one that was
-    // already there is inspected and refused if it is open to anyone else. We do
-    // not rewrite what we did not create: the operator may have pointed at
-    // something shared or redirected, and changing its permissions silently is a
-    // worse surprise than declining to use it.
-    if created {
-        fhd_platform::protect_new_directory(path).map_err(|_| EngineError::InvalidInput)?;
-    }
+    // So a directory we just made carries permissions of its own from the moment
+    // it exists, and one that was already there is inspected and refused if it is
+    // open to anyone else. We do not rewrite what we did not create: the operator
+    // may have pointed at something shared or redirected, and changing its
+    // permissions silently is a worse surprise than declining to use it.
+    //
+    // The inspection runs either way. A directory we created should have nothing
+    // to report, and checking it anyway is what would catch a creation that
+    // silently did not carry its list.
+    let _ = created;
     let foreign = fhd_platform::foreign_writers(path).map_err(|_| EngineError::InvalidInput)?;
     if !foreign.is_empty() {
         return Err(EngineError::ExposedStateDirectory(
             foreign.sids().len() as u32
         ));
+    }
+    // And who could move it aside. Giving the directory a list of its own settles
+    // who may write into it; it settles nothing about who may replace it, because
+    // renaming needs DELETE on the component or FILE_DELETE_CHILD on its parent
+    // and neither is granted by the directory's own list. If any component of the
+    // path can be swapped, every check above describes a directory that may not
+    // be the one the database and the part files are opened in a moment later --
+    // measured on this machine: on a data volume every ancestor grants
+    // Authenticated Users enough to do it.
+    let swappable =
+        fhd_platform::swappable_components(path).map_err(|_| EngineError::InvalidInput)?;
+    if !swappable.is_empty() {
+        return Err(EngineError::SwappableStatePath(swappable.len() as u32));
     }
     Ok(())
 }
@@ -946,6 +969,7 @@ pub fn code(error: &EngineError) -> String {
             None => "STOPPED-RERUN-WITH-RESUME".into(),
         },
         EngineError::ExposedStateDirectory(_) => "STATE-DIRECTORY-EXPOSED".into(),
+        EngineError::SwappableStatePath(_) => "STATE-PATH-SWAPPABLE".into(),
         EngineError::Persistence(error) => error.code().into(),
         EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),
