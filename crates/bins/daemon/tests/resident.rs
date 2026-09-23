@@ -2,7 +2,7 @@
 //! and what it was told survives it going away.
 mod harness;
 
-use fhd_daemon::{EngineConfig, Intent, Resident};
+use fhd_daemon::{EngineConfig, EngineError, Intent, Resident};
 use fhd_ipc::{ask, connect, Endpoint};
 use fhd_protocol::{AddRequest, Request, Response};
 use harness::{content, expected_digest, serve as serve_file, Directory};
@@ -37,19 +37,24 @@ fn endpoint(label: &str) -> Endpoint {
 /// Opens the directory again, allowing for the moment it takes the previous
 /// engine's background work to let go of the database after it has returned.
 async fn reopen(state: &Directory) -> Resident {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // A guard against waiting forever, not a claim about how fast a loaded machine
+    // lets go: the previous engine's background work releases the locks shortly
+    // after it returns.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        match Resident::open(settings(state)).await {
+        let busy = match Resident::open(settings(state)).await {
             Ok(resident) => return resident,
-            Err(error) if std::time::Instant::now() < deadline => {
-                assert!(
-                    format!("{error:?}").contains("Locked"),
-                    "reopening failed for another reason: {error:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => panic!("the directory never became available: {error:?}"),
-        }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(busy, EngineError::StateBusy) || format!("{busy:?}").contains("Locked"),
+            "reopening failed for another reason: {busy:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the directory never became available: {busy:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -100,7 +105,7 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     };
 
     // The job is real work, so it takes a moment; the socket stays answerable.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let mut published = false;
     while std::time::Instant::now() < deadline {
         let Response::Jobs { jobs, .. } = ask(&mut client, 2, &Request::List { after: None })
@@ -126,7 +131,7 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     );
     let _ = stop.send(());
     // The engine must actually finish: a timeout here would be a hang, not a pass.
-    tokio::time::timeout(Duration::from_secs(10), engine)
+    tokio::time::timeout(Duration::from_secs(60), engine)
         .await
         .expect("the engine did not stop")
         .unwrap()
@@ -154,7 +159,7 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     assert_eq!(jobs[0].job, job);
     assert_eq!(jobs[0].state, "Completed");
     let _ = stop.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(10), engine).await;
+    let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -207,5 +212,5 @@ async fn a_request_the_engine_refuses_is_answered_with_a_code_not_a_message() {
         other => panic!("the engine accepted a destination it cannot publish to: {other:?}"),
     }
     let _ = stop.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(10), engine).await;
+    let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
 }

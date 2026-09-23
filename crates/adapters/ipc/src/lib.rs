@@ -313,7 +313,7 @@ mod platform {
     pub async fn connect(
         endpoint: &Endpoint,
     ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, IpcError> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             match ClientOptions::new().open(&endpoint.0) {
                 Ok(client) => return Ok(client),

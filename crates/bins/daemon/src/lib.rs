@@ -36,6 +36,9 @@ pub enum EngineError {
     InvalidInput,
     /// The control surface could not be claimed for this user.
     EndpointUnavailable,
+    /// Another engine still owns this state directory. Its own shutdown releases
+    /// it, which can take a moment after it has returned.
+    StateBusy,
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
     /// Publication renames within a volume; this destination is on another one.
@@ -173,6 +176,15 @@ fn digest(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 fn reference(label: &[u8], parts: &[&[u8]]) -> u64 {
     let digest = digest(label, parts);
     u64::from_le_bytes(digest[..8].try_into().unwrap_or([1; 8])).max(1)
+}
+
+/// Claims the part directory for this engine, telling a caller that is merely
+/// too early apart from one that asked for something impossible.
+fn own_parts(state: &Path) -> Result<FileStorage, EngineError> {
+    FileStorage::own(&state.join("parts")).map_err(|error| match error {
+        fhd_app::storage::StorageError::Locked => EngineError::StateBusy,
+        _ => EngineError::InvalidInput,
+    })
 }
 
 /// Creates the engine's own tree: no link may stand in for a directory, and on
@@ -344,10 +356,7 @@ impl Engine {
             Coordinator::new(
                 Ports {
                     repository: repository.clone(),
-                    store: Arc::new(
-                        FileStorage::own(&config.state_directory.join("parts"))
-                            .map_err(|_| EngineError::InvalidInput)?,
-                    ),
+                    store: Arc::new(own_parts(&config.state_directory)?),
                     transport: Arc::new(transport),
                     destinations: Arc::new(FixedDestinations(destinations)),
                 },
@@ -738,6 +747,7 @@ pub fn code(error: &EngineError) -> String {
     match error {
         EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
         EngineError::EndpointUnavailable => "IPC-ENDPOINT-UNAVAILABLE".into(),
+        EngineError::StateBusy => "STATE-DIRECTORY-BUSY".into(),
         EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
         EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
         EngineError::NeedsDecision(reason) => match reason {

@@ -19,7 +19,6 @@ use fhd_runtime::{
     origin::{OriginGovernor, OriginLimits},
     scheduler::{Command, Scheduler, SchedulerConfig},
 };
-use fhd_storage::FileStorage;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -108,10 +107,7 @@ impl Resident {
             Coordinator::new(
                 Ports {
                     repository: repository.clone(),
-                    store: Arc::new(
-                        FileStorage::own(&config.state_directory.join("parts"))
-                            .map_err(|_| EngineError::InvalidInput)?,
-                    ),
+                    store: Arc::new(crate::own_parts(&config.state_directory)?),
                     transport: transport.clone(),
                     destinations: destinations.clone(),
                 },
