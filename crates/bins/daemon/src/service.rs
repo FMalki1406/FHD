@@ -2,9 +2,7 @@
 //! runs, instead of being handed a list at startup. It owns the mapping from a
 //! request to a job; the socket layer only carries frames, and the scheduler only
 //! decides who runs.
-use crate::{
-    digest, reference, same_volume, EngineConfig, EngineError, LocalOperator, SystemClock,
-};
+use crate::{digest, reference, EngineConfig, EngineError, LocalOperator, SystemClock};
 use fhd_app::{
     AddDownload, AppError, Destinations, ReferenceStore, SourceReference, TransferRepository,
 };
@@ -314,12 +312,6 @@ impl Service {
         // The client proposes; this decides. A destination is refused here rather
         // than after a whole file has been fetched.
         let destination_path = self.allowed_destination(&request.destination)?;
-        // Both sides resolved the same way: comparing a canonical path with a
-        // configured one would compare a verbatim prefix against a drive letter
-        // and call two places on one disk different volumes.
-        if !same_volume(&self.canonical_state, &destination_path)? {
-            return Err(EngineError::CrossVolume);
-        }
         let expected = match &request.expected_sha256 {
             Some(hex) => Some(decode_digest(hex)?),
             None => None,
