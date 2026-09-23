@@ -6,6 +6,7 @@ members = [
     "crates/testkit",
     "crates/runtime", "crates/adapters/storage", "crates/adapters/persistence",
     "crates/adapters/http",
+    "crates/protocol",
     "crates/bins/daemon",
 ]
 resolver = "2"
