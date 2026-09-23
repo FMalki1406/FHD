@@ -127,7 +127,6 @@ impl Resident {
                     retry: fhd_domain::RetryPolicy::new(5, 1000, 60_000)
                         .map_err(|_| EngineError::InvalidInput)?,
                 },
-                config.state_directory.join("parts"),
             )
             .map_err(EngineError::Run)?
             .with_governor(governor.clone()),

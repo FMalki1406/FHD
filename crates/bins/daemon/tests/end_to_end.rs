@@ -532,24 +532,34 @@ async fn a_sensitive_link_is_not_remembered_so_it_cannot_be_continued() {
     );
 }
 
-/// What another account is left able to do to a part file, measured on a real
-/// download rather than argued from the flags the code opens files with.
+/// The access list on a **part file**, while one exists, in a download folder
+/// that lets everybody write.
 ///
 /// Parts moved next to their destination so a download could land on a disk the
 /// engine does not live on. Inside the engine's directory they were covered by
 /// a list it had set; a download folder belongs to the user, and on a data
 /// volume here it grants `Authenticated Users` write -- so the move took a
-/// protection away and this is what puts it back.
+/// protection away and this is what holds it back.
 ///
-/// The folder is given that grant deliberately, as the worst ordinary case, and
-/// the result is read back with `icacls`, which knows nothing about our code.
+/// The job is paused rather than finished, because a completed one discards its
+/// part and an earlier version of this test read an empty directory and called
+/// the part protected. The folder is granted Modify on purpose, the list is read
+/// back with `icacls`, which knows nothing about our code, and the assertion is
+/// on the file, not on the directory that holds it.
+///
+/// **Coverage this does not carry.** It reads the permissions rather than
+/// attempting a read as another principal, which is what criterion م٣ asks for.
+/// Doing that needs a second local account or a restricted token, and this test
+/// process has neither; an independent review did it with a restricted token and
+/// measured the denials. Recorded here as a missing environment requirement
+/// rather than left to look covered.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_part_file_is_not_readable_by_the_accounts_the_download_folder_allows() {
-    let body = content(2 * 1024 * 1024 + 3);
-    let (port, _served) = serve(body.clone(), 0);
-    let state = Directory::new("parts-acl-state");
-    let downloads = Directory::new("parts-acl-downloads");
+async fn a_part_file_does_not_inherit_what_the_download_folder_grants() {
+    let body = content(8 * 1024 * 1024);
+    let (port, served) = serve(body.clone(), 0);
+    let state = Directory::new("part-acl-state");
+    let downloads = Directory::new("part-acl-folder");
     let folder = downloads.0.join("Downloads");
     std::fs::create_dir_all(&folder).expect("the download folder is created");
 
@@ -565,42 +575,149 @@ async fn a_part_file_is_not_readable_by_the_accounts_the_download_folder_allows(
         String::from_utf8_lossy(&granted.stderr)
     );
 
+    // A control written straight into the folder: it must pick the grant up, or
+    // the folder is not the hostile place this test assumes and nothing below
+    // proves anything.
+    let control = folder.join("control.bin");
+    std::fs::write(&control, b"control").expect("the control file is written");
+    let control_acl = String::from_utf8_lossy(
+        &std::process::Command::new("icacls")
+            .arg(&control)
+            .output()
+            .expect("icacls runs")
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        control_acl.contains("Authenticated Users"),
+        "a file in this folder did not inherit the grant, so the folder is not \
+         hostile and the part below proves nothing:\n{control_acl}"
+    );
+
     let destination = folder.join("result.bin");
     let url = format!("http://127.0.0.1:{port}/file");
-    let mut settings = config(&state, destination.clone(), 4);
-    settings.expected_sha256 = Some(expected_digest(&body));
-    let engine = Engine::open(settings, &url).await.unwrap();
-    let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone()),
-        "reason: {:?}",
-        engine.reason().await.unwrap()
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (paused, receiver) = mpsc::channel(1);
+    let run = engine.run(receiver);
+    let pause = async {
+        while served.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        paused.send(Control::Pause).await.unwrap();
+    };
+    let (outcome, ()) = tokio::join!(run, pause);
+    outcome.expect("the run settles");
+    drop(engine);
+
+    // A finished job discards its part, and a discarded part cannot be asked
+    // anything. If the pause lost the race there is nothing here to measure, and
+    // that is reported rather than passed over.
+    let parts = folder.join(".fhd-parts");
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&parts) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|kind| kind == "part") {
+                found.push(entry.path());
+            }
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "no part file survived the pause, so nothing here was measured: {parts:?}"
     );
 
-    let parts = folder.join(".fhd-parts");
-    assert!(parts.is_dir(), "no private directory was made for the part");
-    let listed = std::process::Command::new("icacls")
-        .arg(&parts)
+    for part in found {
+        let acl = String::from_utf8_lossy(
+            &std::process::Command::new("icacls")
+                .arg(&part)
+                .output()
+                .expect("icacls runs")
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            !acl.contains("Authenticated Users") && !acl.contains("S-1-5-11"),
+            "a part file carries the grant the download folder hands out:\n{acl}"
+        );
+        assert!(
+            acl.contains("(F)"),
+            "a part file grants this account nothing:\n{acl}"
+        );
+    }
+}
+
+/// A parts directory this engine did not create is refused, not adopted.
+///
+/// A download folder that lets everybody write lets everybody create
+/// `.fhd-parts` first -- and whoever creates it owns it. An owner holds
+/// WRITE_DAC whatever list we write afterwards, so replacing the list is not
+/// taking the directory back: theirs goes on again whenever they like, and the
+/// part file inherits it. A review pre-created it, re-granted itself while the
+/// engine ran, and read and wrote a live part file.
+///
+/// So the boolean saying whether this call created the directory is the
+/// decision, and one we found is inspected the way the state directory is.
+///
+/// The directory here is made by this test process rather than a second
+/// account, so what is measured is that a foreign grant on a directory we did
+/// not create is refused. **Not covered:** foreign *ownership* with a clean
+/// list, which needs a second account. Recorded rather than implied.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parts_directory_we_did_not_create_is_refused() {
+    let body = content(512 * 1024);
+    let (port, _served) = serve(body.clone(), 0);
+    let state = Directory::new("squat-state");
+    let downloads = Directory::new("squat-folder");
+    let folder = downloads.0.join("Downloads");
+    std::fs::create_dir_all(&folder).expect("the download folder is created");
+
+    // Somebody got there first, and left it open.
+    let planted = folder.join(".fhd-parts");
+    std::fs::create_dir(&planted).expect("the parts directory is planted");
+    let granted = std::process::Command::new("icacls")
+        .arg(&planted)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)M"])
         .output()
         .expect("icacls runs");
-    let acl = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        granted.status.success(),
+        "this test needs icacls to grant Modify to S-1-5-11 on the planted \
+         directory; without it the case is uncovered rather than covered: {}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+
+    let destination = folder.join("result.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await;
 
     assert!(
-        !acl.contains("Authenticated Users") && !acl.contains("S-1-5-11"),
-        "the grant on the download folder reached the part directory:\n{acl}"
+        !matches!(outcome, Ok(SessionEnd::Published(_))),
+        "a download published through a parts directory somebody else made"
     );
-    // Inheritance is closed, so a grant added to the folder later cannot arrive
-    // either. `icacls` marks inherited entries with a leading (I).
     assert!(
-        !acl.contains("(I)"),
-        "the part directory still inherits from the download folder:\n{acl}"
+        !destination.exists(),
+        "the destination was written through a parts directory somebody else made"
     );
-    // And this account can still use it, or the download above would not have
-    // finished -- asserted anyway so a refusal-of-everything cannot pass.
+    // And the engine did not quietly rewrite what it found: the grant is still
+    // there, which is what makes refusing the right answer rather than a
+    // silent repair that ownership would undo anyway.
+    let acl = String::from_utf8_lossy(
+        &std::process::Command::new("icacls")
+            .arg(&planted)
+            .output()
+            .expect("icacls runs")
+            .stdout,
+    )
+    .to_string();
     assert!(
-        acl.contains("(F)"),
-        "the part directory grants this account nothing:\n{acl}"
+        acl.contains("Authenticated Users") || acl.contains("S-1-5-11"),
+        "the planted directory was taken over instead of refused:\n{acl}"
     );
-    assert_eq!(std::fs::read(&destination).unwrap(), body);
 }

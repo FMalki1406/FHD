@@ -112,7 +112,6 @@ pub struct Coordinator {
     buffers: BufferPool,
     clock: Arc<dyn Clock>,
     config: CoordinatorConfig,
-    directory: PathBuf,
     /// Told how each origin behaved. Admission is the scheduler's call, not a
     /// session's: a session that already started keeps the grant it was given.
     governor: Option<Arc<OriginGovernor>>,
@@ -139,7 +138,6 @@ impl Coordinator {
         buffers: BufferPool,
         clock: Arc<dyn Clock>,
         config: CoordinatorConfig,
-        directory: PathBuf,
     ) -> Result<Self, RunError> {
         let block = MAX_BUFFER.min(buffers.capacity());
         if !config.valid() || buffers.capacity() < config.connections * block {
@@ -150,7 +148,6 @@ impl Coordinator {
             buffers,
             clock,
             config,
-            directory,
             governor: None,
         })
     }
@@ -164,14 +161,20 @@ impl Coordinator {
     /// next to its destination keeps the link inside one directory, and the
     /// question stops arising.
     ///
-    /// Falls back to the engine's staging directory when the destination cannot
-    /// be resolved. The transfer still runs and publication decides later, which
-    /// is what happened before rather than a new way to fail.
-    fn part_directory(&self, job: &Job) -> PathBuf {
+    /// An error here is a stop, not a fallback. The port answers with an error
+    /// both when the destination cannot be resolved and when the directory
+    /// beside it could not be made private -- and quietly writing the part
+    /// somewhere else then meant the download proceeded with the protection the
+    /// caller was promised silently absent. A review measured the other half of
+    /// it: with the destination's parent missing, a whole megabyte of the file
+    /// landed under the state directory on another volume, and publication
+    /// failed afterwards as a generic storage error. Saying so up front costs
+    /// one failed job and buys a reason the operator can act on.
+    fn part_directory(&self, job: &Job) -> Result<PathBuf, StorageError> {
         self.ports
             .destinations
             .parts_for(job.spec().destination())
-            .unwrap_or_else(|_| self.directory.clone())
+            .map_err(|_| StorageError::InvalidInput)
     }
 
     /// Reports every origin outcome to this governor. Without one the coordinator
@@ -212,7 +215,10 @@ impl Coordinator {
             return;
         };
         let store = self.ports.store.clone();
-        let directory = self.part_directory(job);
+        let Ok(directory) = self.part_directory(job) else {
+            emit(Event::new(Code::StorageFailed).for_job(job.id().get(), job.generation().get()));
+            return;
+        };
         let removed = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
             let mut file = store.open(&directory, spec)?;
             file.abandon();
@@ -419,7 +425,10 @@ impl Session<'_> {
             .await
             .map_err(|_| RunError::Repository)?;
         let store = self.c.ports.store.clone();
-        let directory = self.c.part_directory(&self.job);
+        let directory = self
+            .c
+            .part_directory(&self.job)
+            .map_err(RunError::Storage)?;
         let opened =
             tokio::task::spawn_blocking(move || -> Result<Box<dyn SegmentFile>, StorageError> {
                 if extents.is_empty() {
