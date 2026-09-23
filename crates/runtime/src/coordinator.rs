@@ -155,6 +155,28 @@ impl Coordinator {
         })
     }
 
+    /// Where this job's part file goes: beside the file it will become.
+    ///
+    /// Publication is a hard link, and a hard link cannot cross a volume. While
+    /// every part lived under the engine's own directory, that directory decided
+    /// which disk the user was allowed to download to -- put the state on `C:`
+    /// and a destination on `D:` was refused before the transfer began. A part
+    /// next to its destination keeps the link inside one directory, and the
+    /// question stops arising.
+    ///
+    /// Falls back to the engine's staging directory when the destination cannot
+    /// be resolved. The transfer still runs and publication decides later, which
+    /// is what happened before rather than a new way to fail.
+    fn part_directory(&self, job: &Job) -> PathBuf {
+        self.ports
+            .destinations
+            .resolve(job.spec().destination())
+            .ok()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| self.directory.clone())
+    }
+
     /// Reports every origin outcome to this governor. Without one the coordinator
     /// still runs; only per-origin governing is then nobody's job.
     pub fn with_governor(mut self, governor: Arc<OriginGovernor>) -> Self {
@@ -193,7 +215,7 @@ impl Coordinator {
             return;
         };
         let store = self.ports.store.clone();
-        let directory = self.directory.clone();
+        let directory = self.part_directory(job);
         let removed = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
             let mut file = store.open(&directory, spec)?;
             file.abandon();
@@ -400,7 +422,7 @@ impl Session<'_> {
             .await
             .map_err(|_| RunError::Repository)?;
         let store = self.c.ports.store.clone();
-        let directory = self.c.directory.clone();
+        let directory = self.c.part_directory(&self.job);
         let opened =
             tokio::task::spawn_blocking(move || -> Result<Box<dyn SegmentFile>, StorageError> {
                 if extents.is_empty() {

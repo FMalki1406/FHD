@@ -858,6 +858,22 @@ mod imp {
     /// parent grants delete-child can be moved aside between the moment it is
     /// checked and the moment it is opened -- after which every check describes a
     /// directory that is no longer there.
+    /// Whether two spellings name the same directory.
+    ///
+    /// `canonicalize` returns `\\?\D:\x` where `absolute` returns `D:\x`, so a
+    /// plain equality check never matched and every component of the resolved
+    /// chain was read a second time -- twice the security reads on every start,
+    /// for nothing. Comparison ignores the verbatim prefix and case, which is
+    /// what NTFS itself does.
+    fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+        fn plain(path: &std::path::Path) -> String {
+            let text = path.to_string_lossy();
+            let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+            text.trim_end_matches('\\').to_lowercase()
+        }
+        plain(left) == plain(right)
+    }
+
     /// Every directory on the way to `path`, root first.
     fn ancestors(path: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut chain: Vec<std::path::PathBuf> =
@@ -881,11 +897,49 @@ mod imp {
         // swap while the check says clean.
         //
         // Every component is judged on its own parent rather than on its place
-        // in a list, because two chains concatenated have no single ordering.
-        let mut chain = ancestors(&std::fs::canonicalize(path)?);
-        for component in ancestors(&std::path::absolute(path)?) {
-            if !chain.contains(&component) {
+        // in a list, because several chains concatenated have no single
+        // ordering.
+        //
+        // And the two endpoints are not enough either. A second review built
+        // `clean\link2` -> `mid\link3` -> `real`, granting only `mid` to another
+        // account: `canonicalize` jumps to `real` and the typed spelling stops
+        // at `link2`, so `mid` -- the directory that actually holds the redirect
+        // -- appears in neither. The same is true of a path reached through a
+        // `subst` drive. Both were refused, but only because the component was
+        // flagged as a reparse point, which named nobody and rested on a clause
+        // no test constrained.
+        //
+        // So every redirect is followed to what it points at, and that target's
+        // own ancestors are walked too. The question the check answers is "who
+        // can move us", and that is whoever holds any hop on the way.
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        let mut pending = vec![std::path::absolute(path)?, std::fs::canonicalize(path)?];
+        // A junction may point at a path that leads back through itself, and a
+        // deep tree costs a security read per component, so the walk is bounded
+        // rather than trusted to terminate on its own.
+        const COMPONENT_LIMIT: usize = 512;
+        while let Some(next) = pending.pop() {
+            for component in ancestors(&next) {
+                if chain.iter().any(|seen| same_path(seen, &component)) {
+                    continue;
+                }
+                if chain.len() >= COMPONENT_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the state path passes through more directories than this check will walk",
+                    ));
+                }
+                let redirect = std::fs::symlink_metadata(&component)
+                    .ok()
+                    .filter(|metadata| {
+                        use std::os::windows::fs::MetadataExt;
+                        metadata.file_attributes() & 0x400 != 0
+                    })
+                    .and_then(|_| std::fs::read_link(&component).ok());
                 chain.push(component);
+                if let Some(target) = redirect {
+                    pending.push(target);
+                }
             }
         }
 
@@ -905,15 +959,24 @@ mod imp {
                 }
             };
             let mut principals = Vec::new();
-            // A component that is itself a reparse point redirects the path
-            // without anybody renaming anything, so whoever can rewrite its
-            // target can move us. On the resolved chain there should be none; on
-            // the typed chain this is the junction the review used, and it is
-            // reported so its holders are read below rather than erased.
+            // A reparse point is not itself a finding. It says the path bends
+            // here, and the walk above already followed the bend and put what it
+            // points at into the chain, so whoever can rewrite the target is
+            // named by their own rights rather than by this flag.
+            //
+            // Reporting the flag alone refused a junction the operator owns
+            // outright -- a layout this project's own documentation calls
+            // ordinary for somebody short of disk space, and one a download
+            // manager invites -- and handed them a count with no principal to
+            // act on. A volume mount point would have been refused the same way.
+            //
+            // What is still a finding is a bend we could not follow, because
+            // then the chain is short by however much lies beyond it.
             {
                 use std::os::windows::fs::MetadataExt;
-                if metadata.file_attributes() & 0x400 != 0 {
-                    principals.push("<reparse point>".to_owned());
+                if metadata.file_attributes() & 0x400 != 0 && std::fs::read_link(component).is_err()
+                {
+                    principals.push("<redirect that could not be followed>".to_owned());
                 }
             }
             // Who may delete the component outright. A volume root is exempt:
@@ -1488,7 +1551,99 @@ mod tests {
              rewrite was called unswappable"
         );
 
-        // 3. A volume root is not a false positive. It carries a DELETE grant
+        // 3. A junction the operator owns outright is not a finding.
+        //
+        //    Reporting every reparse point refused this, and handed back a count
+        //    with no principal in it. The layout is ordinary -- somebody short of
+        //    space points the application directory at another disk -- and a
+        //    download manager invites it. A volume mount point looks the same to
+        //    this code.
+        let owned = base.join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        let owned_link = base.join("owned-link");
+        assert!(
+            Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&owned_link)
+                .arg(&owned)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "this case needs a directory junction; without it the false positive \
+             is uncovered rather than covered"
+        );
+        let inside = owned_link.join("state");
+        std::fs::create_dir(&inside).unwrap();
+        let verdict = swappable_components(&inside).unwrap();
+        assert!(
+            verdict.is_empty(),
+            "a junction nobody else can move was called swappable: {verdict:?}"
+        );
+
+        // 4. A junction whose holder is hostile is a finding -- and the hostile
+        //    holder is *named*, not merely flagged.
+        //
+        //    This is the shape neither chain reaches: the redirect lands inside
+        //    a directory another account can write, and that directory is in
+        //    neither the typed spelling nor the resolved one. Reporting "this is
+        //    a reparse point" refused it while naming nobody, and nothing tested
+        //    that clause -- disabling it left the suite green.
+        let mid = base.join("mid");
+        std::fs::create_dir(&mid).unwrap();
+        assert!(
+            icacls(
+                &mid,
+                &["/grant".to_owned(), "*S-1-5-11:(OI)(CI)M".to_owned()]
+            ),
+            "this case needs icacls to grant Modify on the middle directory"
+        );
+        let far = base.join("far");
+        std::fs::create_dir(&far).unwrap();
+        let hop = mid.join("hop");
+        assert!(
+            Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&hop)
+                .arg(&far)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "this case needs a directory junction"
+        );
+        let outer = base.join("outer");
+        assert!(
+            Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&outer)
+                .arg(&hop)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "this case needs a second directory junction"
+        );
+        let nested = outer.join("state");
+        std::fs::create_dir(&nested).unwrap();
+        let verdict = swappable_components(&nested).unwrap();
+        assert!(
+            verdict.iter().any(|component| component
+                .principals
+                .iter()
+                .any(|who| who.contains("S-1-5-11"))),
+            "a redirect held in a directory another account can write was not \
+             traced to that account: {verdict:?}"
+        );
+
+        let _ = Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&outer)
+            .output();
+        let _ = Command::new("cmd").args(["/C", "rmdir"]).arg(&hop).output();
+        let _ = Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&owned_link)
+            .output();
+
+        // 5. A volume root is not a false positive. It carries a DELETE grant
         //    that means nothing, because no volume root can be renamed.
         let root = std::path::Path::new("C:\\");
         let found = swappable_components(root).unwrap();

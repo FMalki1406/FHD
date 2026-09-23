@@ -246,21 +246,111 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_destination_on_another_volume_is_refused_before_downloading() {
-    let state = Directory::new("volume");
-    let other = if cfg!(windows) {
-        "Z:/elsewhere.bin"
-    } else {
-        "/proc/elsewhere.bin"
+async fn a_destination_away_from_the_state_directory_downloads_and_publishes() {
+    // Publication is a hard link, which cannot cross a volume, and every part
+    // used to live under the engine's own directory -- so that directory decided
+    // which disk the user could download to, and a destination anywhere else was
+    // refused before a byte was fetched. The part goes beside its destination
+    // now, so the link stays inside one directory and the question stops
+    // arising.
+    //
+    // Two unrelated trees rather than two volumes, because a second volume is
+    // not present on every machine this runs on. What this proves is the
+    // mechanism: nothing under the state directory, the bytes written next to
+    // the file they become. The claim about a genuinely different disk is
+    // proved by `a_destination_on_a_second_volume_downloads_and_publishes`,
+    // which needs one and says so.
+    let body = content(2 * 1024 * 1024 + 11);
+    let (port, served) = serve(body.clone(), 0);
+    let state = Directory::new("elsewhere-state");
+    let downloads = Directory::new("elsewhere-target");
+    let destination = downloads.0.join("result.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+    let mut settings = config(&state, destination.clone(), 4);
+    settings.expected_sha256 = Some(expected_digest(&body));
+
+    let engine = Engine::open(settings, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert_eq!(
+        engine.run(receiver).await.unwrap(),
+        SessionEnd::Published(destination.clone()),
+        "reason: {:?}",
+        engine.reason().await.unwrap()
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
+    assert_eq!(engine.state().await.unwrap(), JobState::Completed);
+    assert!(served.load(Ordering::Relaxed) > 1, "used several requests");
+    // And the part never went near the state directory, which is the whole
+    // reason the volumes no longer have to match.
+    assert_eq!(
+        part_bytes(&state),
+        0,
+        "the part was written under the state directory after all"
+    );
+}
+
+/// The claim itself, on a genuinely different disk.
+///
+/// Ignored by default because a second writable volume is not present on every
+/// machine or every CI runner, and a test that quietly passes where it cannot
+/// run is worse than one that is not run at all. This is recorded as coverage
+/// that is not carried by the default suite -- see the support matrix in
+/// `docs/feature-download-to-a-different-disk.md`.
+///
+/// Give it a directory on another volume and run it:
+///
+/// ```text
+/// FHD_SECOND_VOLUME=D:hd-test cargo test -p fhd-daemon --test end_to_end -- --ignored
+/// ```
+#[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_on_a_second_volume_downloads_and_publishes() {
+    let elsewhere = std::env::var_os("FHD_SECOND_VOLUME").map(PathBuf::from).expect(
+        "this test needs FHD_SECOND_VOLUME to name a writable directory on another volume;          without it the cross-volume claim is uncovered rather than covered",
+    );
+    std::fs::create_dir_all(&elsewhere).expect("the second-volume directory is usable");
+
+    let body = content(3 * 1024 * 1024 + 7);
+    let (port, served) = serve(body.clone(), 0);
+    let state = Directory::new("second-volume");
+    let destination = elsewhere.join(format!("fhd-{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&destination);
+    let url = format!("http://127.0.0.1:{port}/file");
+    let mut settings = config(&state, destination.clone(), 4);
+    settings.expected_sha256 = Some(expected_digest(&body));
+
+    // The volumes really are different, or this test proves nothing.
+    let volume = |path: &std::path::Path| {
+        path.components()
+            .next()
+            .map(|component| component.as_os_str().to_ascii_lowercase())
     };
-    let settings = EngineConfig {
-        destination: PathBuf::from(other),
-        ..config(&state, state.0.join("unused.bin"), 2)
+    assert_ne!(
+        volume(&state.engine()),
+        volume(&destination),
+        "FHD_SECOND_VOLUME is on the same volume as the state directory, so this          would pass without crossing anything"
+    );
+
+    let engine = Engine::open(settings, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await.unwrap();
+    // Compared after resolving, because the engine reports the path it opened
+    // and Windows spells that one `\?\D:\...` where the caller wrote `D:\...`.
+    let published = match &outcome {
+        SessionEnd::Published(path) => path.clone(),
+        other => panic!(
+            "not published: {other:?}, reason: {:?}",
+            engine.reason().await.unwrap()
+        ),
     };
-    // Publication renames within one volume, so this is refused up front.
-    assert!(Engine::open(settings, "http://127.0.0.1:1/file")
-        .await
-        .is_err());
+    assert_eq!(
+        std::fs::canonicalize(&published).unwrap(),
+        std::fs::canonicalize(&destination).unwrap()
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
+    assert_eq!(part_bytes(&state), 0, "the part went to the state volume");
+    assert!(served.load(Ordering::Relaxed) > 1, "used several requests");
+    let _ = std::fs::remove_file(&destination);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

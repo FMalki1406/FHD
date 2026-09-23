@@ -46,7 +46,6 @@ pub enum EngineError {
     /// Nothing this run could continue: no recorded job with a usable link.
     NothingToContinue,
     /// Publication renames within a volume; this destination is on another one.
-    CrossVolume,
     /// The job is waiting for a decision; run again with Intent::Resume.
     NeedsDecision(Option<StopReason>),
     /// The state directory's own access list lets accounts other than this one,
@@ -232,9 +231,16 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| EngineError::InvalidInput)?;
+        // Only a directory we made. `create_protected_directory` passes the mode
+        // to `mkdir(2)`, so ours already carries it and this is a no-op for them;
+        // running it unconditionally narrowed an operator's existing directory to
+        // 0700 without asking, which is the surprise the paragraph below says we
+        // decline to cause. Left in for the case where the mode did not take.
+        if created {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| EngineError::InvalidInput)?;
+        }
     }
     // Unix states the permissions it wants above. Windows inherits instead, and
     // what it inherits depends entirely on where the operator put this directory:
@@ -274,29 +280,6 @@ fn own_directory(path: &Path) -> Result<(), EngineError> {
         return Err(EngineError::SwappableStatePath(swappable.len() as u32));
     }
     Ok(())
-}
-
-/// Publication renames within one volume; a destination elsewhere is refused up
-/// front instead of after the whole file has been downloaded.
-fn same_volume(state: &Path, destination: &Path) -> Result<bool, EngineError> {
-    let target = destination.parent().ok_or(EngineError::InvalidInput)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let state = std::fs::metadata(state).map_err(|_| EngineError::InvalidInput)?;
-        let target = std::fs::metadata(target).map_err(|_| EngineError::InvalidInput)?;
-        Ok(state.dev() == target.dev())
-    }
-    #[cfg(not(unix))]
-    {
-        let volume = |path: &Path| {
-            path.components()
-                .next()
-                .map(|component| component.as_os_str().to_ascii_lowercase())
-        };
-        let target = std::path::absolute(target).map_err(|_| EngineError::InvalidInput)?;
-        Ok(volume(state) == volume(&target) && volume(state).is_some())
-    }
 }
 
 impl Engine {
@@ -342,9 +325,6 @@ impl Engine {
         for request in &requests {
             if !request.destination.is_absolute() {
                 return Err(EngineError::InvalidInput);
-            }
-            if !same_volume(&config.state_directory, &request.destination)? {
-                return Err(EngineError::CrossVolume);
             }
             // The binding, not just the URL: an http permission changes what may be sent.
             let source = SourceRef::new(reference(
@@ -963,7 +943,6 @@ pub fn code(error: &EngineError) -> String {
         EngineError::StateBusy => "STATE-DIRECTORY-BUSY".into(),
         EngineError::DestinationRefused => "DESTINATION-REFUSED".into(),
         EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
-        EngineError::CrossVolume => "DESTINATION-OTHER-VOLUME".into(),
         EngineError::NeedsDecision(reason) => match reason {
             Some(reason) => format!("STOPPED-{}-RERUN-WITH-RESUME", stop_reason(reason)),
             None => "STOPPED-RERUN-WITH-RESUME".into(),
