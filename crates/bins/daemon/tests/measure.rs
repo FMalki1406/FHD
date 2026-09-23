@@ -200,9 +200,16 @@ async fn one_file_end_to_end() {
         .await
         .unwrap();
     let (_keep, control) = tokio::sync::mpsc::channel(1);
+    let cpu_before = fhd_platform::process_cpu()
+        .unwrap_or_default()
+        .as_secs_f64();
     let started = watch();
     let outcome = engine.run(control).await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
+    let cpu = fhd_platform::process_cpu()
+        .unwrap_or_default()
+        .as_secs_f64()
+        - cpu_before;
     // The last commit is the moment every byte was durable: the transfer is over
     // and nothing has been read back yet.
     let transfer = last("STORE-COMMITTED", started).unwrap_or(elapsed);
@@ -224,6 +231,12 @@ async fn one_file_end_to_end() {
         mib / elapsed * 8.0
     );
     println!("  verify_publish    {:.3}", elapsed - transfer);
+    // The server runs in this process too, so this is an upper bound on the
+    // engine's own share; the attribution test separates them.
+    println!(
+        "  cpu_core_s_gib    {:.1}",
+        cpu / (size / (1024.0 * 1024.0 * 1024.0))
+    );
     println!("  outcome           {outcome:?}");
 }
 
@@ -554,6 +567,165 @@ async fn what_group_commit_would_buy() {
             "MEASURE group_commit batch={batch:>3}  {:.3}s  {:.0} rows/second",
             elapsed,
             count as f64 / elapsed
+        );
+    }
+}
+
+/// Processor time, attributed. The engine's total is known; this measures the
+/// same bytes through each layer under it, so the difference says where the
+/// cost actually is rather than where it seems to be.
+///
+/// Every step moves the same 256 MiB over the same loopback server:
+///   1. a bare socket read, which is the floor for touching the bytes at all
+///   2. the HTTP client the engine uses, discarding the body
+///   3. the HTTP client plus hashing, as a checkpoint does
+///   4. the engine itself, end to end
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement: run deliberately and record the numbers"]
+async fn where_the_processor_time_goes() {
+    use sha2::{Digest, Sha256};
+    let Some(_) = fhd_platform::process_cpu() else {
+        println!("MEASURE where_the_processor_time_goes: unavailable on this platform");
+        return;
+    };
+    let megabytes: usize = std::env::var("FHD_MEASURE_MB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256);
+    let body = Arc::new(
+        (0..megabytes * 1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
+    );
+    let gib = (megabytes as f64) / 1024.0;
+    let port = serve_fast(body.clone());
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    let cpu = || {
+        fhd_platform::process_cpu()
+            .unwrap_or_default()
+            .as_secs_f64()
+    };
+    let report = |label: &str, seconds: f64, wall: f64| {
+        println!(
+            "  {label:<22} cpu={seconds:6.2}s  ({:5.1} core-s/GiB)  wall={wall:5.2}s",
+            seconds / gib
+        );
+    };
+    println!("MEASURE where_the_processor_time_goes  ({megabytes} MiB)");
+
+    // 1. The floor: read the bytes off a socket and count them.
+    let before = cpu();
+    let clock = Instant::now();
+    {
+        use std::io::Read as _;
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socket
+            .write_all(b"GET /file HTTP/1.1\r\nHost: x\r\nRange: bytes=0-\r\n\r\n")
+            .unwrap();
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut total = 0usize;
+        while total < body.len() {
+            match socket.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => total += read,
+            }
+        }
+    }
+    report("bare socket", cpu() - before, clock.elapsed().as_secs_f64());
+
+    // 2. The HTTP client the engine uses, throwing the body away.
+    let before = cpu();
+    let clock = Instant::now();
+    {
+        let client = reqwest::Client::builder().build().unwrap();
+        let mut response = client.get(&url).send().await.unwrap();
+        let mut total = 0usize;
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            total += chunk.len();
+        }
+        assert!(total > 0);
+    }
+    report("http client", cpu() - before, clock.elapsed().as_secs_f64());
+
+    // 3. The same, hashing as it goes: what a checkpoint costs on top.
+    let before = cpu();
+    let clock = Instant::now();
+    {
+        let client = reqwest::Client::builder().build().unwrap();
+        let mut response = client.get(&url).send().await.unwrap();
+        let mut hash = Sha256::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            hash.update(&chunk);
+        }
+        let _: [u8; 32] = hash.finalize().into();
+    }
+    report(
+        "http client + hash",
+        cpu() - before,
+        clock.elapsed().as_secs_f64(),
+    );
+
+    // 4. The engine, end to end.
+    let state = Directory::new("measure-cpu");
+    let engine = Engine::open(settings(&state, 1), &url).await.unwrap();
+    let (_keep, control) = tokio::sync::mpsc::channel(1);
+    let before = cpu();
+    let clock = Instant::now();
+    engine.run(control).await.unwrap();
+    report(
+        "engine end to end",
+        cpu() - before,
+        clock.elapsed().as_secs_f64(),
+    );
+}
+
+/// What the engine pays for its internal digests, and what a different function
+/// would cost for the same work. The file the user receives is verified with
+/// SHA-256 and that cannot change -- it is the digest a caller supplies and the
+/// one published. But the per-extent digest at each checkpoint is internal: its
+/// only job is to prove, after a crash, that a saved range still holds the same
+/// bytes. This measures whether that internal choice is worth revisiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement: run deliberately and record the numbers"]
+async fn what_the_digest_costs() {
+    use sha2::{Digest, Sha256};
+    let megabytes: usize = std::env::var("FHD_MEASURE_MB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256);
+    let body: Vec<u8> = (0..megabytes * 1024 * 1024)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mib = body.len() as f64 / (1024.0 * 1024.0);
+    let gib = mib / 1024.0;
+    let cpu = || {
+        fhd_platform::process_cpu()
+            .unwrap_or_default()
+            .as_secs_f64()
+    };
+
+    println!("MEASURE what_the_digest_costs  ({megabytes} MiB)");
+    for (name, run) in [("sha2 (today)", 0usize), ("blake3", 1)] {
+        let before_cpu = cpu();
+        let clock = Instant::now();
+        match run {
+            0 => {
+                let mut hash = Sha256::new();
+                hash.update(&body);
+                let _: [u8; 32] = hash.finalize().into();
+            }
+            _ => {
+                let mut hash = blake3::Hasher::new();
+                hash.update(&body);
+                let _ = hash.finalize();
+            }
+        }
+        let wall = clock.elapsed().as_secs_f64();
+        println!(
+            "  {name:<20} wall={wall:5.2}s  {:6.0} MiB/s  cpu={:5.1} core-s/GiB",
+            mib / wall,
+            (cpu() - before_cpu) / gib
         );
     }
 }

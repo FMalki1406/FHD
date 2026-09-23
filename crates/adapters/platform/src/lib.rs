@@ -33,6 +33,11 @@ impl UserScope {
 mod imp {
     use super::*;
 
+    /// Not available without a platform call this crate does not yet make.
+    pub fn process_cpu() -> Option<std::time::Duration> {
+        None
+    }
+
     /// Unix identifies the peer by credentials on the socket itself, so the name
     /// carries nothing: `fhd-ipc` checks ownership of the directory and socket
     /// and asks the kernel who connected.
@@ -79,6 +84,38 @@ mod imp {
     fn last_error() -> io::Error {
         // SAFETY: reads a thread-local error code; no memory is touched.
         io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+    }
+
+    /// How much processor time this process has used, in total, across every
+    /// thread. Measurements need it to say where the work goes; nothing in the
+    /// download path reads it.
+    pub fn process_cpu() -> Option<std::time::Duration> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the four out-parameters are valid for the call's duration, and
+        // GetCurrentProcess is a pseudo-handle that needs no closing.
+        let read = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if read == 0 {
+            return None;
+        }
+        // Both are hundreds of nanoseconds since the process started.
+        let ticks =
+            |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        Some(std::time::Duration::from_nanos(
+            (ticks(kernel) + ticks(user)) * 100,
+        ))
     }
 
     /// The SID of the account this process runs as, and its logon session.
@@ -438,9 +475,9 @@ mod imp {
     }
 }
 
-pub use imp::user_scope;
 #[cfg(windows)]
 pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
+pub use imp::{process_cpu, user_scope};
 
 #[cfg(test)]
 mod tests {
