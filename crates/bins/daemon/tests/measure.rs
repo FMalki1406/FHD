@@ -20,10 +20,14 @@ use std::{
     time::Instant,
 };
 
-/// When each engine event happened, so a run can be split into the part that
-/// moves bytes and the part that makes the file usable. The engine already
-/// reports both; this only timestamps what it says.
-type Marks = Arc<Mutex<Vec<(String, Instant)>>>;
+/// When each engine event happened -- and how much processor time the process
+/// had spent by then -- so a run can be split into the part that moves bytes and
+/// the part that makes the file usable, in seconds *and* in processor cost. The
+/// engine already reports both moments; this only timestamps what it says.
+///
+/// Engine events are lifecycle events, a few dozen per run, so asking the OS for
+/// the process clock at each one costs nothing measurable.
+type Marks = Arc<Mutex<Vec<(String, Instant, f64)>>>;
 static MARKS: OnceLock<Marks> = OnceLock::new();
 
 fn marks() -> Marks {
@@ -56,7 +60,10 @@ impl tracing::Subscriber for Stopwatch {
         let mut code = CodeOnly(None);
         event.record(&mut code);
         if let Some(code) = code.0 {
-            marks().lock().unwrap().push((code, Instant::now()));
+            marks()
+                .lock()
+                .unwrap()
+                .push((code, Instant::now(), process_cpu()));
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
@@ -73,15 +80,24 @@ fn watch() -> Instant {
     Instant::now()
 }
 
+/// Processor time this whole process has burned so far, in seconds. Kernel and
+/// user, every thread.
+fn process_cpu() -> f64 {
+    fhd_platform::process_cpu()
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 /// The last moment the engine said bytes became durable: the end of moving
-/// bytes, before anything is read back to prove them.
-fn last(code: &str, start: Instant) -> Option<f64> {
+/// bytes, before anything is read back to prove them. Returns the wall second it
+/// happened at and the processor seconds spent by then.
+fn last(code: &str, start: Instant) -> Option<(f64, f64)> {
     marks()
         .lock()
         .unwrap()
         .iter()
-        .filter(|(seen, _)| seen == code)
-        .map(|(_, at)| at.duration_since(start).as_secs_f64())
+        .filter(|(seen, _, _)| seen == code)
+        .map(|(_, at, cpu)| (at.duration_since(start).as_secs_f64(), *cpu))
         .next_back()
 }
 
@@ -200,21 +216,21 @@ async fn one_file_end_to_end() {
         .await
         .unwrap();
     let (_keep, control) = tokio::sync::mpsc::channel(1);
-    let cpu_before = fhd_platform::process_cpu()
-        .unwrap_or_default()
-        .as_secs_f64();
     let started = watch();
+    let cpu_before = process_cpu();
     let outcome = engine.run(control).await.unwrap();
     let elapsed = started.elapsed().as_secs_f64();
-    let cpu = fhd_platform::process_cpu()
-        .unwrap_or_default()
-        .as_secs_f64()
-        - cpu_before;
+    let cpu = process_cpu() - cpu_before;
     // The last commit is the moment every byte was durable: the transfer is over
-    // and nothing has been read back yet.
-    let transfer = last("STORE-COMMITTED", started).unwrap_or(elapsed);
+    // and nothing has been read back yet. Splitting the processor clock there
+    // too is what keeps the final verification out of the transfer budget §1
+    // excludes it from -- the two costs are reported apart, never summed into
+    // one verdict.
+    let (transfer, cpu_at_commit) = last("STORE-COMMITTED", started).unwrap_or((elapsed, cpu));
+    let transfer_cpu = cpu_at_commit - cpu_before;
 
     let mib = size / (1024.0 * 1024.0);
+    let gib = size / (1024.0 * 1024.0 * 1024.0);
     println!("MEASURE one_file_end_to_end");
     println!("  size_mib          {megabytes}");
     println!("  connections       {connections}");
@@ -231,12 +247,19 @@ async fn one_file_end_to_end() {
         mib / elapsed * 8.0
     );
     println!("  verify_publish    {:.3}", elapsed - transfer);
-    // The server runs in this process too, so this is an upper bound on the
-    // engine's own share; the attribution test separates them.
+    // The server runs in this process too, so these are upper bounds on the
+    // engine's own share; the attribution test separates them. Reported as three
+    // numbers because §1's budget covers the first alone: moving bytes and the
+    // checkpoint digests that make them resumable, not the final verification.
     println!(
-        "  cpu_core_s_gib    {:.1}",
-        cpu / (size / (1024.0 * 1024.0 * 1024.0))
+        "  cpu_transfer_gib  {:.1}   (fetch + checkpoints -- the §1 budget)",
+        transfer_cpu / gib
     );
+    println!(
+        "  cpu_verify_gib    {:.1}   (final verification + publish -- excluded)",
+        (cpu - transfer_cpu) / gib
+    );
+    println!("  cpu_total_gib     {:.1}", cpu / gib);
     println!("  outcome           {outcome:?}");
 }
 
