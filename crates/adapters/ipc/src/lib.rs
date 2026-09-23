@@ -74,7 +74,7 @@ impl Endpoint {
     /// and 104 on macOS, and a truncated path would name something else entirely.
     pub fn usable(&self) -> Result<(), IpcError> {
         let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
-        if self.0.as_bytes().len() >= limit {
+        if self.0.len() >= limit {
             return Err(IpcError::Untrusted);
         }
         Ok(())

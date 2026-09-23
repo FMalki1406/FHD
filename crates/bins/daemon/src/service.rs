@@ -37,10 +37,10 @@ impl Registry {
         }
     }
     /// True when this name is already spoken for by a different reference.
-    fn claimed_by_other(&self, destination: DestinationRef, path: &PathBuf) -> bool {
+    fn claimed_by_other(&self, destination: DestinationRef, path: &std::path::Path) -> bool {
         self.0.lock().is_ok_and(|map| {
             map.iter()
-                .any(|(other, taken)| *other != destination && taken == path)
+                .any(|(other, taken)| *other != destination && taken.as_path() == path)
         })
     }
 }
