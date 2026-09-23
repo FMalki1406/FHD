@@ -76,6 +76,16 @@ mod imp {
     pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
         Ok(())
     }
+
+    /// Unix creates the directory and then sets its mode, which is what the
+    /// caller already does.
+    pub fn create_protected_directory(path: &std::path::Path) -> io::Result<bool> {
+        match std::fs::create_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -611,6 +621,82 @@ mod imp {
     /// A directory we did not create is never touched: the operator may have
     /// pointed at something shared or redirected, and rewriting its permissions
     /// would be a worse surprise than refusing it.
+    /// Creates the state directory **with** its access list, or reports that it
+    /// was already there.
+    ///
+    /// Creating first and setting permissions afterwards leaves a window in which
+    /// the directory carries whatever it inherited -- on a data volume, write
+    /// access for every account on the machine. Windows decides access when a
+    /// handle is opened, so a handle taken in that window survives the list being
+    /// replaced, and a file planted in it is already inside. Handing the list to
+    /// `CreateDirectoryW` closes the window: there is no moment when the
+    /// directory exists under anything but its stated permissions.
+    ///
+    /// Returns whether this call created it. `false` means it was already there,
+    /// and a directory we did not create is inspected rather than rewritten.
+    pub fn create_protected_directory(path: &std::path::Path) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        let (_descriptor, attributes) = owner_only_directory_descriptor()?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        // SAFETY: `wide` is a null-terminated path and `attributes` points at a
+        // SECURITY_ATTRIBUTES whose descriptor lives until this function returns;
+        // the call copies what it needs before that.
+        let made = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+        if made != 0 {
+            return Ok(false_if_zero(made));
+        }
+        let error = last_error();
+        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+
+    /// `CreateDirectoryW` returns non-zero on success; this keeps the conversion
+    /// where a reader can see it rather than inside a condition.
+    fn false_if_zero(value: i32) -> bool {
+        value != 0
+    }
+
+    /// The access list a state directory gets: this account, the system and the
+    /// administrators, inheritance off, inherited by what is created inside.
+    fn owner_only_directory_descriptor() -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
+        let sid = user_scope()?.identity;
+        let sddl = format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        descriptor_from(&sddl)
+    }
+
+    /// Builds a descriptor from SDDL and the attributes that carry it.
+    fn descriptor_from(sddl: &str) -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is a null-terminated wide string that outlives the call,
+        // and `descriptor` is a valid out-parameter the system allocates into.
+        let built = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if built == 0 || descriptor.is_null() {
+            return Err(last_error());
+        }
+        Ok((
+            Local(descriptor),
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            },
+        ))
+    }
+
     pub fn protect_new_directory(path: &std::path::Path) -> io::Result<()> {
         let sid = user_scope()?.identity;
         // OICI: the same entries are inherited by what we create inside, so the
@@ -810,7 +896,9 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
-pub use imp::{foreign_writers, process_cpu, protect_new_directory, user_scope};
+pub use imp::{
+    create_protected_directory, foreign_writers, process_cpu, protect_new_directory, user_scope,
+};
 
 #[cfg(test)]
 mod tests {
