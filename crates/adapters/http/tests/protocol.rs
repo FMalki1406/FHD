@@ -19,30 +19,42 @@ fn serve(responses: Vec<Vec<u8>>) -> Server {
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
+    let remaining = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
     std::thread::spawn(move || {
-        let mut remaining = std::collections::VecDeque::from(responses);
-        while !remaining.is_empty() {
-            let Ok((mut stream, _)) = listener.accept() else {
+        // A connection per thread. A client may open one connection or several,
+        // and may keep one alive while opening another; a server that answered
+        // only the connection in front of it would block whenever the client
+        // chose differently, which is how this harness used to fail -- on one
+        // platform, under load, because pooling decided differently there.
+        while !remaining.lock().unwrap().is_empty() {
+            let Ok((stream, _)) = listener.accept() else {
                 return;
             };
-            // Answer every request this connection carries, not just the first:
-            // a client is free to keep the connection alive, and a script that
-            // assumed one request per connection would hang whenever it did.
-            while let Some(response) = remaining.front().cloned() {
-                let request = read_request(&mut stream);
-                if request.is_empty() {
-                    break;
+            let recorder = recorder.clone();
+            let remaining = remaining.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                // A client that opens a connection and says nothing must not hold
+                // this thread for the length of the test.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                loop {
+                    let request = read_request(&mut stream);
+                    if request.is_empty() {
+                        return;
+                    }
+                    let Some(response) = remaining.lock().unwrap().pop_front() else {
+                        return;
+                    };
+                    recorder.lock().unwrap().push(request);
+                    if stream
+                        .write_all(&response)
+                        .and_then(|()| stream.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                remaining.pop_front();
-                recorder.lock().unwrap().push(request);
-                if stream
-                    .write_all(&response)
-                    .and_then(|()| stream.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            });
         }
     });
     Server { port, seen }
