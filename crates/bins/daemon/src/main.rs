@@ -119,13 +119,33 @@ fn parse() -> Result<Invocation, &'static str> {
             _ => return Err(usage()),
         }
     }
+    // Flags only one mode reads are refused in the others. Accepting one where
+    // nothing looks at it is the same silent drop that let `--sha256` be parsed,
+    // validated and then ignored: the operator asks for something, is told
+    // nothing, and does not get it.
+    //
     // A checksum belongs to one request the operator named. `--continue` is every
     // job the directory remembers and `--serve` is whatever a client asks for
-    // later, so neither has a request to attach it to -- and neither reads the
-    // field. Accepting it there would be the same silent drop that let `--sha256`
-    // be parsed, validated and then ignored on the one-shot path.
+    // later, so neither has a request to attach it to.
     if (cont || serve) && config.expected_sha256.is_some() {
         return Err("--sha256 belongs to a single request");
+    }
+    // The download root confines where a *client* may land files, so only a
+    // resident engine acts on it. Elsewhere it reads like a confinement that is
+    // not there, which is worse than not offering it.
+    if !serve && config.download_root.is_some() {
+        return Err("--download-root belongs to --serve");
+    }
+    // A link is kept off the disk for the request being made now. `--continue`
+    // replays what is already recorded and `--serve` takes each request over the
+    // wire with its own flag, so neither reads this one.
+    if (cont || serve) && sensitive {
+        return Err("--sensitive-link belongs to a single request");
+    }
+    // Releasing a stopped job is decided per run of the engine itself; a resident
+    // takes that decision from a client instead, and never reads this.
+    if serve && config.intent == Intent::Resume {
+        return Err("--resume belongs to a run that drives jobs itself");
     }
     Ok(Invocation {
         config,
@@ -182,18 +202,28 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
                 allow_http,
             })
         }
-        "list" => Request::List { after: None },
+        "list" => {
+            refuse_extra(args);
+            Request::List { after: None }
+        }
         "pause" | "cancel" => {
             let Some(job) = args.next().and_then(|job| job.parse::<u64>().ok()) else {
                 fail("ENGINE-INVALID-INPUT")
             };
+            // One command names one job. `cancel 3 7` used to cancel 3, print
+            // "done" and exit zero, leaving the operator believing both were
+            // cancelled -- and this refusal happens before anything is sent.
+            refuse_extra(args);
             if command == "pause" {
                 Request::Pause { job }
             } else {
                 Request::Cancel { job }
             }
         }
-        "stop" => Request::Shutdown,
+        "stop" => {
+            refuse_extra(args);
+            Request::Shutdown
+        }
         _ => {
             eprintln!("{}", usage());
             std::process::exit(2);
@@ -236,6 +266,17 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
         }
         Ok(Response::Failed { code }) => fail(&code),
         Err(error) => fail(error.code()),
+    }
+}
+
+/// Refuses anything left over after a client command has taken what it needs.
+///
+/// Silence here is the defect this closes: an argument that is collected and
+/// never looked at tells the operator their instruction was accepted.
+fn refuse_extra(rest: impl Iterator<Item = String>) {
+    if rest.count() > 0 {
+        eprintln!("{}", usage());
+        std::process::exit(2);
     }
 }
 

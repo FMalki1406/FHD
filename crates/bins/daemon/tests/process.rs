@@ -405,6 +405,25 @@ fn a_refused_argument_has_no_side_effect_in_any_mode() {
         vec!["--serve".into(), "--sha256".into(), hex(&[0x22; 32])],
         vec!["--serve".into(), "--frobnicate".into()],
         vec!["--continue".into(), "--frobnicate".into()],
+        // A confinement that is not applied reads as one that is. Only a
+        // resident engine acts on the download root.
+        vec!["<dest>".into(), "--download-root".into(), "<dest>".into()],
+        vec![
+            "--continue".into(),
+            "--download-root".into(),
+            "<dest>".into(),
+        ],
+        // Keeping a link off the disk is decided for the request being made.
+        vec!["--continue".into(), "--sensitive-link".into()],
+        vec!["--serve".into(), "--sensitive-link".into()],
+        // Releasing a stopped job belongs to a run that drives jobs itself.
+        vec!["--serve".into(), "--resume".into()],
+        // One command names one job: `cancel 3 7` cancelled 3, said "done" and
+        // exited zero while the operator believed both were cancelled.
+        vec!["--client".into(), "cancel".into(), "3".into(), "7".into()],
+        vec!["--client".into(), "pause".into(), "3".into(), "7".into()],
+        vec!["--client".into(), "list".into(), "extra".into()],
+        vec!["--client".into(), "stop".into(), "extra".into()],
         vec![
             "--client".into(),
             "add".into(),
