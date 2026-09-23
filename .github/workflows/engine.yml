@@ -54,8 +54,23 @@ jobs:
           node tools/check-architecture.mjs
       - name: Check Rust warnings
         run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test Rust workspace
-        run: cargo +1.98.1 test --workspace --locked
+      # Split by area on purpose: a job's step names and their results are
+      # readable without a token, but its logs are not. When something fails on a
+      # runner we cannot reproduce, the failing step name is the whole diagnosis.
+      - name: Test domain and application
+        run: cargo +1.98.1 test -p fhd-domain -p fhd-app -p fhd-config -p fhd-telemetry --locked
+      - name: Test protocol and IPC
+        run: cargo +1.98.1 test -p fhd-protocol -p fhd-ipc --locked
+      - name: Test storage and persistence adapters
+        run: cargo +1.98.1 test -p fhd-storage -p fhd-persistence --locked
+      - name: Test HTTP adapter
+        run: cargo +1.98.1 test -p fhd-http --locked
+      - name: Test runtime
+        run: cargo +1.98.1 test -p fhd-runtime --locked
+      - name: Test engine end to end
+        run: cargo +1.98.1 test -p fhd-daemon --locked
+      - name: Test legacy engine and stores
+        run: cargo +1.98.1 test -p download-engine -p download-core -p resume-policy -p transfer-store -p queue-secrets -p platform-files -p fhd-testkit --locked
       - name: Build developer transfer tool
         run: cargo +1.98.1 build --bin fhd-transfer --locked
       - name: Test HTTP fixtures
