@@ -109,6 +109,11 @@ jobs:
         run: cargo +1.98.1 test -p fhd-runtime --locked
       - name: Test engine end to end
         run: cargo +1.98.1 test -p fhd-daemon --locked
+      # The library suites never start the program. Argument parsing, the
+      # one-shot/serve/client dispatch and the control surface between two real
+      # processes are only covered here.
+      - name: Test the engine as a program
+        run: cargo +1.98.1 test -p fhd-daemon --locked --test process
       - name: Test legacy engine and stores
         run: cargo +1.98.1 test -p download-engine -p download-core -p resume-policy -p transfer-store -p queue-secrets -p platform-files -p fhd-testkit --locked
       - name: Build developer transfer tool
