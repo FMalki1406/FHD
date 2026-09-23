@@ -95,6 +95,9 @@ jobs:
       # everywhere is what keeps it from drifting on a platform nobody checks.
       - name: Platform - the owner rule is decided, not assumed
         run: cargo +1.98.1 test -p fhd-platform --locked owner_rule_is_decided
+      - name: Platform - the ways the swap check used to miss
+        if: runner.os == 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked used_to_miss
       # Each test above is named by a step, and a step that matched nothing would
       # pass in silence. This fails if the crate grows a test no step runs.
       - name: Platform - every test here is named by a step
@@ -106,7 +109,7 @@ jobs:
           covered=$(for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
               either_spelling stranger_may_write until_it_is_protected \
-              used_to_fail_open owner_rule_is_decided; do
+              used_to_fail_open owner_rule_is_decided used_to_miss; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))
