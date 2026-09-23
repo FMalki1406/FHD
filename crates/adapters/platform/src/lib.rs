@@ -703,20 +703,15 @@ mod imp {
         // SECURITY_ATTRIBUTES whose descriptor lives until this function returns;
         // the call copies what it needs before that.
         let made = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+        // Non-zero is success, and success means this call is what created it.
         if made != 0 {
-            return Ok(false_if_zero(made));
+            return Ok(true);
         }
         let error = last_error();
         if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
             return Ok(false);
         }
         Err(error)
-    }
-
-    /// `CreateDirectoryW` returns non-zero on success; this keeps the conversion
-    /// where a reader can see it rather than inside a condition.
-    fn false_if_zero(value: i32) -> bool {
-        value != 0
     }
 
     /// The access list a state directory gets: this account, the system and the
