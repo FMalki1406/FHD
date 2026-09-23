@@ -260,7 +260,7 @@ async fn main() {
     if cont {
         continue_run(config).await;
     }
-    let requests = match read_requests(std::io::stdin(), &config.destination) {
+    let mut requests = match read_requests(std::io::stdin(), &config.destination) {
         Ok(mut requests) => {
             for request in &mut requests {
                 request.sensitive = sensitive;
@@ -277,6 +277,16 @@ async fn main() {
     if requests.len() > 1 && config.expected_sha256.is_some() {
         eprintln!("ENGINE-INVALID-INPUT");
         std::process::exit(2);
+    }
+    // And it has to reach that request. `read_requests` cannot know about a flag
+    // parsed from the command line, so it leaves the field empty; applying it here
+    // is what makes `--sha256` mean anything. Without this the engine verified the
+    // bytes against its own record, published the file and exited zero while the
+    // digest the operator gave it was never compared to anything.
+    if let Some(expected) = config.expected_sha256 {
+        if let Some(request) = requests.first_mut() {
+            request.expected_sha256 = Some(expected);
+        }
     }
     let several = requests.len() > 1;
     let engine = match Engine::open_many(config, requests).await {
