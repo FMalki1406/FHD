@@ -22,7 +22,11 @@ enum Command {
     },
     Sync(Reply<()>),
     Hash(ByteRange, Reply<[u8; 32]>),
-    Verify(Option<[u8; 32]>, Reply<[u8; 32]>),
+    Verify(
+        Option<[u8; 32]>,
+        Vec<(ByteRange, [u8; 32])>,
+        Reply<[u8; 32]>,
+    ),
     Publish(std::path::PathBuf, Reply<std::path::PathBuf>),
     Discard {
         abandon: bool,
@@ -145,10 +149,12 @@ impl Writer {
                             let _ = reply.send(result);
                         }
                         // A digest mismatch is a verdict, not a broken lane: no poisoning.
-                        Command::Verify(expected, reply) => {
+                        Command::Verify(expected, record, reply) => {
                             let result = match failure {
                                 Some(error) => Err(error),
-                                None => file.verify(expected).map_err(WriterError::Storage),
+                                None => {
+                                    file.verify(expected, &record).map_err(WriterError::Storage)
+                                }
                             };
                             if let Err(error) = result {
                                 if error != WriterError::Storage(StorageError::Integrity) {
@@ -233,10 +239,12 @@ impl Writer {
     pub async fn verify(
         &self,
         expected: Option<[u8; 32]>,
+        record: Vec<(ByteRange, [u8; 32])>,
         cancel: &CancellationToken,
     ) -> Result<[u8; 32], WriterError> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::Verify(expected, reply), cancel).await?;
+        self.send(Command::Verify(expected, record, reply), cancel)
+            .await?;
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }
     /// Atomic no-replace publication, after every write and the verification.

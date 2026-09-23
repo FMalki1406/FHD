@@ -109,10 +109,35 @@ pub trait SegmentFile: Send {
     /// Rehash a receipt recovered from the repository before trusting its extent.
     /// Opening a file alone must not restore coverage based on its size.
     fn recover_extent(&mut self, range: ByteRange, digest: [u8; 32]) -> Result<(), StorageError>;
-    /// Coordinator must first prove complete committed extent coverage and drain
-    /// workers. File length, zero contents and an untrusted digest do not prove it.
-    /// Implementation invalidates any verification on further writes.
-    fn verify(&mut self, expected: Option<[u8; 32]>) -> Result<[u8; 32], StorageError>;
+    /// Proves the file against the record, then optionally against a digest the
+    /// request carried.
+    ///
+    /// `record` is the repository's committed extents: a range and the digest of
+    /// its bytes, taken after the bytes were synced. It is the prior evidence
+    /// this check is made against. Verifying without it compared the file with a
+    /// digest computed from the file a moment earlier, which is a check of this
+    /// function against itself -- a review overwrote sixteen bytes of a live part
+    /// and watched them publish.
+    ///
+    /// The implementation must reject a record that does not cover every byte,
+    /// because an uncovered range is one nothing ever attested, and it must
+    /// rehash each recorded range rather than trusting that it was written.
+    ///
+    /// **What the record does not do.** It shows the bytes are the ones that were
+    /// recorded, not that they are the ones the source sent: the digests are
+    /// computed from what arrived. An attacker able to change the data and the
+    /// repository together defeats it. Only `expected` -- supplied with the
+    /// request, from somewhere we did not derive -- speaks to authenticity, and
+    /// it stays for exactly that reason.
+    ///
+    /// Coordinator must first drain workers. File length and zero contents do
+    /// not prove coverage. Implementation invalidates any verification on
+    /// further writes.
+    fn verify(
+        &mut self,
+        expected: Option<[u8; 32]>,
+        record: &[(ByteRange, [u8; 32])],
+    ) -> Result<[u8; 32], StorageError>;
     /// Requires a synchronized, verified file and a durable PublishIntent in the
     /// repository. Atomic no-replace is mandatory; unsupported filesystems fail.
     fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError>;
