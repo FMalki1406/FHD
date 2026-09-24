@@ -360,6 +360,7 @@ async fn main() {
             }
         }
     }
+    warn_about_shared_destinations(&requests);
     let several = requests.len() > 1;
     let engine = match Engine::open_many(config, requests).await {
         Ok(engine) => engine,
@@ -505,4 +506,46 @@ fn report(outcomes: Vec<(usize, JobOutcome)>) -> i32 {
         }
     }
     i32::from(failed)
+}
+
+/// Says once, for each folder, that other accounts on this machine can change
+/// what lands in it.
+///
+/// The engine protects a download while it is in progress: the part file lives
+/// in a directory it created with its own access list, and a second account is
+/// denied everything in it. Once the finished file is delivered into a folder
+/// others can write, that protection ends -- and nothing the engine does
+/// afterwards can extend it, because the file is theirs to reach.
+///
+/// Not a refusal. A folder every account can write is the stock arrangement on
+/// a data volume, so refusing would refuse most downloads to a second disk,
+/// which is what this engine exists to allow. Not per download either: it is a
+/// property of the folder, and repeating it per file trains people to skip it.
+///
+/// Until there is an interface to say it in, it is said here, because a limit
+/// that lives only in a source comment is not a declared limit.
+fn warn_about_shared_destinations(requests: &[fhd_daemon::Request]) {
+    let mut told: Vec<std::path::PathBuf> = Vec::new();
+    for request in requests {
+        let Some(folder) = request.destination.parent() else {
+            continue;
+        };
+        if told.iter().any(|seen| seen == folder) {
+            continue;
+        }
+        let Ok(swappable) = fhd_platform::swappable_components(folder) else {
+            continue;
+        };
+        let exposed = fhd_platform::foreign_writers(folder)
+            .map(|writers| !writers.is_empty())
+            .unwrap_or(false);
+        if swappable.is_empty() && !exposed {
+            continue;
+        }
+        told.push(folder.to_path_buf());
+        eprintln!("DESTINATION-SHARED {}", folder.display());
+        eprintln!(
+            "  other accounts on this machine can change files in this folder.              the download is protected while it runs; the finished file is not."
+        );
+    }
 }
