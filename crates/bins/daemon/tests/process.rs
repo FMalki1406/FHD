@@ -7,7 +7,10 @@
 //! processes. A regression in any of those would have left the whole suite green.
 mod harness;
 
-use harness::{content, expected_digest, serve, Directory};
+use harness::{
+    content, expected_digest, kept_beside_matches, program_published, resting, serve, Directory,
+    PUBLISHES,
+};
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -44,11 +47,47 @@ fn run(arguments: &[&str], stdin: &str) -> (Option<i32>, String, String) {
     )
 }
 
+/// What `--continue` does with a directory whose jobs have already fetched
+/// everything they were asked for.
+///
+/// Where publication works every job is `Completed`, nothing is left to do and
+/// the run exits zero. Where it does not, each job is resting on the refusal
+/// instead, so the run reports every one of them as needing a decision for the
+/// storage reason and exits one. Either way the point being made is the same
+/// and is asserted on both: the directory is still usable -- not refused as a
+/// whole, and still naming its jobs one line each.
+#[track_caller]
+fn continued(code: Option<i32>, out: &str, err: &str, complaint: &str) {
+    if PUBLISHES {
+        assert_eq!(code, Some(0), "{complaint}.\nstdout: {out}\nstderr: {err}");
+        return;
+    }
+    assert_eq!(
+        code,
+        Some(1),
+        "{complaint}: --continue must reach the jobs and report them.\nstdout: \
+         {out}\nstderr: {err}"
+    );
+    assert!(
+        !out.is_empty()
+            && out
+                .lines()
+                .all(|line| line.contains("STOPPED-STORAGE-RERUN-WITH-RESUME")),
+        "every job should be resting on the refused publication, reachable by a \
+         rerun with --resume.\nstdout: {out}\nstderr: {err}"
+    );
+}
+
 /// One file, fetched and published by the program itself.
 ///
 /// This is the path an operator runs. It proves the argument parser accepts what
 /// the usage text promises, that a link read from standard input reaches the
 /// transport, and that a successful run leaves a correct file and exits zero.
+///
+/// Where publication is unsupported the same run is held to what the program
+/// does offer there: it fetches everything, refuses to publish, says so and
+/// exits one, keeping the bytes beside the destination. `program_published`
+/// asserts whichever of the two applies.
 #[test]
 fn the_program_downloads_and_publishes_a_file() {
     let state = Directory::new("process-oneshot");
@@ -68,9 +107,7 @@ fn the_program_downloads_and_publishes_a_file() {
         &format!("http://127.0.0.1:{port}/file\n"),
     );
 
-    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
-    let published = std::fs::read(&destination).expect("the file is where it was asked for");
-    assert_eq!(published, body, "the published bytes are the served bytes");
+    program_published(code, &destination, &body, &out, &err);
 }
 
 /// The digest the operator supplies is honoured, not decorative.
@@ -175,9 +212,11 @@ fn adding_a_checksum_later_conflicts_instead_of_forking_the_job() {
     let target = destination.to_string_lossy().into_owned();
 
     let (code, out, err) = run(&[&engine_dir, &target, "--allow-http"], &line);
-    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    program_published(code, &destination, &body, &out, &err);
 
-    // The same request, now carrying the digest it always had in fact.
+    // The same request, now carrying the digest it always had in fact. The
+    // receipt is written when the job is admitted, so the conflict below is the
+    // same on every platform whether or not the first run could publish.
     let (code, _, err) = run(
         &[
             &engine_dir,
@@ -196,11 +235,7 @@ fn adding_a_checksum_later_conflicts_instead_of_forking_the_job() {
 
     // And the directory is still usable, which is the part that was lost.
     let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
-    assert_eq!(
-        code,
-        Some(0),
-        "--continue must still work.\nstdout: {out}\nstderr: {err}"
-    );
+    continued(code, &out, &err, "--continue must still work");
 }
 
 /// A conflicting checksum on one job does not touch another job in the same
@@ -220,16 +255,19 @@ fn a_checksum_conflict_leaves_other_jobs_and_resume_intact() {
     let one = state.0.join("one.bin");
     let two = state.0.join("two.bin");
 
-    // Two independent jobs, each admitted and published on its own run.
-    for (port, target) in [(port_one, &one), (port_two, &two)] {
+    // Two independent jobs, each admitted on its own run and taken as far as
+    // this platform takes one.
+    for (port, target, body) in [(port_one, &one, &first), (port_two, &two, &second)] {
         let (code, out, err) = run(
             &[&engine_dir, &target.to_string_lossy(), "--allow-http"],
             &format!("http://127.0.0.1:{port}/file\n"),
         );
-        assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+        program_published(code, target, body, &out, &err);
     }
-    assert_eq!(std::fs::read(&one).unwrap(), first);
-    assert_eq!(std::fs::read(&two).unwrap(), second);
+    if PUBLISHES {
+        assert_eq!(std::fs::read(&one).unwrap(), first);
+        assert_eq!(std::fs::read(&two).unwrap(), second);
+    }
 
     // The first request comes back with a checksum, which conflicts.
     let (code, _, err) = run(
@@ -246,16 +284,26 @@ fn a_checksum_conflict_leaves_other_jobs_and_resume_intact() {
     assert!(err.contains("COMMAND-CONFLICT"), "stderr: {err}");
 
     // The neighbour is untouched and the directory still continues: both jobs
-    // are still there and both files still hold what they held.
+    // are still there and both still hold the bytes they held.
     let (code, out, err) = run(&[&engine_dir, "--continue", "--allow-http"], "");
-    assert_eq!(
-        code,
-        Some(0),
-        "the conflict broke resume.\nstdout: {out}\nstderr: {err}"
-    );
+    continued(code, &out, &err, "the conflict broke resume");
     assert_eq!(out.lines().count(), 2, "a job went missing: {out}");
-    assert_eq!(std::fs::read(&one).unwrap(), first);
-    assert_eq!(std::fs::read(&two).unwrap(), second);
+    if PUBLISHES {
+        assert_eq!(std::fs::read(&one).unwrap(), first);
+        assert_eq!(std::fs::read(&two).unwrap(), second);
+    } else {
+        // Same claim where nothing is published: the conflict, and the continue
+        // that followed it, left both jobs' work whole and neither destination
+        // created behind the operator's back.
+        assert!(
+            !one.exists() && !two.exists(),
+            "a refused publication created a destination"
+        );
+        assert!(
+            kept_beside_matches(&one, &first) && kept_beside_matches(&two, &second),
+            "a job lost the bytes it had downloaded"
+        );
+    }
 }
 
 /// A wrong checksum stops the file being published, on the resume path too.
@@ -695,12 +743,49 @@ fn a_client_process_commands_a_serving_process() {
     assert_eq!(code, Some(0));
     assert!(!listed.trim().is_empty(), "list returned nothing");
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !destination.exists() {
-        assert!(Instant::now() < deadline, "the download never published");
-        std::thread::sleep(Duration::from_millis(100));
+    // What the job comes to rest as is not the same on every platform, so what
+    // is waited for is not either. Waiting for a published file where nothing
+    // can publish could only ever time out, and a longer deadline would be a
+    // way of not noticing.
+    if PUBLISHES {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !destination.exists() {
+            assert!(Instant::now() < deadline, "the download never published");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+    } else {
+        // The declared refusal, seen the way an operator would see it: over the
+        // control surface, through a second process. Any resting state ends the
+        // wait, so a wrong one fails at once rather than after the deadline.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (rested, why) = loop {
+            let (code, listed, err) =
+                run(&[&state.engine().to_string_lossy(), "--client", "list"], "");
+            assert_eq!(code, Some(0), "listing failed.\nstderr: {err}");
+            if let Some((rested, why)) = listed.lines().find_map(resting) {
+                break (rested.to_owned(), why.map(str::to_owned));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the job never came to rest: {listed}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(
+            (rested.as_str(), why.as_deref()),
+            ("NeedsAction", Some("STORAGE")),
+            "the job settled in a state this platform does not declare"
+        );
+        assert!(
+            !destination.exists(),
+            "a refused publication created the destination"
+        );
+        assert!(
+            kept_beside_matches(&destination, &body),
+            "no part beside the destination holds the bytes that were downloaded"
+        );
     }
-    assert_eq!(std::fs::read(&destination).unwrap(), body);
 
     // Shutdown travels over the same surface, and the process actually leaves.
     let (code, _, _) = run(&[&state.engine().to_string_lossy(), "--client", "stop"], "");
@@ -826,18 +911,54 @@ fn two_jobs_may_share_a_destination_and_the_file_survives_it() {
 
     // Whatever the race does, the published file must be one of the two bodies
     // whole -- never a mixture, and never truncated.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !target.exists() {
-        assert!(Instant::now() < deadline, "neither job published");
-        std::thread::sleep(Duration::from_millis(100));
+    if PUBLISHES {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !target.exists() {
+            assert!(Instant::now() < deadline, "neither job published");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let published = std::fs::read(&target).unwrap();
+        assert!(
+            published == first || published == second,
+            "the destination holds neither body whole: {} bytes",
+            published.len()
+        );
+    } else {
+        // Where nothing publishes, neither job can win the name -- so the claim
+        // is the same one made about the bytes rather than about the file: each
+        // job fetched its own body whole and kept it, unmixed, and no
+        // destination appeared. Waiting for a file here could only time out.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (code, listed, err) = run(&[&engine_dir, "--client", "list"], "");
+            assert_eq!(code, Some(0), "listing failed.\nstderr: {err}");
+            let at_rest: Vec<_> = listed.lines().filter_map(resting).collect();
+            if at_rest.len() == 2 {
+                for (rested, why) in at_rest {
+                    assert_eq!(
+                        (rested, why),
+                        ("NeedsAction", Some("STORAGE")),
+                        "a job settled in a state this platform does not declare: {listed}"
+                    );
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both jobs should come to rest: {listed}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !target.exists(),
+            "a refused publication created the destination"
+        );
+        assert!(
+            kept_beside_matches(&target, &first) && kept_beside_matches(&target, &second),
+            "the two jobs sharing one destination did not each keep their own body whole"
+        );
     }
-    std::thread::sleep(Duration::from_secs(2));
-    let published = std::fs::read(&target).unwrap();
-    assert!(
-        published == first || published == second,
-        "the destination holds neither body whole: {} bytes",
-        published.len()
-    );
 
     let (code, _, _) = run(&[&engine_dir, "--client", "stop"], "");
     assert_eq!(code, Some(0));

@@ -51,6 +51,73 @@ pub fn kept_beside_matches(destination: &Path, body: &[u8]) -> bool {
         .is_some_and(|folder| walk(&folder.join(".fhd-parts"), body))
 }
 
+/// The declared outcome of a *program* run that fetched everything.
+///
+/// Returns `true` where this platform publishes, after asserting the run exited
+/// zero and left the destination holding `body`. Where it does not publish, it
+/// asserts the contract the program actually offers -- the run reached
+/// publication and stopped there, nothing was published, and the bytes are
+/// still on disk beside the destination -- and returns `false`, so the caller
+/// stops before looking at a file this platform never creates.
+///
+/// This is not a way of switching a test off: both branches assert, and neither
+/// accepts "something went wrong". The exit code is pinned to 1, which is what
+/// a job settling short of `Completed` produces; a binary that could not parse
+/// its arguments or open its state directory exits 2 and would fail here.
+#[track_caller]
+pub fn program_published(
+    code: Option<i32>,
+    destination: &Path,
+    body: &[u8],
+    out: &str,
+    err: &str,
+) -> bool {
+    if PUBLISHES {
+        assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+        let published = std::fs::read(destination).expect("the file is where it was asked for");
+        assert_eq!(published, body, "the published bytes are the served bytes");
+        return true;
+    }
+    assert_eq!(
+        code,
+        Some(1),
+        "a refused publication must stop the job, not fail the program some other \
+         way.\nstdout: {out}\nstderr: {err}"
+    );
+    // The state the engine declares for it, printed by the program itself. "Not
+    // zero" alone is satisfied by a run that never reached the transport.
+    assert!(
+        out.contains("stopped in NeedsAction"),
+        "the run did not stop the way a refused publication stops.\nstdout: \
+         {out}\nstderr: {err}"
+    );
+    assert!(
+        !destination.exists(),
+        "a refused publication created the destination"
+    );
+    // Contents rather than length: a part is created at its full size before a
+    // byte arrives, so only the bytes prove the transfer finished and that what
+    // stopped it was publication.
+    assert!(
+        kept_beside_matches(destination, body),
+        "no part beside the destination holds the bytes that were downloaded"
+    );
+    false
+}
+
+/// A job's line from a `list` answer -- `<job> <state> <durable>/<total>
+/// <reason>` -- read as its state and reason once the job is at rest.
+///
+/// `None` while the job is still moving. Any resting state is an answer, so a
+/// caller polling this fails on a wrong state at once instead of waiting out
+/// its deadline, and never has to accept "whatever turned up".
+pub fn resting(line: &str) -> Option<(&str, Option<&str>)> {
+    let mut fields = line.split_whitespace();
+    let (_job, state, _progress) = (fields.next()?, fields.next()?, fields.next());
+    matches!(state, "Completed" | "NeedsAction" | "Failed" | "Cancelled")
+        .then(|| (state, fields.next()))
+}
+
 /// Assert a session that did not publish settled in one of the states the
 /// engine declares for it, rather than merely failing somehow.
 ///
