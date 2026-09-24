@@ -12,6 +12,18 @@
 //! and before the destination exists, and it receives the handle that was
 //! proved. A linker that takes the source name away and then delegates to the
 //! real mechanism reproduces the attack exactly, with no timing in the answer.
+// Every test here measures the Windows publication mechanism, so the whole file
+// is Windows-only. It says so once, at the crate root, rather than on each item.
+//
+// This is the fix for a CI failure that Windows could not see. The helpers and
+// the `SubstituteThenLink` double were not gated while all nine tests were, so
+// on Linux and macOS the file compiled to a struct nobody constructs and
+// functions nobody calls -- `dead_code` under `-D warnings` -- and worse, the
+// double's `same_object` called `fhd_platform::same_object`, which that crate
+// exports only on Windows. A hard name error, invisible here, red on both other
+// runners at `Check Rust warnings`.
+#![cfg(windows)]
+
 mod harness;
 
 use fhd_app::storage::{
