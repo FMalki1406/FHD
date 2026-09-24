@@ -110,7 +110,7 @@ jobs:
       # Unix does have. macOS uses a different ACL system and is not covered.
       - name: Platform - a default ACL on the parent does not leave us open
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked default_acl_on_the_parent
+        run: cargo +1.98.1 test -p fhd-platform --locked default_acl_on_the_parent_grants_nobody
       # It runs everywhere now. While it was Windows-only, a test compiled
       # under cfg(unix) could be added and run nowhere with nothing saying
       # so -- which is what happened to the Unix half of foreign_writers:

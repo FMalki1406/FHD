@@ -1803,35 +1803,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A default ACL on the parent does not leave our directory open, and we can
-    /// tell when it has.
+    /// A default ACL on the parent leaves nobody else with an effective right to
+    /// our directory -- checked by trying it, not by reading it.
     ///
     /// The reasoning that Unix has no inherited permissions is too absolute. A
     /// POSIX default ACL is inheritance: `mkdir` under a parent that carries one
     /// ignores the umask and seeds the new directory from those entries, so a
-    /// named user can arrive with write access that no mode argument mentions.
-    /// `foreign_writers` reads `st_mode`, and a named entry is not in the mode
-    /// bits -- only the mask is, which is what makes this worth measuring rather
-    /// than arguing.
+    /// named user can arrive with an entry no mode argument mentions.
+    /// `foreign_writers` reads `st_mode`, where a named entry does not appear.
     ///
-    /// Linux only: `setfacl` is the portable-enough way to set one, and macOS
-    /// uses a different ACL system entirely. Where it is absent the case is a
-    /// failure naming what is missing, not a quiet pass -- a control with no
-    /// coverage and nothing saying so is how the last several defects survived.
+    /// **An entry is not a permission.** A named entry is intersected with the
+    /// mask, and `0o700` leaves the mask empty, so an inherited `rwx` can be
+    /// present and grant nothing. Reporting the presence of `w` as a bypass
+    /// would be reporting the wrong thing. So this asks three separate
+    /// questions: what the entry says, what the mask leaves of it, and -- the
+    /// one that settles it -- whether an untrusted identity can actually write.
+    ///
+    /// Linux only. macOS has a different ACL system and **is not covered by
+    /// this verdict**; nothing here says anything about it.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_default_acl_on_the_parent_does_not_leave_us_open() {
+    fn a_default_acl_on_the_parent_grants_nobody_an_effective_right() {
         use std::process::Command;
         let root = scratch("defacl");
         std::fs::create_dir_all(&root).unwrap();
+        // The parent must be reachable, or the access attempt below fails for
+        // the wrong reason -- a denial at the parent, not at our directory.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let granted = Command::new("setfacl")
-            .args(["-d", "-m", "u:daemon:rwx"])
+            .args(["-d", "-m", "u:nobody:rwx"])
             .arg(&root)
-            .output();
-        let granted = granted.expect(
-            "this case needs setfacl; without it default-ACL inheritance is              uncovered rather than covered",
-        );
+            .output()
+            .expect(
+                "this case needs setfacl; without it default-ACL inheritance is                  uncovered rather than covered",
+            );
         assert!(
             granted.status.success(),
             "setfacl refused: {}",
@@ -1840,15 +1849,17 @@ mod tests {
 
         let made = root.join("made");
         assert!(create_protected_directory(&made).unwrap());
+        let acl = String::from_utf8_lossy(
+            &Command::new("getfacl")
+                .arg("-p")
+                .arg(&made)
+                .output()
+                .expect("getfacl runs")
+                .stdout,
+        )
+        .to_string();
 
-        let listed = Command::new("getfacl")
-            .arg("-p")
-            .arg(&made)
-            .output()
-            .expect("getfacl runs");
-        let acl = String::from_utf8_lossy(&listed.stdout).to_string();
-
-        // The mode still reads owner-only.
+        // 1. The mode bits, which is all `foreign_writers` can see.
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&made).unwrap().permissions().mode() & 0o077,
@@ -1857,25 +1868,52 @@ mod tests {
 {acl}"
         );
 
-        // And the inherited entry, if it is there at all, is masked to nothing.
-        // `getfacl` prints the effective permission after the mask as
-        // `#effective:`, so a named entry that still has write is visible.
+        // 2. What the mask leaves of any inherited entry. `getfacl` prints
+        //    `#effective:` when the mask reduces one, and the effective set is
+        //    what the kernel uses. An entry showing `rwx` with an effective of
+        //    `---` grants nothing, and is not a finding.
         for line in acl.lines() {
-            if !line.starts_with("user:") || line.starts_with("user::") {
+            let line = line.trim();
+            if !line.starts_with("user:nobody:") {
                 continue;
             }
-            let effective = line.rsplit("#effective:").next().unwrap_or("");
-            let granted = if line.contains("#effective:") {
-                effective
-            } else {
-                line.rsplit(':').next().unwrap_or("")
+            let effective = match line.split_once("#effective:") {
+                Some((_, after)) => after.trim(),
+                None => line.rsplit(':').next().unwrap_or("").trim(),
             };
             assert!(
-                !granted.contains('w'),
-                "a named user inherited write access to a directory we made:
+                !effective.contains('w'),
+                "an inherited entry keeps an effective write after the mask:
 {acl}"
             );
         }
+
+        // 3. The question the first two only approximate: can that identity
+        //    write? Asked of the kernel, as that identity, through a helper that
+        //    knows nothing about any of this.
+        let attempt = Command::new("sudo")
+            .args(["-n", "-u", "nobody", "test", "-w"])
+            .arg(&made)
+            .status()
+            .expect(
+                "this case needs sudo to attempt access as another identity;                  without it the effective-permission claim is unverified",
+            );
+        assert!(
+            !attempt.success(),
+            "another identity can write a directory we made under a default ACL:
+{acl}"
+        );
+        // And the control: the same identity can reach the parent, so the
+        // refusal above is about our directory rather than about the path.
+        let reachable = Command::new("sudo")
+            .args(["-n", "-u", "nobody", "test", "-x"])
+            .arg(&root)
+            .status()
+            .expect("sudo runs");
+        assert!(
+            reachable.success(),
+            "the parent is unreachable, so the refusal proves nothing"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
