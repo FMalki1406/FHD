@@ -412,6 +412,24 @@ impl FilePart {
                 && self.coverage[0].start() == 0
                 && self.coverage[0].end() == self.spec.size())
     }
+    /// Lifts the seal a failed publication wrote.
+    ///
+    /// The seal is written and synced before the link so a reopened part can
+    /// never modify something already published. When no link was made, nothing
+    /// is published and the seal describes a file that does not exist.
+    ///
+    /// It used to be cleared in memory only, so the disk still said sealed,
+    /// `open_inner` read that on the next run, and `write_at` returned
+    /// `InvalidState` for ever -- a part that was genuinely corrupt could never
+    /// be re-downloaded.
+    fn unseal(&mut self) -> Result<(), StorageError> {
+        self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
+        self.metadata.write_all(&[0]).map_err(io)?;
+        self.metadata.sync_all().map_err(io)?;
+        self.sealed = false;
+        Ok(())
+    }
+
     fn hash(&mut self, start: u64, length: u64) -> Result<[u8; 32], StorageError> {
         self.file.seek(SeekFrom::Start(start)).map_err(io)?;
         let mut left = length;
@@ -595,6 +613,13 @@ impl SegmentFile for FilePart {
             || self.hash(0, self.spec.size())? != expected
         {
             self.verified = None;
+            // Corrupt data: it has to be replaceable, because a re-download is
+            // the only way out. The seal is lifted before the seal is even
+            // written here, so nothing to undo -- kept explicit so a later
+            // reordering does not silently strand the job.
+            if self.sealed {
+                self.unseal()?;
+            }
             return Err(StorageError::Integrity);
         }
         // Freeze the generation durably BEFORE a second pathname can expose its
@@ -627,6 +652,11 @@ impl SegmentFile for FilePart {
         };
         if let Err(error) = linked {
             self.poisoned = false;
+            // Nothing was published, so the seal describes nothing. Lifting it
+            // is what keeps a taken name, a full disk or a platform with no
+            // mechanism a job the operator can retry rather than one that can
+            // never move again.
+            self.unseal()?;
             // The bytes are sound; only the name was refused -- taken, a full
             // disk, or no mechanism here. Nothing needs downloading again.
             //

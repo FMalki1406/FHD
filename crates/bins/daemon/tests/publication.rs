@@ -318,3 +318,70 @@ fn a_destination_folder_moved_at_the_boundary_does_not_publish_elsewhere() {
         ),
     }
 }
+
+/// **ن٤ integrated.** A failed publication leaves a job that can come back,
+/// on the same build that publishes from the handle.
+///
+/// The recovery fix and the handle link were developed on separate branches,
+/// and a comment recording the dependency is not evidence that they work
+/// together. This composes them: no mechanism, so publication refuses, and the
+/// part must still be writable after being reopened from disk -- which is where
+/// the seal lives.
+#[test]
+fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
+    struct NoMechanism;
+    impl HandleLinker for NoMechanism {
+        fn link(&self, _: &fs::File, _: &Path) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+    }
+
+    let directory = Directory::new("publish-recover");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let destination = directory.0.join("published.bin");
+    let bystander = directory.0.join("theirs.bin");
+    fs::write(&bystander, b"not ours").unwrap();
+
+    let store = FileStorage::default().with_linker(Arc::new(NoMechanism));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+
+    assert_eq!(
+        part.publish(&destination),
+        Err(StorageError::Unsupported),
+        "publication found another way to name the file"
+    );
+    assert!(
+        !destination.exists(),
+        "a refused publication named the file"
+    );
+    assert_eq!(
+        fs::read(&bystander).unwrap(),
+        b"not ours",
+        "a refused publication touched a file that was not ours"
+    );
+    drop(part);
+
+    // Read the seal byte straight off the disk, so a failure here says whether
+    // the seal was lifted or whether reopening is refusing for another reason.
+    let meta = fs::read(parts.join("1-1.meta")).unwrap();
+    assert_eq!(
+        meta.get(33),
+        Some(&0u8),
+        "the seal is still set on disk after a refused publication"
+    );
+
+    // Reopened from disk, which is where the seal lives. Nothing in memory
+    // carries over, so this is the assertion the unsealed version fails.
+    let mut reopened = FileStorage::default()
+        .with_linker(Arc::new(NoMechanism))
+        .open(&parts, spec(6))
+        .unwrap();
+    reopened
+        .write_at(0, b"BBBBBB")
+        .expect("a part whose publication was refused can be written again");
+}
