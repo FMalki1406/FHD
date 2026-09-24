@@ -351,10 +351,24 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
     let delivered = server.delivered.clone();
     let quarter = body.len() as u64 / 4;
     let pause = async {
+        // Bounded. An unbounded wait here is how a test stops being a test:
+        // both Unix runners sat in this suite until the job timed out, with
+        // nothing to say for it, while Windows passed. Whatever the cause, a
+        // wait that cannot end is the wrong instrument -- this one gives up
+        // and says what it saw.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while delivered.load(Ordering::Relaxed) < quarter {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in",
+                delivered.load(Ordering::Relaxed)
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        control.send(Control::Pause).await.unwrap();
+        // The run may already have settled, in which case the receiver is gone
+        // and there is nothing to pause. That is a legitimate outcome and the
+        // assertions below judge it; failing to send is not itself a failure.
+        let _ = control.send(Control::Pause).await;
     };
     let (outcome, ()) = tokio::join!(run, pause);
 
@@ -386,7 +400,9 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
         .unwrap();
     let before = server.delivered.load(Ordering::Relaxed);
     let (_control, receiver) = mpsc::channel(1);
-    let outcome = resumed.run(receiver).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(120), resumed.run(receiver))
+        .await
+        .expect("the resumed run did not come back");
     let reason = resumed.reason().await.unwrap();
 
     // The resume fetched what was missing and no more than the file. With
@@ -728,10 +744,24 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     let delivered = server.delivered.clone();
     let quarter = body.len() as u64 / 4;
     let pause = async {
+        // Bounded. An unbounded wait here is how a test stops being a test:
+        // both Unix runners sat in this suite until the job timed out, with
+        // nothing to say for it, while Windows passed. Whatever the cause, a
+        // wait that cannot end is the wrong instrument -- this one gives up
+        // and says what it saw.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while delivered.load(Ordering::Relaxed) < quarter {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in",
+                delivered.load(Ordering::Relaxed)
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        control.send(Control::Pause).await.unwrap();
+        // The run may already have settled, in which case the receiver is gone
+        // and there is nothing to pause. That is a legitimate outcome and the
+        // assertions below judge it; failing to send is not itself a failure.
+        let _ = control.send(Control::Pause).await;
     };
     let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
     // Paused, or stopped at a publication this platform refuses, and nothing
@@ -760,7 +790,15 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     settings.intent = Intent::Resume;
     let engine = Engine::reopen(settings).await.unwrap();
     let (_keep, commands) = mpsc::channel(4);
-    let outcomes = engine.run_all(commands).await.unwrap();
+    // Bounded, because this is a path Unix only started taking when the early
+    // return went: where publication is refused the job settles needing action
+    // rather than completing, and a scheduler that waited for something else
+    // would hang here with nothing to show for it. A timeout says which call
+    // did not come back.
+    let outcomes = tokio::time::timeout(Duration::from_secs(120), engine.run_all(commands))
+        .await
+        .expect("continuing did not come back")
+        .unwrap();
     assert_eq!(outcomes.len(), 1);
     // The job was found and carried to its end, and what "its end" is depends
     // on the platform. That it was found at all is the claim.
