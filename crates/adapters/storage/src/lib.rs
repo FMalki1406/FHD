@@ -928,6 +928,93 @@ mod tests {
         }
     }
 
+    /// **ن١ / ن٣-ب.** The bytes published are the ones the handle proved, even
+    /// when the source name is taken over while publication runs.
+    ///
+    /// This is the attack a joint review demonstrated, not a hypothetical.
+    /// Publication resolves a name; verification holds a handle. Between the
+    /// two, replacing what the name refers to substitutes the file -- and the
+    /// window is the length of the hash, so it is wide, not a hairline race.
+    ///
+    /// Written before the mechanism that is meant to close it, so that the
+    /// mechanism is measured rather than believed. **It is expected to fail on
+    /// the current implementation**, and that failure is the evidence the
+    /// contract is unmet.
+    ///
+    /// The racer asserts that it actually won before anything is concluded: a
+    /// run where the replacement did not land proves nothing, and must say so
+    /// rather than pass.
+    #[test]
+    #[ignore = "ن١: fails until publication links from the verified handle"]
+    fn published_bytes_are_the_verified_ones_though_the_name_is_taken_over() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Large enough that hashing takes long enough to be interfered with.
+        // The window is O(size) by construction, so this is not a tight race.
+        const SIZE: u64 = 48 * 1024 * 1024;
+        let directory = Directory::new();
+        let ours = vec![b'A'; SIZE as usize];
+        let theirs = vec![b'Z'; SIZE as usize];
+
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(SIZE))
+            .unwrap();
+        part.write_at(0, &ours).unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        // Whatever intermediate name publication uses, the attack is the same:
+        // replace what the name refers to while the bytes are being read.
+        let folder = directory.part();
+        let replaced = Arc::new(AtomicBool::new(false));
+        let flag = replaced.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                let Ok(entries) = fs::read_dir(&folder) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let staged = path
+                        .extension()
+                        .is_some_and(|kind| kind == "staged" || kind == "part");
+                    if !staged || path.extension().is_some_and(|kind| kind == "part") {
+                        continue;
+                    }
+                    // Let the read get under way, then take the name.
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let aside = path.with_extension("aside");
+                    if fs::rename(&path, &aside).is_ok() && fs::write(&path, &theirs).is_ok() {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let outcome = part.publish(&directory.output());
+        let _ = racer.join();
+        assert!(
+            replaced.load(Ordering::SeqCst),
+            "the racer never took the name, so this run tested nothing"
+        );
+
+        // Either publication refuses, or what it published is ours. Delivering
+        // the other bytes with Ok is the failure this exists to catch.
+        if outcome.is_ok() {
+            let delivered = fs::read(directory.output()).unwrap();
+            assert_eq!(
+                delivered.first(),
+                Some(&b'A'),
+                "publication delivered bytes the handle never proved"
+            );
+        }
+    }
+
     /// Bytes changed after they were recorded do not publish.
     ///
     /// Verification used to hash the file and compare it with that same hash, so
