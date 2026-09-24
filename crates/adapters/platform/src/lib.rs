@@ -1710,6 +1710,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// What Unix reports about a directory somebody else may write.
+    ///
+    /// This answered "nobody" until a review pointed out it was reasoning about
+    /// a directory we create while the caller was asking about one it found --
+    /// so a parts directory another account had already made, world-writable,
+    /// was adopted on Unix where the same case was refused on Windows.
+    ///
+    /// Built with real modes, and each case differs from the clean one by
+    /// exactly the bit under test.
+    #[cfg(unix)]
+    #[test]
+    fn a_stranger_may_write_a_unix_directory_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "fhd-unix-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // One we made ourselves, the way the engine makes it.
+        let ours = base.join("ours");
+        assert!(create_protected_directory(&ours).unwrap());
+        assert!(
+            foreign_writers(&ours).unwrap().is_empty(),
+            "a directory this account just created with mode 0700 was called exposed"
+        );
+
+        // Group write.
+        let grouped = base.join("grouped");
+        create_protected_directory(&grouped).unwrap();
+        std::fs::set_permissions(&grouped, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(
+            !foreign_writers(&grouped).unwrap().is_empty(),
+            "a group-writable directory was called clean"
+        );
+
+        // World write. The sticky bit narrows deletion, not writing, so it is
+        // set here too and must not make this pass.
+        let open = base.join("open");
+        create_protected_directory(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(
+            !foreign_writers(&open).unwrap().is_empty(),
+            "a world-writable directory was called clean, sticky bit or not"
+        );
+
+        // And a path that is not there is an error, not a clean answer.
+        assert!(foreign_writers(&base.join("absent")).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// What an owner means, decided rather than assumed.
     ///
     /// Creating a directory owned by another account needs a privilege a test

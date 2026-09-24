@@ -847,3 +847,122 @@ fn two_jobs_may_share_a_destination_and_the_file_survives_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// A second engine process on the same state directory is refused.
+///
+/// Giving each engine its own parts directory settles two engines with two
+/// state directories sharing a download folder. It says nothing about two
+/// processes pointed at **one** state directory, which is the case where they
+/// would share a job record and a part file -- and where getting it wrong
+/// corrupts rather than merely loses.
+///
+/// `FileStorage::own` takes an operating-system lock on `owner.lock` for that,
+/// and until now it was exercised only from one process, where a lock can be
+/// re-entered without proving anything about a second one. This runs two real
+/// processes.
+#[test]
+fn a_second_engine_process_on_one_state_directory_is_refused() {
+    let state = Directory::new("one-state-two-processes");
+    let root = state.0.join("downloads");
+    std::fs::create_dir_all(&root).unwrap();
+    let body = content(48 * 1024);
+    let (port, _) = serve(body.clone(), 0);
+
+    let resident = Resident(
+        Command::new(engine())
+            .args([
+                &state.engine().to_string_lossy() as &str,
+                "--serve",
+                "--download-root",
+                &root.to_string_lossy(),
+                "--allow-http",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the resident starts"),
+    );
+
+    // Wait until the first one truly holds the directory: its control surface
+    // answering is the signal that it got past claiming ownership. A fixed sleep
+    // would either be flaky or test nothing.
+    let destination = root.join("held.bin");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (code, _, _) = run(
+            &[
+                &state.engine().to_string_lossy(),
+                "--client",
+                "add",
+                &destination.to_string_lossy(),
+                "--allow-http",
+            ],
+            &format!("http://127.0.0.1:{port}/file\n"),
+        );
+        if code == Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first engine never took the state directory"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Now a second engine process, same state directory, its own destination.
+    let (code, out, err) = run(
+        &[
+            &state.engine().to_string_lossy(),
+            &root.join("second.bin").to_string_lossy(),
+            "--allow-http",
+        ],
+        &format!("http://127.0.0.1:{port}/file\n"),
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "a second process took a state directory another process holds.\n\
+         stdout: {out}\nstderr: {err}"
+    );
+    // Two locks stand between the second process and the data, and either one
+    // refusing is a correct answer. Measured, the database claims the directory
+    // first -- `SqliteRepository::open` runs before `FileStorage::own` -- so what
+    // appears here is PERSISTENCE-LOCKED rather than STATE-BUSY. Both are
+    // accepted: which of them wins is an ordering detail inside the engine, and
+    // pinning it would fail this test on a reordering a user cannot see.
+    assert!(
+        ["STATE-BUSY", "PERSISTENCE-LOCKED"]
+            .iter()
+            .any(|code| err.contains(code) || out.contains(code)),
+        "refused, but not for holding the directory.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        !root.join("second.bin").exists(),
+        "the refused process published anyway"
+    );
+
+    // And it is the holding, not the path: once the first one is gone the same
+    // command works, so this cannot pass against an engine that refuses always.
+    drop(resident);
+    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (code, _, _) = run(
+            &[
+                &state.engine().to_string_lossy(),
+                &root.join("after.bin").to_string_lossy(),
+                "--allow-http",
+            ],
+            &format!("http://127.0.0.1:{port}/file\n"),
+        );
+        if code == Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the state directory never became usable after its holder exited"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
