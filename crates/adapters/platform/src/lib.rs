@@ -229,6 +229,26 @@ mod imp {
         })
     }
 
+    /// Replaces an inherited access list with one of our own.
+    ///
+    /// Nothing to do on Unix, and deliberately: there is no inherited list
+    /// there, only a umask, and a directory that came out of the umask
+    /// group-writable has already been that way for as long as it has existed.
+    /// Setting the mode afterwards closes nothing -- it leaves the window it was
+    /// meant to remove, which is the create-then-repair pattern the Windows half
+    /// of this module was rewritten to get rid of.
+    ///
+    /// The secure primitive is `create_protected_directory`, which passes the
+    /// mode to `mkdir(2)` so the directory never exists unprotected. Callers
+    /// wanting a private directory on Unix use that one.
+    ///
+    /// And a directory we merely found is not narrowed here. Changing an
+    /// operator's permissions unasked is a worse surprise than declining to use
+    /// the directory, which is what `own_directory` does instead.
+    pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Not implemented, and this returns "nothing found" rather than "not
     /// examined" -- so `STATE-PATH-SWAPPABLE` can never fire on Unix.
     ///
