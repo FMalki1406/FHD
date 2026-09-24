@@ -428,6 +428,26 @@ impl FilePart {
                 && self.coverage[0].start() == 0
                 && self.coverage[0].end() == self.spec.size())
     }
+    /// Lifts the seal a failed publication wrote.
+    ///
+    /// The seal is written and synced before any link, so that a reopened part
+    /// can never modify something already published. When no link survives,
+    /// nothing was published and the seal is a statement about a file that does
+    /// not exist.
+    ///
+    /// It used to be cleared in memory only. The disk still said sealed, no path
+    /// anywhere wrote it back, and `open_inner` reads it on the next run -- so
+    /// `write_at` returned `InvalidState` for ever and a part that was genuinely
+    /// corrupt could never be re-downloaded. A failure has to leave the job
+    /// somewhere it can come back from.
+    fn unseal(&mut self) -> Result<(), StorageError> {
+        self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
+        self.metadata.write_all(&[0]).map_err(io)?;
+        self.metadata.sync_all().map_err(io)?;
+        self.sealed = false;
+        Ok(())
+    }
+
     fn hash(&mut self, start: u64, length: u64) -> Result<[u8; 32], StorageError> {
         self.file.seek(SeekFrom::Start(start)).map_err(io)?;
         let mut left = length;
@@ -634,19 +654,25 @@ impl SegmentFile for FilePart {
             self.spec.generation().get()
         ));
         let _ = fs::remove_file(&staged);
-        fs::hard_link(&self.path, &staged).map_err(|error| {
+        if let Err(error) = fs::hard_link(&self.path, &staged) {
             self.poisoned = false;
-            self.sealed = false;
-            io(error)
-        })?;
+            // Nothing linked, so nothing is published and the seal describes
+            // nothing. Lifting it is what keeps this a job the operator can
+            // retry rather than one that can never move again.
+            self.unseal()?;
+            return Err(io(error));
+        }
         let proved = File::open(&staged)
             .map_err(io)
             .and_then(|mut file| hash_whole(&mut file, self.spec.size()));
         if proved.as_ref() != Ok(&expected) {
             let _ = fs::remove_file(&staged);
             self.poisoned = false;
-            self.sealed = false;
             self.verified = None;
+            // These bytes are not the ones that were verified, so they have to
+            // be replaceable: this is the corrupt-data case and a re-download is
+            // the only way out of it.
+            self.unseal()?;
             return Err(StorageError::Integrity);
         }
 
@@ -655,6 +681,10 @@ impl SegmentFile for FilePart {
             Err(error) => {
                 let _ = fs::remove_file(&staged);
                 self.poisoned = false;
+                // The bytes are sound; only the name was refused -- taken, or a
+                // full disk, or an I/O error. Nothing needs downloading again,
+                // so the part stays usable and publication can be retried.
+                self.unseal()?;
                 return Err(match error.kind() {
                     std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
                     std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
@@ -926,6 +956,73 @@ mod tests {
             );
             assert_ne!(mode & 0o600, 0, "{name} grants its owner nothing");
         }
+    }
+
+    /// A publication that fails leaves a job it is possible to come back from,
+    /// and the two ways it can fail are not the same job afterwards.
+    ///
+    /// The seal is written to disk before the link so a reopened part can never
+    /// modify something already published. It was never lifted: a failed
+    /// publication left the disk saying sealed with no path anywhere that
+    /// cleared it, so the next run read the seal and `write_at` returned
+    /// `InvalidState` for ever. A part that was genuinely corrupt could never be
+    /// re-downloaded -- the failure mode with no way out.
+    #[test]
+    fn a_failed_publication_leaves_the_job_recoverable() {
+        // Corrupt data: verification passed, then the bytes changed. The part
+        // has to be writable again, because a re-download is the only way out.
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        let name = directory.part().join("1-1.part");
+        fs::rename(&name, directory.part().join("aside.bin")).unwrap();
+        fs::write(&name, b"EVIL!!").unwrap();
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::Integrity)
+        );
+        drop(part);
+
+        // Reopened from disk, which is where the seal lives. Nothing in memory
+        // carries over, so this is the assertion the old code failed.
+        let mut reopened = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        reopened
+            .write_at(0, b"abcdef")
+            .expect("a part whose publication failed can be written again");
+
+        // Sound data, publication refused: the destination is taken. Nothing is
+        // re-downloaded -- the same bytes publish to a free name afterwards.
+        let second = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&second.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        fs::write(second.output(), b"theirs").unwrap();
+        assert_eq!(
+            part.publish(&second.output()),
+            Err(StorageError::Conflict),
+            "an occupied destination is a conflict"
+        );
+        assert_eq!(
+            fs::read(second.output()).unwrap(),
+            b"theirs",
+            "a refused publication overwrote the file that was there"
+        );
+        let elsewhere = second.output().with_file_name("free.bin");
+        part.verify(None, &record).unwrap();
+        part.publish(&elsewhere)
+            .expect("sound bytes publish again once a name is free");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"abcdef");
     }
 
     /// Bytes changed after they were recorded do not publish.
