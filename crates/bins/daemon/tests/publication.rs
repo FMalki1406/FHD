@@ -445,6 +445,14 @@ fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
     let record = attested(part.as_mut());
     part.verify(None, &record).unwrap();
 
+    // The seal before the operation. Without this the assertion after it is
+    // vacuous: a byte that was zero all along proves nothing was lifted.
+    assert_eq!(
+        fs::read(parts.join("1-1.meta")).unwrap().get(33),
+        Some(&0u8),
+        "the part was already sealed before publication was attempted"
+    );
+
     assert_eq!(
         {
             part.adopt_destination(&destination).unwrap();
