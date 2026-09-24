@@ -281,6 +281,13 @@ pub struct Slow {
     pub port: u16,
     pub requests: Arc<AtomicU64>,
     pub delivered: Arc<AtomicU64>,
+    /// Responses this server could not finish writing.
+    ///
+    /// CI read as "the resume fetched 147461 of 2097152 bytes" and as a job
+    /// stopped for a `Network` reason, with nothing to say whether the client
+    /// gave up or the server did. A test server that fails silently turns its
+    /// own faults into the engine's.
+    pub broken: Arc<AtomicU64>,
 }
 
 pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> Slow {
@@ -288,11 +295,13 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(AtomicU64::new(0));
     let delivered = Arc::new(AtomicU64::new(0));
+    let broken = Arc::new(AtomicU64::new(0));
     let body = Arc::new(body);
-    let (counter, bytes) = (requests.clone(), delivered.clone());
+    let (counter, bytes, faults) = (requests.clone(), delivered.clone(), broken.clone());
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
-            let (body, counter, bytes) = (body.clone(), counter.clone(), bytes.clone());
+            let (body, counter, bytes, faults) =
+                (body.clone(), counter.clone(), bytes.clone(), faults.clone());
             std::thread::spawn(move || {
                 let request = read_request(&mut stream);
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -309,19 +318,28 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
                 let (start, end) = range.unwrap_or((0, body.len() as u64 - 1));
                 let slice = &body[start as usize..=end as usize];
                 let head = format!(
+                    // `Connection: close`, because this server answers one
+                    // request per connection and its thread then ends. Without
+                    // it the response is HTTP/1.1 with a content length, which
+                    // invites the client to keep the connection and send its
+                    // next request on a socket that is about to close -- a
+                    // truncated transfer the engine can only report as a
+                    // network fault, which is what CI reported. Delivering
+                    // slowly holds the connection open far longer than `serve`
+                    // does, which is why the window opened here and not there.
                     "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\n\
-                 Content-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                 Connection: close\r\nContent-Range: bytes {start}-{end}/{}\r\n\
+                 Content-Length: {}\r\n\r\n",
                     body.len(),
                     slice.len()
                 );
                 if stream.write_all(head.as_bytes()).is_err() {
+                    faults.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 for piece in slice.chunks(chunk.max(1)) {
-                    if stream.write_all(piece).is_err() {
-                        return;
-                    }
-                    if stream.flush().is_err() {
+                    if stream.write_all(piece).is_err() || stream.flush().is_err() {
+                        faults.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     bytes.fetch_add(piece.len() as u64, Ordering::Relaxed);
@@ -334,6 +352,7 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
         port,
         requests,
         delivered,
+        broken,
     }
 }
 

@@ -349,6 +349,7 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
     let (control, receiver) = mpsc::channel(1);
     let run = engine.run(receiver);
     let delivered = server.delivered.clone();
+    let faults = server.broken.clone();
     let quarter = body.len() as u64 / 4;
     let pause = async {
         // Bounded. An unbounded wait here is how a test stops being a test:
@@ -360,8 +361,9 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
         while delivered.load(Ordering::Relaxed) < quarter {
             assert!(
                 std::time::Instant::now() < deadline,
-                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in",
-                delivered.load(Ordering::Relaxed)
+                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in; the server failed to finish {}                  responses",
+                delivered.load(Ordering::Relaxed),
+                faults.load(Ordering::Relaxed)
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -405,19 +407,28 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
         .expect("the resumed run did not come back");
     let reason = resumed.reason().await.unwrap();
 
-    // The resume fetched what was missing and no more than the file. With
-    // nothing committed that is the whole of it, which is the honest number
-    // here rather than a saving this engine does not make at this granularity.
+    // The run's own verdict first. Asserting on the byte count ahead of it hid
+    // the answer: CI reported "the resume fetched 147461 bytes of 2097152" and
+    // said nothing about why the run ended, when the run had in fact stopped
+    // for a network fault. A count cannot explain a run that ended for another
+    // reason, so the reason is established before the count is read.
+    let landed = published_as_declared(outcome, reason, &destination, &body);
+
+    // Then how much it had to fetch: what was missing, and no more than the
+    // file. With nothing committed that is the whole of it, which is the honest
+    // number here rather than a saving this engine does not make at this
+    // granularity. The upper bound allows for the probe, a one-byte ranged
+    // request the server counts like any other delivery.
     let refetched = server.delivered.load(Ordering::Relaxed) - before;
-    // The upper bound allows for the probe, which is a one-byte ranged request
-    // the server counts like any other delivery.
     assert!(
         refetched >= body.len() as u64 - kept && refetched <= body.len() as u64 + 1024,
-        "the resume fetched {refetched} bytes with {kept} committed, out of {}",
-        body.len()
+        "the resume fetched {refetched} bytes with {kept} committed, out of {}; \
+         the server failed to finish {} responses",
+        body.len(),
+        server.broken.load(Ordering::Relaxed)
     );
 
-    if published_as_declared(outcome, reason, &destination, &body).is_none() {
+    if landed.is_none() {
         return;
     }
     assert_eq!(std::fs::read(&destination).unwrap(), body);
@@ -742,6 +753,7 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
         .unwrap();
     let (control, receiver) = mpsc::channel(1);
     let delivered = server.delivered.clone();
+    let faults = server.broken.clone();
     let quarter = body.len() as u64 / 4;
     let pause = async {
         // Bounded. An unbounded wait here is how a test stops being a test:
@@ -753,8 +765,9 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
         while delivered.load(Ordering::Relaxed) < quarter {
             assert!(
                 std::time::Instant::now() < deadline,
-                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in",
-                delivered.load(Ordering::Relaxed)
+                "only {} of {quarter} bytes arrived in 60s, so the pause never had                  a part-way transfer to land in; the server failed to finish {}                  responses",
+                delivered.load(Ordering::Relaxed),
+                faults.load(Ordering::Relaxed)
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -812,7 +825,17 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
         // Found, continued, and stopped where this platform stops -- at
         // publication, for the storage reason.
         JobOutcome::Settled(JobState::NeedsAction, reason) if !PUBLISHES => {
-            assert_eq!(*reason, Some(StopReason::Storage));
+            // CI saw `Network` here. That is not a publication being refused,
+            // it is a transfer that broke, and accepting it would have turned a
+            // test-server fault into a passing test. The server's own failure
+            // count is printed beside it so the next reading does not have to
+            // guess which end gave up.
+            assert_eq!(
+                *reason,
+                Some(StopReason::Storage),
+                "continuing stopped for the wrong reason; the server failed to                  finish {} responses",
+                server.broken.load(Ordering::Relaxed)
+            );
             assert!(
                 !destination.exists(),
                 "a refused publication created the destination"
