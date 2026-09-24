@@ -103,12 +103,14 @@ jobs:
       - name: Platform - a stranger who may write a unix directory is reported
         if: runner.os != 'Windows'
         run: cargo +1.98.1 test -p fhd-platform --locked stranger_may_write_a_unix
-      # Single-threaded: the case replaces this process's umask around each
-      # creation, and a parallel test creating a file meanwhile would see the
-      # wrong one.
-      - name: Platform - a directory we make is owner-only whatever the umask
+      - name: Platform - a directory we make is owner-only, one we find is untouched
         if: runner.os != 'Windows'
-        run: cargo +1.98.1 test -p fhd-platform --locked owner_only_whatever_the_umask -- --test-threads=1
+        run: cargo +1.98.1 test -p fhd-platform --locked owner_only_and_one_we_find
+      # Linux only: setfacl sets POSIX default ACLs, which is the inheritance
+      # Unix does have. macOS uses a different ACL system and is not covered.
+      - name: Platform - a default ACL on the parent does not leave us open
+        if: runner.os == 'Linux'
+        run: cargo +1.98.1 test -p fhd-platform --locked default_acl_on_the_parent
       # It runs everywhere now. While it was Windows-only, a test compiled
       # under cfg(unix) could be added and run nowhere with nothing saying
       # so -- which is what happened to the Unix half of foreign_writers:
@@ -126,7 +128,8 @@ jobs:
           covered=$(for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
               either_spelling stranger_may_write until_it_is_protected \
-              used_to_fail_open owner_rule_is_decided used_to_miss owner_only_whatever_the_umask; do
+              used_to_fail_open owner_rule_is_decided used_to_miss \
+              owner_only_and_one_we_find default_acl_on_the_parent; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))

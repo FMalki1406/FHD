@@ -1739,63 +1739,46 @@ mod tests {
     }
 
     /// A directory the engine makes on Unix is owner-only from the instant it
-    /// exists, whatever the umask, and one it finds is left alone.
+    /// exists, and one it finds is left alone.
     ///
-    /// `create_dir` then `set_permissions` would pass this test's first half and
+    /// `create_dir` then `set_permissions` would pass the first half of this and
     /// still be wrong: between the two calls the directory carries whatever the
-    /// umask allowed, and a handle taken in that window outlives the repair.
-    /// `mkdir(2)` is given the mode instead, so there is no interval to lose --
-    /// which is why the check is on `create_protected_directory` and why
-    /// `protect_new_directory` does nothing here.
+    /// parent allowed, and a handle taken in that window outlives the repair.
+    /// The mode goes to `mkdir(2)` instead, so there is no interval.
     ///
-    /// Run under 002 and 000 because those are the umasks that make the
-    /// difference visible. A macOS runner refused its own test directory when
-    /// the repair-afterwards version met a umask of 002.
+    /// **On the umask.** A request to run this under 002 and 000 rests on a
+    /// premise worth stating: `mkdir(2)` intersects the mode with the umask, so
+    /// a umask can only take permission bits away. `0o700` therefore cannot come
+    /// out group- or other-writable under any umask at all -- 000 included, and
+    /// 000 is the worst case. Changing this process's mask to show that would
+    /// need `umask(2)`, and this crate forbids `unsafe` off Windows, which is
+    /// the right trade: the property is a consequence of how `mkdir` is
+    /// specified, not of what the mask happens to be.
+    ///
+    /// **Default ACLs are the case that does not follow from the mode**, and it
+    /// has its own test below. A parent carrying one changes `mkdir`'s rules:
+    /// the umask is ignored and the default entries seed the new directory.
     #[cfg(unix)]
     #[test]
-    fn a_directory_we_make_is_owner_only_whatever_the_umask() {
+    fn a_directory_we_make_is_owner_only_and_one_we_find_is_untouched() {
         use std::os::unix::fs::PermissionsExt;
-
-        // SAFETY: `umask` only reads and replaces this process's own file-mode
-        // creation mask. Tests in this crate run on one thread by the harness's
-        // default only when asked, so the mask is restored before returning and
-        // the two cases run in sequence rather than in parallel.
-        fn with_umask<T>(mask: u32, body: impl FnOnce() -> T) -> T {
-            extern "C" {
-                fn umask(mask: u32) -> u32;
-            }
-            let previous = unsafe { umask(mask) };
-            let outcome = body();
-            unsafe { umask(previous) };
-            outcome
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "fhd-umask-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = scratch("umask");
         std::fs::create_dir_all(&root).unwrap();
 
-        for mask in [0o002, 0o000] {
-            let made = root.join(format!("made-{mask:03o}"));
-            let created = with_umask(mask, || create_protected_directory(&made).unwrap());
-            assert!(created, "the directory was not created by this call");
-            let mode = std::fs::metadata(&made).unwrap().permissions().mode();
-            assert_eq!(
-                mode & 0o777,
-                0o700,
-                "umask {mask:03o} left the directory {:03o}",
-                mode & 0o777
-            );
-            assert!(
-                foreign_writers(&made).unwrap().is_empty(),
-                "umask {mask:03o} left somebody else able to write it"
-            );
-        }
+        let made = root.join("made");
+        assert!(
+            create_protected_directory(&made).unwrap(),
+            "not created here"
+        );
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a directory this call made is not owner-only"
+        );
+        assert!(
+            foreign_writers(&made).unwrap().is_empty(),
+            "a directory this call made is writable by somebody else"
+        );
 
         // One that was already there keeps what it had. The engine reports such
         // a directory rather than narrowing it: changing an operator's
@@ -1803,8 +1786,10 @@ mod tests {
         let found = root.join("found");
         std::fs::create_dir(&found).unwrap();
         std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o775)).unwrap();
-        let created = create_protected_directory(&found).unwrap();
-        assert!(!created, "an existing directory was reported as created");
+        assert!(
+            !create_protected_directory(&found).unwrap(),
+            "an existing directory was reported as created"
+        );
         assert_eq!(
             std::fs::metadata(&found).unwrap().permissions().mode() & 0o777,
             0o775,
@@ -1818,7 +1803,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// What Unix reports about a directory somebody else may write.
+    /// A default ACL on the parent does not leave our directory open, and we can
+    /// tell when it has.
+    ///
+    /// The reasoning that Unix has no inherited permissions is too absolute. A
+    /// POSIX default ACL is inheritance: `mkdir` under a parent that carries one
+    /// ignores the umask and seeds the new directory from those entries, so a
+    /// named user can arrive with write access that no mode argument mentions.
+    /// `foreign_writers` reads `st_mode`, and a named entry is not in the mode
+    /// bits -- only the mask is, which is what makes this worth measuring rather
+    /// than arguing.
+    ///
+    /// Linux only: `setfacl` is the portable-enough way to set one, and macOS
+    /// uses a different ACL system entirely. Where it is absent the case is a
+    /// failure naming what is missing, not a quiet pass -- a control with no
+    /// coverage and nothing saying so is how the last several defects survived.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_default_acl_on_the_parent_does_not_leave_us_open() {
+        use std::process::Command;
+        let root = scratch("defacl");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let granted = Command::new("setfacl")
+            .args(["-d", "-m", "u:daemon:rwx"])
+            .arg(&root)
+            .output();
+        let granted = granted.expect(
+            "this case needs setfacl; without it default-ACL inheritance is              uncovered rather than covered",
+        );
+        assert!(
+            granted.status.success(),
+            "setfacl refused: {}",
+            String::from_utf8_lossy(&granted.stderr)
+        );
+
+        let made = root.join("made");
+        assert!(create_protected_directory(&made).unwrap());
+
+        let listed = Command::new("getfacl")
+            .arg("-p")
+            .arg(&made)
+            .output()
+            .expect("getfacl runs");
+        let acl = String::from_utf8_lossy(&listed.stdout).to_string();
+
+        // The mode still reads owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o077,
+            0,
+            "the mode bits let somebody else in:
+{acl}"
+        );
+
+        // And the inherited entry, if it is there at all, is masked to nothing.
+        // `getfacl` prints the effective permission after the mask as
+        // `#effective:`, so a named entry that still has write is visible.
+        for line in acl.lines() {
+            if !line.starts_with("user:") || line.starts_with("user::") {
+                continue;
+            }
+            let effective = line.rsplit("#effective:").next().unwrap_or("");
+            let granted = if line.contains("#effective:") {
+                effective
+            } else {
+                line.rsplit(':').next().unwrap_or("")
+            };
+            assert!(
+                !granted.contains('w'),
+                "a named user inherited write access to a directory we made:
+{acl}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What Unix reports about a directory somebody else may write.    /// What Unix reports about a directory somebody else may write.
     ///
     /// This answered "nobody" until a review pointed out it was reasoning about
     /// a directory we create while the caller was asking about one it found --
@@ -1872,6 +1934,19 @@ mod tests {
         assert!(foreign_writers(&base.join("absent")).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory under the temporary tree, named for this process and moment.
+    #[cfg(unix)]
+    fn scratch(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fhd-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     /// What an owner means, decided rather than assumed.
