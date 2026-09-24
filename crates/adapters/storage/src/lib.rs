@@ -134,6 +134,30 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
     }
     Ok(())
 }
+/// Opens a directory as a handle, so publication names a file inside the
+/// directory *object* the operator approved rather than inside whatever its
+/// path leads to at the moment of the call.
+///
+/// `fhd-platform` has the same three lines for its own test. This crate may not
+/// depend on it in any dependency kind and the architecture gate enforces that,
+/// so the duplication is the cost of the boundary, paid deliberately.
+fn open_directory(path: &Path) -> Result<File, StorageError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// Without it, opening a directory as a `File` fails on Windows.
+        const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(io)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).map_err(io)
+    }
+}
 fn identity(spec: PartSpec, sealed: bool) -> [u8; META_LEN] {
     let mut data = [0; META_LEN];
     data[..9].copy_from_slice(MAGIC);
@@ -597,6 +621,22 @@ impl SegmentFile for FilePart {
             return Err(StorageError::InvalidState);
         }
         let destination = resolve_destination(destination)?;
+        // Fix the destination *folder* as an object before anything else
+        // happens, for the same reason the source is a handle. Measured: with
+        // the folder named rather than held, moving it aside and creating
+        // another directory at its name during publication put the file in the
+        // new directory -- somebody else's -- and the operator's folder stayed
+        // empty. Holding it means the leaf is resolved inside the directory the
+        // operator approved, whatever its name leads to by then.
+        let folder = open_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
+        let leaf = destination
+            .file_name()
+            .ok_or(StorageError::InvalidInput)?
+            .to_os_string();
+        // Advisory only. The authority for never replacing is the linker's
+        // no-replace flag, which acts on the directory object; this is here so
+        // an already-taken name is a clear `Conflict` instead of an error out of
+        // the mechanism, and it is resolved by path, so it can be raced.
         match fs::symlink_metadata(&destination) {
             Ok(_) => return Err(StorageError::Conflict),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -630,7 +670,8 @@ impl SegmentFile for FilePart {
         self.metadata.sync_all().map_err(io)?;
         self.sealed = true;
 
-        // The name is made from the handle whose bytes were proved.
+        // The name is made from the handle whose bytes were proved, inside the
+        // folder handle opened above.
         //
         // Staging existed because linking resolved a path: the part was linked
         // to a private name first, hashed there, and only then named at the
@@ -638,8 +679,8 @@ impl SegmentFile for FilePart {
         // the first published a substituted file, the second exposed the final
         // name before its bytes were proved, the third left a window as long as
         // the hash -- because all three were still arguing about *when* to
-        // resolve a name. Linking from the handle stops the argument: there is
-        // no name to resolve and nothing to stage.
+        // resolve a name. Linking between two handles stops the argument: there
+        // is no path to resolve, on either end, and nothing to stage.
         //
         // A platform with no mechanism refuses here. It does not fall back to
         // linking by path, because that is precisely the behaviour being
@@ -647,7 +688,7 @@ impl SegmentFile for FilePart {
         // new arrangement.
         let linker = self.linker.clone().ok_or(StorageError::Unsupported);
         let linked = match &linker {
-            Ok(linker) => linker.link(&self.file, &destination),
+            Ok(linker) => linker.link(&self.file, &folder, &leaf),
             Err(unsupported) => Err(*unsupported),
         };
         if let Err(error) = linked {
@@ -666,10 +707,22 @@ impl SegmentFile for FilePart {
             return Err(error);
         }
         self.file.sync_all().map_err(io)?;
-        sync_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
+        // Through the handle, not the path: syncing `destination.parent()` would
+        // reopen the name and could flush a directory the file is not in. Only
+        // on Unix, for the same reason `sync_directory` is a no-op elsewhere --
+        // `FlushFileBuffers` wants write access to a directory handle, and this
+        // one is opened for reading.
+        #[cfg(unix)]
+        folder.sync_all().map_err(io)?;
         sync_directory(&self.directory)?;
         self.published = true;
         self.poisoned = false;
+        // The path as the caller spelled it. If the approved folder was renamed
+        // during publication the file is in that folder -- which is the contract
+        // -- but this spelling no longer reaches it. Reporting the folder's
+        // current name would mean resolving the handle back to a path, which
+        // Windows answers for a directory only through another NT class; the
+        // stale spelling is recorded as a known limit rather than papered over.
         Ok(destination)
     }
 }
@@ -915,12 +968,18 @@ mod tests {
     /// can put the two together.
     struct LinkByName {
         source: PathBuf,
+        folder: PathBuf,
     }
     impl HandleLinker for LinkByName {
-        fn link(&self, _: &File, destination: &Path) -> Result<(), StorageError> {
-            fs::hard_link(&self.source, destination).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                other => StorageError::Io(other),
+        fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
+            // Both handles ignored, both ends resolved by path: exactly the
+            // behaviour the real linker replaces, which is why the properties
+            // this double can carry are only the ones that do not depend on it.
+            fs::hard_link(&self.source, self.folder.join(name)).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
             })
         }
     }
@@ -930,6 +989,10 @@ mod tests {
     fn publishing_store(parts: &Path) -> FileStorage {
         FileStorage::default().with_linker(std::sync::Arc::new(LinkByName {
             source: parts.join("1-1.part"),
+            folder: parts
+                .parent()
+                .expect("the parts directory has a parent")
+                .into(),
         }))
     }
 
@@ -943,7 +1006,7 @@ mod tests {
     /// tests, where the composition root lives.
     struct NoMechanism;
     impl HandleLinker for NoMechanism {
-        fn link(&self, _: &File, _: &Path) -> Result<(), StorageError> {
+        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
     }

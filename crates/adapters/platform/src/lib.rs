@@ -1,4 +1,4 @@
-﻿//! Operating-system primitives the rest of the engine cannot express safely.
+//! Operating-system primitives the rest of the engine cannot express safely.
 //!
 //! This is the one crate Â§4 allows `unsafe`, and it exists for a single reason:
 //! Â§3.1's control surface needs a Windows named pipe that carries the user's SID
@@ -1142,20 +1142,38 @@ mod imp {
             && left.FileId.Identifier == right.FileId.Identifier)
     }
 
-    /// The extended-length prefix a caller's path may carry. The object manager
-    /// does not use it, and leaving it on produced STATUS_OBJECT_NAME_INVALID.
-    const VERBATIM: &str = r"\\?\";
-    /// How the object manager spells a drive-letter path.
-    const OBJECT_ROOT: &str = r"\??\";
     /// STATUS_OBJECT_NAME_COLLISION.
     const NAME_COLLISION: u32 = 0xC000_0035;
+    /// Without it, opening a directory as a `File` fails on Windows.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-    /// Creates `destination` as another name for the file this handle holds.
+    /// Opens a directory as a handle, so a later call can name a file inside the
+    /// directory *object* rather than inside whatever the path leads to then.
     ///
-    /// The point is *which* file. `hard_link` takes a source path and resolves
-    /// it at the moment it runs, so between proving some bytes and publishing
-    /// them the name can be made to mean a different file -- measured, and it
-    /// published the other bytes. A handle cannot be redirected that way.
+    /// `fhd-storage` opens its own, because it may not depend on this crate in
+    /// any dependency kind. The duplication is three lines and is deliberate:
+    /// the alternative is a dependency the architecture gate refuses.
+    pub fn open_directory(path: &Path) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    /// Creates `name` inside `directory` as another name for the file this
+    /// handle holds.
+    ///
+    /// **Both ends are handles, and that is the whole point.** `hard_link` takes
+    /// two paths and resolves them at the moment it runs, so between proving
+    /// some bytes and publishing them either end can be made to mean something
+    /// else. Both were measured: the source name was taken over and the other
+    /// file's bytes were published; the destination folder was moved aside and a
+    /// new directory took its name, and the file landed in that one. A handle
+    /// cannot be redirected that way, so `file` fixes *which object* is
+    /// published and `directory` fixes *where*. Only the last component is
+    /// resolved, and it is resolved inside a directory object already held --
+    /// which is why `name` must be one component and is rejected otherwise.
     ///
     /// `SetFileInformationByHandle` has no class for this: `FileLinkInfo` is an
     /// NT-level class, so `NtSetInformationFile` from ntdll is the only route.
@@ -1167,14 +1185,24 @@ mod imp {
     /// Never replaces: `ReplaceIfExists` is false, so an occupied name comes
     /// back as `AlreadyExists`, which is what `hard_link` does today.
     ///
-    /// The path is made absolute and spelled the way the object manager expects.
-    pub fn link_from_handle(file: &File, destination: &Path) -> io::Result<()> {
-        let absolute = std::path::absolute(destination)?;
-        let text = absolute.to_string_lossy();
-        let text = text.strip_prefix(VERBATIM).unwrap_or(&text);
-        let name: Vec<u16> = OsStr::new(&format!("{OBJECT_ROOT}{text}"))
-            .encode_wide()
-            .collect();
+    /// `directory` must be opened with `FILE_FLAG_BACKUP_SEMANTICS`, which is
+    /// how a directory is opened at all on Windows.
+    pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
+        // A relative name under a root directory is exactly one component. Any
+        // separator, and any drive or root spelling, would reopen the path
+        // resolution this call exists to avoid, so it is refused rather than
+        // sanitized.
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => (),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a link name must be a single path component",
+                ));
+            }
+        }
+        let name: Vec<u16> = name.encode_wide().collect();
         let name_bytes = std::mem::size_of_val(name.as_slice());
 
         // The struct ends in a one-character array the name runs past, so the
@@ -1188,7 +1216,7 @@ mod imp {
         // and the name. It outlives the call below.
         unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
-            (*info).RootDirectory = ptr::null_mut();
+            (*info).RootDirectory = directory.as_raw_handle() as HANDLE;
             (*info).FileNameLength = u32::try_from(name_bytes).unwrap_or(0);
             ptr::copy_nonoverlapping(
                 name.as_ptr().cast::<u8>(),
@@ -1464,7 +1492,9 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{acceptable_descriptor, create_pipe, link_from_handle, open_pipe, same_object};
+pub use imp::{
+    acceptable_descriptor, create_pipe, link_into_directory, open_directory, open_pipe, same_object,
+};
 pub use imp::{
     create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
     swappable_components, user_scope,
@@ -2185,6 +2215,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_link_from_a_handle_carries_the_held_file_and_never_replaces() {
+        use std::ffi::OsStr;
         use std::fs;
         let base = std::env::temp_dir().join(format!(
             "fhd-ntlink-{}-{}",
@@ -2214,8 +2245,10 @@ mod tests {
         );
 
         // What a handle-resolving link does with it.
+        let folder = open_directory(&base).unwrap();
         let by_handle = base.join("by-handle.bin");
-        link_from_handle(&held, &by_handle).expect("the handle link succeeds");
+        link_into_directory(&held, &folder, OsStr::new("by-handle.bin"))
+            .expect("the handle link succeeds");
         assert_eq!(
             fs::read(&by_handle).unwrap(),
             b"ours",
@@ -2230,13 +2263,25 @@ mod tests {
         // there is untouched.
         let occupied = base.join("occupied.bin");
         fs::write(&occupied, b"somebody else").unwrap();
-        let refused = link_from_handle(&held, &occupied).unwrap_err();
+        let refused = link_into_directory(&held, &folder, OsStr::new("occupied.bin")).unwrap_err();
         assert_eq!(
             refused.kind(),
             std::io::ErrorKind::AlreadyExists,
             "an occupied name was refused for the wrong reason: {refused}"
         );
         assert_eq!(fs::read(&occupied).unwrap(), b"somebody else");
+
+        // A name that is not one component is refused rather than resolved,
+        // because resolving it is what this call exists to avoid.
+        for escape in ["sub\\deep.bin", "..\\up.bin", r"C:\absolute.bin"] {
+            let refused = link_into_directory(&held, &folder, OsStr::new(escape)).unwrap_err();
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{escape} was not refused as a name"
+            );
+        }
+        drop(folder);
 
         drop(held);
         let _ = fs::remove_dir_all(&base);

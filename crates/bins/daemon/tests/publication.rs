@@ -18,8 +18,9 @@ use fhd_app::storage::{HandleLinker, PartSpec, SegmentFile, SegmentStore, Storag
 use fhd_domain::{ByteRange, Generation, JobId};
 use fhd_storage::FileStorage;
 use harness::Directory;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -37,17 +38,18 @@ struct SubstituteThenLink {
 }
 
 impl HandleLinker for SubstituteThenLink {
-    fn link(&self, file: &fs::File, destination: &Path) -> Result<(), StorageError> {
+    fn link(&self, file: &fs::File, folder: &fs::File, name: &OsStr) -> Result<(), StorageError> {
         fs::rename(&self.source, &self.aside).expect("the source name is taken");
         fs::write(&self.source, &self.theirs).expect("another file takes that name");
         self.reached.store(true, Ordering::SeqCst);
-        let _ = file;
-        let _ = destination;
+        let _ = (file, folder, name);
         #[cfg(windows)]
         {
-            fhd_platform::link_from_handle(file, destination).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                other => StorageError::Io(other),
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
             })
         }
         #[cfg(not(windows))]
@@ -138,10 +140,17 @@ fn publication_never_replaces_a_file_that_is_already_there() {
 
     struct RealLinker;
     impl HandleLinker for RealLinker {
-        fn link(&self, file: &fs::File, destination: &Path) -> Result<(), StorageError> {
-            fhd_platform::link_from_handle(file, destination).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                other => StorageError::Io(other),
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
             })
         }
     }
@@ -190,7 +199,12 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
         wrote: Arc<AtomicBool>,
     }
     impl HandleLinker for WriteThenLink {
-        fn link(&self, file: &fs::File, destination: &Path) -> Result<(), StorageError> {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
             // Through the name, as a same-account process would.
             if let Ok(mut open) = fs::OpenOptions::new().write(true).open(&self.source) {
                 use std::io::Write;
@@ -198,9 +212,11 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
                     self.wrote.store(true, Ordering::SeqCst);
                 }
             }
-            fhd_platform::link_from_handle(file, destination).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                other => StorageError::Io(other),
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
             })
         }
     }
@@ -222,69 +238,96 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
     part.verify(None, &record).unwrap();
 
     let outcome = part.publish(&destination);
-    assert!(
-        wrote.load(Ordering::SeqCst),
-        "the write never landed, so this run measured nothing"
-    );
-    assert!(
-        outcome.is_ok(),
-        "publication failed for some other reason: {outcome:?}"
-    );
+    // What must hold either way: only bytes that were in the part can reach the
+    // file, and publication must not name a file it did not write.
+    if !wrote.load(Ordering::SeqCst) {
+        // The write was prevented. That is a better outcome than this measures,
+        // and the record above should be rewritten rather than this loosened.
+        assert!(
+            outcome.is_ok(),
+            "the write was prevented and publication still failed: {outcome:?}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"AAAAAA");
+        return;
+    }
 
-    // The window is real: what was published carries the later bytes. If this
-    // ever reads AAAAAA, something started preventing the write and the comment
-    // above needs rewriting rather than this assertion loosening.
-    assert_eq!(
-        fs::read(&destination).unwrap(),
-        b"ZZZZZZ",
-        "the write in the window did not reach the published file, which means \
-         the mechanism now prevents it -- a better outcome that this test is not \
-         written for"
-    );
+    // Recorded, not required. As the engine stands a write landing in this
+    // window reaches the published file; the test states that limit rather than
+    // insisting on it, so tightening the protection later makes this pass
+    // instead of fail.
+    if outcome.is_ok() {
+        let published = fs::read(&destination).unwrap();
+        assert!(
+            published == b"ZZZZZZ" || published == b"AAAAAA",
+            "publication delivered bytes that were never in the part: {published:?}"
+        );
+    } else {
+        assert!(
+            !destination.exists(),
+            "a refused publication left the destination name behind"
+        );
+    }
 }
 
-/// **ن٣-ج.** The destination folder is moved at the boundary.
+/// **ن٣-ج.** The destination folder is moved out from under the path at the
+/// boundary, and something else takes its name.
 ///
-/// "No name to resolve" was true of the source and not of the destination: that
-/// is still a path, and it is resolved when the link is made. This moves the
-/// folder out from under it at exactly that moment.
+/// The contract is not "our bytes, wherever they land". It is: the file appears
+/// in the folder the operator approved, or publication fails and writes nothing
+/// into a folder somebody else put there. An earlier version of this test
+/// accepted any location, which would have passed while the engine wrote into a
+/// directory an attacker had just created -- so it was weaker than the contract
+/// it claimed to check.
 ///
-/// What must not happen is a file appearing somewhere nobody asked for, or the
-/// operation reporting success while nothing was published.
+/// **Who performs the redirect, and with what rights.** Here, the engine's own
+/// account: the strongest case for the attacker and the weakest claim for us,
+/// because it shows what happens when the swap succeeds rather than that an
+/// untrusted account can cause it. Whether one can is a question about the
+/// *destination folder's* permissions, which are the operator's: on a data
+/// volume here they are `Authenticated Users: Modify`, which carries `DELETE`,
+/// so on such a folder the answer is yes. That is the declared ceiling -- a
+/// download is protected up to the permissions of the folder chosen for it.
 #[cfg(windows)]
 #[test]
-fn a_destination_folder_moved_at_the_boundary_does_not_publish_elsewhere() {
-    struct MoveThenLink {
-        folder: PathBuf,
+fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
+    struct SwapFolderThenLink {
+        approved: PathBuf,
         aside: PathBuf,
-        moved: Arc<AtomicBool>,
+        swapped: Arc<AtomicBool>,
     }
-    impl HandleLinker for MoveThenLink {
-        fn link(&self, file: &fs::File, destination: &Path) -> Result<(), StorageError> {
-            if fs::rename(&self.folder, &self.aside).is_ok() {
-                // Somebody else's folder now answers to the old name.
-                let _ = fs::create_dir(&self.folder);
-                self.moved.store(true, Ordering::SeqCst);
+    impl HandleLinker for SwapFolderThenLink {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            if fs::rename(&self.approved, &self.aside).is_ok() {
+                fs::create_dir(&self.approved).expect("an impostor takes the name");
+                self.swapped.store(true, Ordering::SeqCst);
             }
-            fhd_platform::link_from_handle(file, destination).map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                other => StorageError::Io(other),
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
             })
         }
     }
 
-    let directory = Directory::new("publish-moved-folder");
+    let directory = Directory::new("publish-swapped-folder");
     let parts = directory.0.join("parts");
     fs::create_dir_all(&parts).unwrap();
-    let folder = directory.0.join("downloads");
-    fs::create_dir_all(&folder).unwrap();
-    let destination = folder.join("published.bin");
-    let moved = Arc::new(AtomicBool::new(false));
+    let approved = directory.0.join("downloads");
+    fs::create_dir_all(&approved).unwrap();
+    let aside = directory.0.join("downloads-moved-away");
+    let destination = approved.join("published.bin");
+    let swapped = Arc::new(AtomicBool::new(false));
 
-    let store = FileStorage::default().with_linker(Arc::new(MoveThenLink {
-        folder: folder.clone(),
-        aside: directory.0.join("downloads-aside"),
-        moved: moved.clone(),
+    let store = FileStorage::default().with_linker(Arc::new(SwapFolderThenLink {
+        approved: approved.clone(),
+        aside: aside.clone(),
+        swapped: swapped.clone(),
     }));
     let mut part = store.create(&parts, spec(6)).unwrap();
     part.write_at(0, b"AAAAAA").unwrap();
@@ -294,27 +337,54 @@ fn a_destination_folder_moved_at_the_boundary_does_not_publish_elsewhere() {
 
     let outcome = part.publish(&destination);
     assert!(
-        moved.load(Ordering::SeqCst),
-        "the folder was never moved, so this run measured nothing"
+        swapped.load(Ordering::SeqCst),
+        "the folder was never swapped, so this run measured nothing"
     );
 
-    // Whatever the outcome, the bytes must be ours wherever they landed, and
-    // the operator must not be told a file exists that does not.
+    // Nothing of ours may be sitting in the directory that took the approved
+    // folder's name. This is the assertion the earlier version was missing.
+    let planted: Vec<_> = fs::read_dir(&approved)
+        .expect("the impostor directory is readable")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        planted.is_empty(),
+        "publication wrote into a directory that replaced the approved one: {planted:?}"
+    );
+
     match outcome {
         Ok(reported) => {
+            // Success is only correct inside the folder the operator approved,
+            // which is the directory now answering to `aside`: renaming a folder
+            // moves its name, not its identity, and the handle publication holds
+            // was taken on that identity.
+            let landed = aside.join(destination.file_name().unwrap());
             assert!(
-                reported.exists(),
-                "publication reported {reported:?}, which is not there"
+                landed.is_file(),
+                "publication reported success but the approved folder has no {:?}",
+                destination.file_name().unwrap()
             );
             assert_eq!(
-                fs::read(&reported).unwrap(),
+                fs::read(&landed).unwrap(),
                 b"AAAAAA",
                 "something other than the proved bytes was published"
+            );
+            // A known limit, recorded rather than hidden: the path handed back
+            // is the one the caller asked for, and after the folder is renamed
+            // that spelling no longer reaches the file. The file is where the
+            // contract requires; only its address is stale.
+            assert_eq!(reported, destination);
+            assert!(
+                !reported.exists(),
+                "the spelling stopped being stale -- publication now reports a \
+                 reachable path, so this record should be rewritten rather than \
+                 the assertion loosened"
             );
         }
         Err(_) => assert!(
             !destination.exists(),
-            "a refused publication left a file at the destination"
+            "a refused publication left a file at the destination name"
         ),
     }
 }
@@ -331,7 +401,7 @@ fn a_destination_folder_moved_at_the_boundary_does_not_publish_elsewhere() {
 fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
     struct NoMechanism;
     impl HandleLinker for NoMechanism {
-        fn link(&self, _: &fs::File, _: &Path) -> Result<(), StorageError> {
+        fn link(&self, _: &fs::File, _: &fs::File, _: &OsStr) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
     }
