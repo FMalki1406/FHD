@@ -22,7 +22,7 @@ use fhd_storage::FileStorage;
 use harness::Directory;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -569,5 +569,151 @@ fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() 
         "the folder that was moved aside received the file, which would mean \
          adoption reached back before it ran -- a better outcome that this \
          record does not describe"
+    );
+}
+
+/// **ن٤, the rest of it.** A refused publication leaves a job that can finish,
+/// with the bytes it already had, without having touched anything else.
+///
+/// The test above proves the seal is lifted. That is the part that makes the
+/// part *writable* again -- it is not the whole of recovery. Three things more
+/// have to hold, and each is asserted here rather than inferred from the first:
+///
+/// - **the progress survives**: the bytes and their extents are still there, so
+///   the retry is a retry and not a fresh download;
+/// - **the retry can succeed**: given a mechanism, the same handle publishes;
+/// - **nothing else was touched**: every other file in both directories is
+///   byte-for-byte what it was, and none has disappeared.
+///
+/// The third is asserted over a directory listing rather than one bystander
+/// file, because "we did not delete the file we were thinking of" is a weaker
+/// claim than "we did not delete anything".
+#[cfg(windows)]
+#[test]
+fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_else() {
+    struct Refuse(Arc<AtomicBool>);
+    impl HandleLinker for Refuse {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            if self.0.load(Ordering::SeqCst) {
+                return Err(StorageError::Unsupported);
+            }
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
+            })
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+        }
+    }
+
+    /// Everything in a directory, by name and contents.
+    fn census(directory: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut entries: Vec<_> = fs::read_dir(directory)
+            .expect("the directory is readable")
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).expect("the file is readable"),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    let directory = Directory::new("publish-retry");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let downloads = directory.0.join("downloads");
+    fs::create_dir_all(&downloads).unwrap();
+    let destination = downloads.join("published.bin");
+    // Bystanders in both directories, including one whose name is close enough
+    // to be caught by a careless cleanup.
+    fs::write(downloads.join("theirs.bin"), b"not ours").unwrap();
+    fs::write(downloads.join("published.bin.old"), b"older").unwrap();
+    fs::write(parts.join("unrelated.part"), b"another job").unwrap();
+
+    let refusing = Arc::new(AtomicBool::new(true));
+    let store = FileStorage::default().with_linker(Arc::new(Refuse(refusing.clone())));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+
+    let before_parts = census(&parts);
+    let before_downloads = census(&downloads);
+
+    part.adopt_destination(&destination).unwrap();
+    assert_eq!(
+        part.publish(),
+        Err(StorageError::Unsupported),
+        "publication found another way to name the file"
+    );
+    drop(part);
+
+    // Nothing else was touched. Names and contents, both directories.
+    assert_eq!(
+        census(&downloads),
+        before_downloads,
+        "a refused publication changed the destination directory"
+    );
+    assert_eq!(
+        census(&parts),
+        before_parts,
+        "a refused publication changed the parts directory"
+    );
+
+    // The progress survived: the part still holds the bytes that were verified,
+    // so the retry below is a retry rather than a second download.
+    assert_eq!(
+        fs::read(parts.join("1-1.part")).unwrap(),
+        b"AAAAAA",
+        "a refused publication lost the bytes that were already proved"
+    );
+
+    // And the retry succeeds, on a handle reopened from disk with a mechanism
+    // this time. It goes the way production goes: coverage is restored from the
+    // recorded extents, which are rehashed on the way in, because opening a
+    // file must never restore coverage from its size alone. Without that the
+    // reopened handle refuses to verify -- which it did, and is the reason this
+    // test is written through `recover_extent` rather than around it.
+    refusing.store(false, Ordering::SeqCst);
+    let mut again = store.open(&parts, spec(6)).unwrap();
+    for (range, digest) in &record {
+        again.recover_extent(*range, *digest).unwrap();
+    }
+    // A reopened handle is not synchronized until it says so, and the
+    // coordinator syncs a reopened session before verifying for that reason.
+    again.sync().unwrap();
+    again.verify(None, &record).unwrap();
+    again.adopt_destination(&destination).unwrap();
+    assert_eq!(
+        again.publish().expect("the retry publishes"),
+        Published::At(fs::canonicalize(&destination).unwrap()),
+        "the retry did not publish where it was asked to"
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"AAAAAA");
+
+    // The bystanders are still there afterwards too: publishing is not the
+    // moment to discover a cleanup that ran on the way past.
+    assert_eq!(fs::read(downloads.join("theirs.bin")).unwrap(), b"not ours");
+    assert_eq!(
+        fs::read(downloads.join("published.bin.old")).unwrap(),
+        b"older"
+    );
+    assert_eq!(
+        fs::read(parts.join("unrelated.part")).unwrap(),
+        b"another job"
     );
 }

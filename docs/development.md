@@ -37,7 +37,7 @@ npm.cmd test
 
 ```powershell
 rustup target add x86_64-unknown-linux-gnu --toolchain 1.98.1
-./tools/rust.ps1 -CargoArguments @('clippy','-p','fhd-platform','-p','fhd-storage','--all-targets','--target','x86_64-unknown-linux-gnu','--','-D','warnings')
+./tools/rust.ps1 -CargoArguments @('clippy','-p','fhd-platform','-p','fhd-storage','-p','fhd-app','-p','fhd-runtime','-p','fhd-domain','-p','fhd-telemetry','--all-targets','--target','x86_64-unknown-linux-gnu','--','-D','warnings')
 ```
 
 **وحدّه معروف:** يفحص الترجمة وclippy لا التشغيل. ولا يغطي مساحة العمل كاملة — `libsqlite3-sys` يحتاج مترجم C مُقاطعًا. وmacOS لا يُفحص هكذا إطلاقًا. **فهو يمسك ما أمسك بي ثلاث مرات، ولا يُغني عن CI.**
