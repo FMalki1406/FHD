@@ -788,8 +788,16 @@ fn a_client_process_commands_a_serving_process() {
     }
 
     // Shutdown travels over the same surface, and the process actually leaves.
-    let (code, _, _) = run(&[&state.engine().to_string_lossy(), "--client", "stop"], "");
-    assert_eq!(code, Some(0));
+    //
+    // The client prints a code on every failure and this test used to throw
+    // both streams away, so CI could say only `left: Some(1), right: Some(0)`
+    // -- an exit code with no account of itself. They are kept and shown now.
+    let (code, out, err) = run(&[&state.engine().to_string_lossy(), "--client", "stop"], "");
+    assert_eq!(
+        code,
+        Some(0),
+        "the stop command failed.\nstdout: {out}\nstderr: {err}"
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match resident.0.try_wait().expect("wait on the resident") {

@@ -235,12 +235,19 @@ impl Serving {
             let _ = commands.send(Command::Shutdown).await;
             let _ = done.send(());
         });
-        let serving = tokio::spawn({
+        // The listener also stops when the scheduler comes to rest, which is how
+        // a client-initiated shutdown ends: nothing sends `done` on that path, so
+        // without this the serving task could only ever be aborted.
+        let (settled, rested) = tokio::sync::oneshot::channel();
+        let mut serving = tokio::spawn({
             let service = service.clone();
             async move {
                 server
-                    .serve(service, async {
-                        let _ = ended.await;
+                    .serve(service, async move {
+                        tokio::select! {
+                            _ = ended => {}
+                            _ = rested => {}
+                        }
                     })
                     .await;
             }
@@ -248,10 +255,34 @@ impl Serving {
         let outcomes = scheduler.run(restored, incoming).await;
         // The repository keeps every job; these are only what this run touched.
         drop(outcomes);
+        let _ = settled.send(());
         // Let go of the endpoint and the database before returning, so a caller
         // that opens this directory next does not meet our own lock.
-        serving.abort();
-        let _ = serving.await;
+        //
+        // Gracefully first. A client's `stop` is answered by handing the
+        // scheduler a Shutdown and returning `Done` -- and that answer still
+        // has to be written. Aborting the serving task the moment the scheduler
+        // returns can cut it, and then the client is told nothing and exits
+        // non-zero having done exactly what it was asked.
+        //
+        // **Not recorded as the cause of anything.** It is wrong on its own
+        // terms: a reply that has been decided should not be thrown away. The
+        // ubuntu failure where `--client stop` exited 1 may or may not be this;
+        // the test now keeps the client's own output, and that will say.
+        //
+        // The abort stays as a backstop, because a client that will not read
+        // its answer must not keep this process alive.
+        // Awaited only on the abort path. A `JoinHandle` that the timeout above
+        // already drove to completion panics if it is polled again, and that
+        // panic killed the resident -- caught here rather than on a runner,
+        // because this reproduces on Windows too.
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut serving)
+            .await
+            .is_err()
+        {
+            serving.abort();
+            let _ = serving.await;
+        }
         drop(service);
         Ok(())
     }

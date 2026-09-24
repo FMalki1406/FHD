@@ -144,6 +144,29 @@ pub struct Server {
     first: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
 }
 
+/// How long a stopping server gives clients to finish the answers it already
+/// decided on.
+///
+/// A client's `stop` is answered with `Done`, and that answer still has to be
+/// written. Aborting the client tasks the moment the stop signal arrives can
+/// cut it, and then the operator is told nothing and the command exits
+/// non-zero having done exactly what it was asked. Draining first is right on
+/// its own terms: a reply that has been decided should reach the client that
+/// asked for it.
+///
+/// Bounded, because a client that will not read its answer, or one idling on a
+/// kept-alive connection, must not keep the engine alive. After this, the
+/// abort that was always here takes over.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Lets in-flight clients finish, then abandons whoever is left.
+async fn drain(clients: &mut tokio::task::JoinSet<()>) {
+    let settled = async { while clients.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN, settled).await.is_err() {
+        clients.shutdown().await;
+    }
+}
+
 impl Server {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
@@ -166,7 +189,7 @@ impl Server {
                 tokio::select! {
                     biased;
                     () = &mut stop => {
-                        clients.shutdown().await;
+                        drain(&mut clients).await;
                         return;
                     }
                     _ = clients.join_next() => continue,
@@ -175,7 +198,7 @@ impl Server {
             let accepted = tokio::select! {
                 biased;
                 () = &mut stop => {
-                    clients.shutdown().await;
+                    drain(&mut clients).await;
                     return;
                 }
                 accepted = self.accept() => accepted,
