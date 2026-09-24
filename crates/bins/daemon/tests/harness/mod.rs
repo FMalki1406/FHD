@@ -36,10 +36,17 @@ impl Directory {
         #[cfg(not(windows))]
         let root = std::env::temp_dir();
         let base = root.join("fhd-tests");
-        let _ = std::fs::create_dir_all(&base);
-        // Permissions of its own, as an installer would give it. Without this the
-        // base inherits whatever its parent hands out.
-        let _ = fhd_platform::protect_new_directory(&base);
+        // Created with its permissions rather than given them afterwards, as an
+        // installer would. `create_dir_all` followed by a repair is what this
+        // used to do, and on Unix the repair did nothing at all -- so under a
+        // umask of 002 the base came out group-writable and a macOS runner
+        // refused its own test directory, correctly. A repair would also leave
+        // the window it was meant to close.
+        //
+        // A directory left over from an earlier run is not touched: this reports
+        // that it already existed and says nothing about its permissions, which
+        // is the same treatment the engine gives a directory it finds.
+        let _ = fhd_platform::create_protected_directory(&base);
         std::fs::canonicalize(&base).unwrap_or(base)
     }
 

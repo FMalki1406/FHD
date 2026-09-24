@@ -199,25 +199,24 @@ mod imp {
         uid
     }
 
-    /// Gives a directory permissions of its own: owner only.
+    /// Replaces an inherited access list with one of our own.
     ///
-    /// This did nothing, on the reasoning that Unix has no inherited list to
-    /// replace. What it has instead is a umask, and a directory made under one
-    /// of `002` comes out group-writable -- so callers asking to protect a
-    /// directory they had just made got whatever the environment felt like.
+    /// Nothing to do on Unix, and deliberately: there is no inherited list
+    /// there, only a umask, and a directory that came out of the umask
+    /// group-writable has already been that way for as long as it has existed.
+    /// Setting the mode afterwards closes nothing -- it leaves the window it
+    /// was meant to remove, which is the create-then-repair pattern the Windows
+    /// half of this module was rewritten to get rid of.
     ///
-    /// It showed up when the check that reads these modes started reporting
-    /// them: a macOS runner refused its own test directory with
-    /// `STATE-DIRECTORY-EXPOSED`, correctly, because nothing had ever protected
-    /// it. Windows was unaffected because its half of this function has always
-    /// written a real list.
+    /// The secure primitive is `create_protected_directory`, which passes the
+    /// mode to `mkdir(2)` so the directory never exists unprotected. Callers
+    /// that want a private directory on Unix use that one.
     ///
-    /// Only for a directory the caller made. `own_directory` deliberately does
-    /// not narrow one it merely found, because changing an operator's
-    /// permissions unasked is a worse surprise than declining to use it.
-    pub fn protect_new_directory(path: &std::path::Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    /// And a directory we merely found is not narrowed here. Changing an
+    /// operator's permissions unasked is a worse surprise than declining to use
+    /// the directory, which is what `own_directory` does instead.
+    pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
+        Ok(())
     }
 
     /// Not implemented, and this returns "nothing found" rather than "not
@@ -1737,6 +1736,86 @@ mod tests {
             .arg(&link)
             .output();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory the engine makes on Unix is owner-only from the instant it
+    /// exists, whatever the umask, and one it finds is left alone.
+    ///
+    /// `create_dir` then `set_permissions` would pass this test's first half and
+    /// still be wrong: between the two calls the directory carries whatever the
+    /// umask allowed, and a handle taken in that window outlives the repair.
+    /// `mkdir(2)` is given the mode instead, so there is no interval to lose --
+    /// which is why the check is on `create_protected_directory` and why
+    /// `protect_new_directory` does nothing here.
+    ///
+    /// Run under 002 and 000 because those are the umasks that make the
+    /// difference visible. A macOS runner refused its own test directory when
+    /// the repair-afterwards version met a umask of 002.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_we_make_is_owner_only_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `umask` only reads and replaces this process's own file-mode
+        // creation mask. Tests in this crate run on one thread by the harness's
+        // default only when asked, so the mask is restored before returning and
+        // the two cases run in sequence rather than in parallel.
+        fn with_umask<T>(mask: u32, body: impl FnOnce() -> T) -> T {
+            extern "C" {
+                fn umask(mask: u32) -> u32;
+            }
+            let previous = unsafe { umask(mask) };
+            let outcome = body();
+            unsafe { umask(previous) };
+            outcome
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "fhd-umask-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        for mask in [0o002, 0o000] {
+            let made = root.join(format!("made-{mask:03o}"));
+            let created = with_umask(mask, || create_protected_directory(&made).unwrap());
+            assert!(created, "the directory was not created by this call");
+            let mode = std::fs::metadata(&made).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "umask {mask:03o} left the directory {:03o}",
+                mode & 0o777
+            );
+            assert!(
+                foreign_writers(&made).unwrap().is_empty(),
+                "umask {mask:03o} left somebody else able to write it"
+            );
+        }
+
+        // One that was already there keeps what it had. The engine reports such
+        // a directory rather than narrowing it: changing an operator's
+        // permissions unasked is the surprise we decline to cause.
+        let found = root.join("found");
+        std::fs::create_dir(&found).unwrap();
+        std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let created = create_protected_directory(&found).unwrap();
+        assert!(!created, "an existing directory was reported as created");
+        assert_eq!(
+            std::fs::metadata(&found).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "a directory we found was quietly narrowed"
+        );
+        assert!(
+            !foreign_writers(&found).unwrap().is_empty(),
+            "a group-writable directory we found was called clean"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// What Unix reports about a directory somebody else may write.
