@@ -164,59 +164,55 @@ mod imp {
 
     /// The user id this process's files are created as.
     ///
-    /// Read from a file we have just made rather than through `getuid`, so this
+    /// Read once from a file we make, rather than through `getuid`, so this
     /// crate's one `unsafe` allowance stays where the security descriptor work
-    /// needs it and no dependency is added for one integer. It is the effective
-    /// (filesystem) id rather than the real one, which is the right one to
-    /// compare against the owner of a directory we would write in.
+    /// needs it. It cannot change while the process runs, so it is computed once
+    /// and kept.
     ///
-    /// `create_new` and an explicit mode, because the plain create was
+    /// **Once matters, not merely for speed.** A version of this made a probe
+    /// file on every call, named from the pid and the clock. Under parallel
+    /// tests on a runner whose clock is coarser than nanoseconds, two calls
+    /// chose the same name, `create_new` refused the second, and the failure
+    /// path returned `u32::MAX` -- which reads as a foreign owner, so the engine
+    /// refused a directory of its own with `STATE-DIRECTORY-EXPOSED`. Failing
+    /// closed is right; failing closed at random because of a name collision is
+    /// not, and it took a macOS runner to show it.
+    ///
+    /// `create_new` with an explicit mode, because the plain create was
     /// `O_WRONLY|O_CREAT|O_TRUNC` and followed symlinks in a directory that is
-    /// usually world-writable: a review pointed out that guessing the name gave
-    /// an attacker a way to truncate any file this uid can write. It was never
-    /// an authorization bypass -- a failure here returns `u32::MAX`, which makes
-    /// every directory read as foreign-owned and every caller refuse -- but it
-    /// was a way to destroy somebody else's file, which is enough.
+    /// usually world-writable: guessing the name gave an attacker a way to
+    /// truncate any file this uid can write. Retried on a taken name so that a
+    /// collision costs an attempt rather than the answer.
     fn our_uid() -> u32 {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let probe = std::env::temp_dir().join(format!(
-            "fhd-uid-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_nanos())
-                .unwrap_or(0)
-        ));
-        let uid = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&probe)
-            .and_then(|file| file.metadata())
-            .map(|metadata| metadata.uid())
-            .unwrap_or(u32::MAX);
-        let _ = std::fs::remove_file(&probe);
-        uid
-    }
-
-    /// Replaces an inherited access list with one of our own.
-    ///
-    /// Nothing to do on Unix, and deliberately: there is no inherited list
-    /// there, only a umask, and a directory that came out of the umask
-    /// group-writable has already been that way for as long as it has existed.
-    /// Setting the mode afterwards closes nothing -- it leaves the window it
-    /// was meant to remove, which is the create-then-repair pattern the Windows
-    /// half of this module was rewritten to get rid of.
-    ///
-    /// The secure primitive is `create_protected_directory`, which passes the
-    /// mode to `mkdir(2)` so the directory never exists unprotected. Callers
-    /// that want a private directory on Unix use that one.
-    ///
-    /// And a directory we merely found is not narrowed here. Changing an
-    /// operator's permissions unasked is a worse surprise than declining to use
-    /// the directory, which is what `own_directory` does instead.
-    pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
-        Ok(())
+        static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *UID.get_or_init(|| {
+            for attempt in 0..8u32 {
+                let probe = std::env::temp_dir().join(format!(
+                    "fhd-uid-{}-{}-{attempt}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_nanos())
+                        .unwrap_or(0)
+                ));
+                let read = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&probe)
+                    .and_then(|file| file.metadata())
+                    .map(|metadata| metadata.uid());
+                let _ = std::fs::remove_file(&probe);
+                if let Ok(uid) = read {
+                    return uid;
+                }
+            }
+            // Every attempt failed, which is a real problem rather than a
+            // collision. An id nothing owns makes every directory read as
+            // foreign, so callers refuse rather than proceed blind.
+            u32::MAX
+        })
     }
 
     /// Not implemented, and this returns "nothing found" rather than "not
