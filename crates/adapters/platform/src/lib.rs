@@ -199,9 +199,25 @@ mod imp {
         uid
     }
 
-    /// The caller sets the mode on Unix; there is no inherited list to replace.
-    pub fn protect_new_directory(_: &std::path::Path) -> io::Result<()> {
-        Ok(())
+    /// Gives a directory permissions of its own: owner only.
+    ///
+    /// This did nothing, on the reasoning that Unix has no inherited list to
+    /// replace. What it has instead is a umask, and a directory made under one
+    /// of `002` comes out group-writable -- so callers asking to protect a
+    /// directory they had just made got whatever the environment felt like.
+    ///
+    /// It showed up when the check that reads these modes started reporting
+    /// them: a macOS runner refused its own test directory with
+    /// `STATE-DIRECTORY-EXPOSED`, correctly, because nothing had ever protected
+    /// it. Windows was unaffected because its half of this function has always
+    /// written a real list.
+    ///
+    /// Only for a directory the caller made. `own_directory` deliberately does
+    /// not narrow one it merely found, because changing an operator's
+    /// permissions unasked is a worse surprise than declining to use it.
+    pub fn protect_new_directory(path: &std::path::Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
     }
 
     /// Not implemented, and this returns "nothing found" rather than "not
