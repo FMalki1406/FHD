@@ -111,8 +111,12 @@ jobs:
       - name: Platform - every test here is named by a step
         shell: bash
         run: |
-          listed=$(cargo +1.98.1 test -p fhd-platform --locked -- --list \
-            | sed -n 's/^tests::\(.*\): test$/\1/p' | sort)
+          # Every test this platform compiled, wherever it lives. The old
+          # pattern took only `tests::`-prefixed names, so one in another module,
+          # at crate root, or under `tests/` was invisible: a review added such a
+          # test and watched this step pass while nothing ran it.
+          listed=$(cargo +1.98.1 test -p fhd-platform --locked --all-targets -- --list \
+            | sed -n 's/: test$//p' | sed 's/^tests:://' | sort -u)
           covered=$(for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
               either_spelling stranger_may_write until_it_is_protected \
