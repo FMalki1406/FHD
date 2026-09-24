@@ -7,6 +7,13 @@ publish = false
 [dependencies]
 tokio = { version = "=1.51.4", features = ["net"] }
 
+# `geteuid(2)` and nothing else. Already in Cargo.lock as a transitive
+# dependency, so this adds no code to the build -- but it is named here rather
+# than relied on incidentally, because a direct dependency is reviewed and a
+# transitive one is not.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",

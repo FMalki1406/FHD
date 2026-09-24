@@ -8,7 +8,13 @@
 //!
 //! Every `unsafe` block here states what makes the call sound. Nothing in this
 //! crate decides policy: it reports what the system says and hands back handles.
-#![cfg_attr(not(windows), forbid(unsafe_code))]
+// `deny` rather than `forbid` off Windows, so that exactly one place can lift
+// it: `our_uid`, which calls `geteuid(2)`. `forbid` cannot be overridden at all,
+// which sounds stronger and in practice pushed the answer into a probe file that
+// had to guess a unique name and failed closed at random when two callers
+// guessed the same one. A single reviewed call is the smaller risk. Every other
+// `unsafe` off Windows still fails the build.
+#![cfg_attr(not(windows), deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::io;
@@ -155,78 +161,36 @@ mod imp {
         if mode & 0o002 != 0 {
             foreign.push("other".to_owned());
         }
-        let us = our_uid()?;
+        let us = our_uid();
         if metadata.uid() != us {
             foreign.push(format!("owner:{}", metadata.uid()));
         }
         Ok(ForeignWriters(foreign))
     }
 
-    /// The user id this process's files are created as.
+    /// The effective user id of this process.
     ///
-    /// **The direct call is `geteuid(2)`, and it is not used here on purpose.**
-    /// Reaching it means `libc` -- which is already in `Cargo.lock` as a
-    /// transitive dependency, so it would add no new code to the build -- and an
-    /// `unsafe` block, which `crates/adapters/platform/src/lib.rs:11` forbids off
-    /// Windows. That prohibition is an architectural decision and is not for
-    /// this function to spend. If it is ever relaxed, `geteuid` is the answer
-    /// and everything below can go.
+    /// `geteuid(2)` answers it directly, cannot fail, and returns the id the
+    /// kernel uses for the permission checks this module is reasoning about --
+    /// which is what makes it the right question rather than merely the
+    /// convenient one.
     ///
-    /// Until then, in order of directness:
+    /// Two workarounds preceded it and both were worse. A probe file had to
+    /// invent a unique name, and when two parallel callers invented the same one
+    /// the read failed and the answer became "owner unknown", which reads as a
+    /// foreign owner -- so the engine refused a directory it had just created,
+    /// at random, on a macOS runner. `/proc/self` is Linux-only, and its
+    /// ownership is a property of a filesystem rather than of the call, so it
+    /// would have needed its own argument about when that property holds.
     ///
-    /// 1. **Linux: `/proc/self`.** Owned by the process's effective user, so its
-    ///    owner *is* the answer -- one `stat`, no probe, no write, nothing to
-    ///    collide with. Documented in `proc(5)`.
-    /// 2. **Elsewhere: a file we create.** macOS has no `/proc`. Made with
-    ///    `create_new` and an explicit mode, because a plain create followed
-    ///    symlinks in a usually world-writable directory and let a guessed name
-    ///    truncate anything this uid can write.
-    ///
-    /// **A failure is an error, not a stand-in identity.** This used to answer
-    /// `u32::MAX` when the probe failed, which reads as an owner who is not us
-    /// -- so a name collision between two parallel calls made the engine refuse
-    /// a directory it had just created, on a macOS runner, at random. A refusal
-    /// has to be about what was measured; "we could not tell" is a different
-    /// answer and says so.
-    ///
-    /// Computed once: it cannot change while the process runs.
-    fn our_uid() -> io::Result<u32> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        let found = *UID.get_or_init(|| {
-            #[cfg(target_os = "linux")]
-            if let Ok(metadata) = std::fs::metadata("/proc/self") {
-                return Some(metadata.uid());
-            }
-            for attempt in 0..8u32 {
-                let probe = std::env::temp_dir().join(format!(
-                    "fhd-uid-{}-{}-{attempt}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_nanos())
-                        .unwrap_or(0)
-                ));
-                let read = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&probe)
-                    .and_then(|file| file.metadata())
-                    .map(|metadata| metadata.uid());
-                let _ = std::fs::remove_file(&probe);
-                if let Ok(uid) = read {
-                    return Some(uid);
-                }
-            }
-            None
-        });
-        found.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "this process's user id could not be read, so ownership cannot be judged",
-            )
-        })
+    /// The `unsafe` is one call with no arguments, no pointers and no failure
+    /// mode, and `deny` rather than `forbid` at the top of this file is what
+    /// allows exactly this one and nothing else.
+    #[allow(unsafe_code)]
+    fn our_uid() -> u32 {
+        // SAFETY: `geteuid` takes nothing, returns a `uid_t` by value, touches
+        // no memory this side owns, and is documented as always succeeding.
+        unsafe { libc::geteuid() }
     }
 
     /// Replaces an inherited access list with one of our own.
