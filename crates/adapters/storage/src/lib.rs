@@ -763,7 +763,8 @@ impl SegmentFile for FilePart {
 
         // Publishing into the adopted object succeeded. Whether the path the
         // operator gave still reaches it is a separate question, asked
-        // separately: the folder can have been renamed while the transfer ran.
+        // separately -- and a question that can also fail to get an answer,
+        // which is a third outcome rather than a bad version of the second.
         //
         // The comparison is by identity, not by existence. A file appearing at
         // the requested path is not evidence it is ours -- anyone able to move
@@ -775,18 +776,32 @@ impl SegmentFile for FilePart {
             requested: requested.clone(),
             name: name.clone(),
         };
-        // Nothing is republished and nothing is removed on this branch. A second
-        // publication would leave a copy somewhere, and a removal would act on a
-        // file this engine cannot prove is its own.
-        let Ok(at_path) = File::open(&requested) else {
-            return Ok(moved);
+        let unverified = |because| Published::LocationUnverified {
+            requested: requested.clone(),
+            name: name.clone(),
+            because,
         };
-        let Ok(linker) = linker else { return Ok(moved) };
+        // Nothing is republished and nothing is removed on any of these
+        // branches. A second publication would leave a copy somewhere, and a
+        // removal would act on a file this engine cannot prove is its own.
+        let at_path = match File::open(&requested) {
+            Ok(file) => file,
+            // Nothing is there. That is an answer: the path does not reach it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(moved),
+            // Anything else -- denied, busy, a device that will not open -- is
+            // a question that went unanswered, not a file that moved.
+            Err(error) => return Ok(unverified(io(error))),
+        };
+        let Ok(linker) = linker else {
+            return Ok(unverified(StorageError::Unsupported));
+        };
         match linker.same_object(&self.file, &at_path) {
             Ok(true) => Ok(Published::At(requested)),
-            // Either the path leads elsewhere, or the platform could not say.
-            // Neither is a reason to claim it leads here.
-            Ok(false) | Err(_) => Ok(moved),
+            // Checked, and something else is there.
+            Ok(false) => Ok(moved),
+            // The platform could not compare them. Not knowing where the file
+            // is is not evidence that it moved.
+            Err(error) => Ok(unverified(error)),
         }
     }
 }

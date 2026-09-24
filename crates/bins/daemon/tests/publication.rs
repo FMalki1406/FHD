@@ -717,3 +717,79 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
         b"another job"
     );
 }
+
+/// Publication succeeded and the location check could not be completed.
+///
+/// This must not read as `Moved`. **Not knowing where the file is is not
+/// evidence that it moved** -- here it is in exactly the place that was asked
+/// for, and the only thing that failed is the question. Reporting a move would
+/// be an assertion about the filesystem that nothing established, and it would
+/// send an operator hunting for a file sitting where they put it.
+///
+/// The failure is injected at the one place the answer comes from: the port's
+/// `same_object`. The link itself is the real mechanism, so what is measured is
+/// the adapter's handling of an unanswered question, not a fake publication.
+#[cfg(windows)]
+#[test]
+fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
+    struct LinkButCannotCompare;
+    impl HandleLinker for LinkButCannotCompare {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
+            })
+        }
+        fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+    }
+
+    let directory = Directory::new("publish-unverified");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let destination = directory.0.join("published.bin");
+
+    let store = FileStorage::default().with_linker(Arc::new(LinkButCannotCompare));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    let outcome = part.publish().expect("publication succeeds");
+    assert_eq!(
+        outcome,
+        Published::LocationUnverified {
+            requested: fs::canonicalize(&destination).unwrap(),
+            name: destination.file_name().unwrap().to_os_string(),
+            because: StorageError::Unsupported,
+        },
+        "an unanswered question was reported as a finding"
+    );
+
+    // And the file really is where it was asked for: the engine's ignorance is
+    // about the check, not about the outcome.
+    assert_eq!(fs::read(&destination).unwrap(), b"AAAAAA");
+
+    // Nothing was published twice and nothing was removed.
+    let published: Vec<_> = fs::read_dir(&directory.0)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        published,
+        vec!["published.bin".to_string()],
+        "an unverified location led to a second copy or a removal"
+    );
+}

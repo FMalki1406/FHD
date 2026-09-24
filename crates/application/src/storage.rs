@@ -84,30 +84,52 @@ pub enum Occupant {
     NotAFile,
 }
 
-/// What publication achieved, with the object kept separate from the path.
+/// What publication achieved, with the object kept separate from the path, and
+/// both kept separate from what could not be established.
 ///
 /// Publishing into the adopted folder and being able to say where that folder
 /// is are two different claims, and collapsing them is how an operator gets
-/// told a file sits at a path that leads nowhere. If the folder is renamed
-/// during the transfer the file is still exactly where the contract requires
-/// -- inside the object that was adopted -- and the path the operator typed no
-/// longer reaches it.
+/// told a file sits at a path that leads nowhere. There is a third case that
+/// must not be folded into either: publication succeeded, and the engine could
+/// not find out whether the requested path still reaches it. **Not knowing
+/// where the file is is not evidence that it moved**, and reporting it as a
+/// move would be an assertion about the filesystem that nothing established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Published {
-    /// In the adopted folder, and this path reaches it. The ordinary answer.
+    /// Published, and the requested path was confirmed to reach it. The only
+    /// variant whose path may be shown as somewhere to go and look.
     At(PathBuf),
-    /// In the adopted folder, under `name`, but the path the operator gave no
-    /// longer reaches it: the folder was renamed or moved after adoption.
+    /// Published, and the requested path was confirmed **not** to reach it:
+    /// either nothing is there, or what is there is a different file. The
+    /// folder was renamed or moved after adoption.
     ///
     /// **Nothing is republished and nothing is removed.** Publishing again
     /// would put a second copy somewhere, and deleting would act on a file this
     /// engine cannot prove is its own. The job is complete and needs the
     /// operator, which is what this state says.
     Moved {
-        /// The path that was asked for, which no longer leads to the file.
+        /// The path that was asked for, which was checked and does not lead to
+        /// the file. Not a location to show as valid.
         requested: PathBuf,
         /// The file's name inside the adopted folder.
         name: std::ffi::OsString,
+    },
+    /// Published into the adopted folder, and the check on the requested path
+    /// could not be completed -- the path could not be opened for a reason
+    /// other than absence, or the platform could not compare the two handles.
+    ///
+    /// This is ignorance, not a finding. The file may well be exactly where it
+    /// was asked for. **No path is offered as valid, and nothing is
+    /// republished or removed**, for the same reasons as `Moved` and one more:
+    /// acting on a guess here would act on a file whose relationship to this
+    /// job was never established.
+    LocationUnverified {
+        /// The path that was asked for, whose status is unknown.
+        requested: PathBuf,
+        /// The file's name inside the adopted folder.
+        name: std::ffi::OsString,
+        /// Why the check could not be completed, for the operator and the log.
+        because: StorageError,
     },
 }
 
@@ -115,13 +137,24 @@ impl std::fmt::Display for Published {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::At(path) => write!(f, "{}", path.display()),
-            // Never just the requested path: that is the sentence that tells an
-            // operator to look somewhere the file is not.
+            // Never just the requested path: that is the sentence that sends an
+            // operator to look somewhere the file is not, or somewhere nobody
+            // checked.
             Self::Moved { requested, name } => write!(
                 f,
-                "{} as {} -- in the folder you chose, which was renamed during the transfer",
-                requested.display(),
-                name.to_string_lossy()
+                "as {} in the folder you chose -- {} no longer reaches it,                  because the folder was renamed during the transfer",
+                name.to_string_lossy(),
+                requested.display()
+            ),
+            Self::LocationUnverified {
+                requested,
+                name,
+                because,
+            } => write!(
+                f,
+                "as {} in the folder you chose -- whether {} still reaches it                  could not be checked ({because})",
+                name.to_string_lossy(),
+                requested.display()
             ),
         }
     }
