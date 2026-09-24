@@ -246,7 +246,8 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::fs::File;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::{ffi::c_void, iter::once, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE},
@@ -261,6 +262,7 @@ mod imp {
             INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
             PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
+        Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO},
         System::{
             RemoteDesktop::ProcessIdToSessionId,
             Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken},
@@ -1083,6 +1085,53 @@ mod imp {
         Ok(found)
     }
 
+    /// Whether two open handles name the same file on the same volume.
+    ///
+    /// Publication links a path, and verification holds a handle, so the object
+    /// proved and the object delivered are two resolutions of one name. Asking
+    /// the kernel which object each handle actually refers to is how that gap
+    /// becomes visible.
+    ///
+    /// `GetFileInformationByHandleEx` with `FileIdInfo` answers it: a 128-bit
+    /// file id and the volume it lives on, both read from the handle rather than
+    /// from a name. `std`'s equivalent (`file_index`, `volume_serial_number`) is
+    /// still unstable, which is why this lives here instead of in the storage
+    /// adapter -- that crate forbids `unsafe` and may not depend on this one.
+    ///
+    /// **This detects; it does not prevent.** Linking from the verified handle
+    /// is what would prevent, and it needs `NtSetInformationFile` with
+    /// `FILE_LINK_INFORMATION`: `SetFileInformationByHandle` does not accept
+    /// `FileLinkInfo`, so the documented Win32 surface has no route. Whether to
+    /// take the NT one is an open decision, and until it is taken this is the
+    /// difference between publishing the wrong bytes and refusing to.
+    pub fn same_object(left: &File, right: &File) -> io::Result<bool> {
+        fn identity(file: &File) -> io::Result<FILE_ID_INFO> {
+            let mut info = FILE_ID_INFO {
+                VolumeSerialNumber: 0,
+                FileId: Default::default(),
+            };
+            // SAFETY: the handle is borrowed from a live `File`, the class and
+            // the buffer match (`FileIdInfo` expects a `FILE_ID_INFO`), and the
+            // size is that buffer's own. Nothing is retained.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle() as HANDLE,
+                    FileIdInfo,
+                    (&raw mut info).cast(),
+                    u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).unwrap_or(0),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(info)
+        }
+        let left = identity(left)?;
+        let right = identity(right)?;
+        Ok(left.VolumeSerialNumber == right.VolumeSerialNumber
+            && left.FileId.Identifier == right.FileId.Identifier)
+    }
+
     /// Untrusted principals an object grants any of `rights` to, its owner
     /// included.
     fn holders(path: &std::path::Path, rights: u32) -> io::Result<Vec<String>> {
@@ -1324,7 +1373,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{acceptable_descriptor, create_pipe, open_pipe};
+pub use imp::{acceptable_descriptor, create_pipe, open_pipe, same_object};
 pub use imp::{
     create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
     swappable_components, user_scope,
@@ -1979,6 +2028,60 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// A handle knows which object it holds, even after its name is taken.
+    ///
+    /// This is the measurement the publication contract turns on. A file is
+    /// opened, its name is renamed away, and another file is put at that name.
+    /// Linking by name delivers the impostor; the handle still identifies the
+    /// original, and `same_object` says so.
+    ///
+    /// It is the detection half. Preventing it means linking from the handle,
+    /// which `SetFileInformationByHandle` has no class for -- `FileLinkInfo` is
+    /// an NT-level class -- so that remains an open decision rather than
+    /// something this function quietly implies.
+    #[cfg(windows)]
+    #[test]
+    fn a_handle_identifies_its_object_after_the_name_is_taken() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!(
+            "fhd-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let name = base.join("subject.bin");
+        fs::write(&name, b"ours").unwrap();
+        let held = fs::File::open(&name).unwrap();
+
+        // Same handle, same path, same object: the control, so a comparison
+        // that always answered false could not pass this.
+        assert!(
+            same_object(&held, &fs::File::open(&name).unwrap()).unwrap(),
+            "two handles on one file were called different objects"
+        );
+
+        // The name is taken over. The handle survives it on NTFS.
+        fs::rename(&name, base.join("aside.bin")).unwrap();
+        fs::write(&name, b"theirs").unwrap();
+        let impostor = fs::File::open(&name).unwrap();
+        assert!(
+            !same_object(&held, &impostor).unwrap(),
+            "a file planted at the name was called the same object"
+        );
+
+        // And what the name now leads to really is the other bytes, so this is
+        // the substitution rather than an artefact of the check.
+        assert_eq!(fs::read(&name).unwrap(), b"theirs");
+        assert_eq!(fs::read(base.join("aside.bin")).unwrap(), b"ours");
+
+        drop(held);
+        drop(impostor);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// What an owner means, decided rather than assumed.
