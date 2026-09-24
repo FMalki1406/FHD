@@ -78,6 +78,65 @@ function itemBelow(lines, from) {
   return '<end of file>';
 }
 
+/// Every attribute in `text`, as whole attributes rather than lines.
+///
+/// A line-based scan was the flaw the review of 2026-09-24 found: it matched
+/// the prefix `#[allow(unsafe_code)]` and nothing else, so `#[allow(dead_code,
+/// unsafe_code)]`, `#[cfg_attr(unix, allow(unsafe_code))]` and any attribute
+/// split across lines went straight past a gate that claimed to bound them.
+///
+/// Brackets are matched so a nested attribute comes back whole. String literals
+/// inside an attribute are skipped so a `]` in a doc string or a `cfg` value
+/// does not end it early. This is not a Rust parser, which is why the caller
+/// refuses every spelling it does not recognise instead of interpreting it.
+export function attributesIn(text) {
+  const found = [];
+  for (let i = 0; i + 1 < text.length; i += 1) {
+    if (text[i] !== '#') continue;
+    let open = i + 1;
+    const inner = text[open] === '!';
+    if (inner) open += 1;
+    if (text[open] !== '[') continue;
+    let depth = 0;
+    let end = -1;
+    for (let j = open; j < text.length; j += 1) {
+      const ch = text[j];
+      if (ch === '"') {
+        j += 1;
+        while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+        continue;
+      }
+      if (ch === '[') depth += 1;
+      else if (ch === ']') {
+        depth -= 1;
+        if (depth === 0) { end = j; break; }
+      }
+    }
+    // An attribute that never closes is malformed; the compiler will say so.
+    if (end === -1) continue;
+    found.push({
+      text: text.slice(i, end + 1),
+      inner,
+      line: text.slice(0, i).split('\n').length,
+      after: end + 1,
+    });
+    i = end;
+  }
+  return found;
+}
+
+/// Whether an attribute's text would permit unsafe code somewhere.
+///
+/// `allow` and `expect` both silence `deny(unsafe_code)`; `expect` was missed
+/// entirely before. `deny` and `forbid` mentions are the policy itself and are
+/// left alone -- but only when the attribute does not *also* allow, so
+/// `cfg_attr(windows, allow(unsafe_code))` beside a deny is still caught.
+function permitsUnsafe(text) {
+  if (!text.includes('unsafe_code')) return false;
+  const stripped = text.replaceAll(/\s+/gu, '');
+  return stripped.includes('allow(') || stripped.includes('expect(');
+}
+
 export function checkUnsafePolicy(root) {
   const offenders = [];
   const walk = (directory) => {
@@ -86,40 +145,59 @@ export function checkUnsafePolicy(root) {
       const full = `${directory}/${entry}`;
       if (statSync(full).isDirectory()) { walk(full); continue; }
       if (!entry.endsWith('.rs')) continue;
-      const relative = full.slice(root.length + 1).replaceAll('\\', '/');
-      const approved = UNSAFE_ALLOWANCES.get(relative) ?? [];
-      const remaining = [...approved];
-      const lines = readFileSync(full, 'utf8').split(/\r?\n/u);
-      lines.forEach((line, index) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('#![allow(unsafe_code)]')) {
-          offenders.push(
-            `${relative}:${index + 1}: a crate- or module-wide unsafe allowance is never approved. ` +
-            'Attach it to the one item that needs it.',
-          );
-          return;
-        }
-        if (!trimmed.startsWith('#[allow(unsafe_code)]')) return;
-        const item = itemBelow(lines, index);
-        const at = remaining.indexOf(item);
-        if (at === -1) {
-          offenders.push(
-            `${relative}:${index + 1}: unsafe allowed on an item that is not approved: ${item}. ` +
-            'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
-          );
-          return;
-        }
-        remaining.splice(at, 1);
-      });
-      for (const unused of remaining) {
-        offenders.push(
-          `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
-          'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
-        );
-      }
+      const relative = full.slice(root.length + 1).split('\\').join('/');
+      offenders.push(...unsafeOffendersIn(relative, readFileSync(full, 'utf8')));
     }
   };
   walk(`${root}/crates`);
+  return offenders;
+}
+
+/// The policy itself, over one file's text. Exported so it can be tested on
+/// spellings that do not exist in the tree.
+export function unsafeOffendersIn(relative, text) {
+  const offenders = [];
+  const approved = UNSAFE_ALLOWANCES.get(relative) ?? [];
+  const remaining = [...approved];
+  const lines = text.split("\n").map(line => line.replace(/\r$/u, ""));
+  for (const attribute of attributesIn(text)) {
+    if (!permitsUnsafe(attribute.text)) continue;
+    const where = `${relative}:${attribute.line}`;
+    if (attribute.inner) {
+      offenders.push(
+        `${where}: a crate- or module-wide unsafe allowance is never approved. ` +
+        'Attach it to the one item that needs it.',
+      );
+      continue;
+    }
+    // One spelling is approved, and everything else is refused rather than
+    // interpreted. A gate that guesses at what an attribute means is a gate
+    // whose coverage nobody can state.
+    if (attribute.text.replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') {
+      offenders.push(
+        `${where}: unsafe is permitted by a spelling this gate does not accept: ` +
+        `${attribute.text.replaceAll(/\s+/gu, ' ')}. Write it as #[allow(unsafe_code)] ` +
+        'on the single item that needs it, so the allowance has one reviewable form.',
+      );
+      continue;
+    }
+    const item = itemBelow(lines, attribute.line - 1);
+    const at = remaining.indexOf(item);
+    if (at === -1) {
+      offenders.push(
+        `${where}: unsafe allowed on an item that is not approved: ${item}. ` +
+        'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
+      );
+      continue;
+    }
+    remaining.splice(at, 1);
+  }
+  for (const unused of remaining) {
+    offenders.push(
+      `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
+      'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
+    );
+  }
   return offenders;
 }
 

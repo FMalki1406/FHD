@@ -315,7 +315,7 @@ impl Service {
 
     /// Admits one request: checks it, records what it points at, and hands the job
     /// to the scheduler. Anything refused is refused before a byte is fetched.
-    async fn add(&self, request: AddRequest) -> Result<JobId, EngineError> {
+    async fn add(&self, request: AddRequest) -> Result<(JobId, Vec<String>), EngineError> {
         // The client proposes; this decides. A destination is refused here rather
         // than after a whole file has been fetched.
         let destination_path = self.allowed_destination(&request.destination)?;
@@ -394,7 +394,13 @@ impl Service {
         if matches!(job.state(), JobState::Queued) {
             let _ = self.commands.send(Command::Admit(Box::new(job))).await;
         }
-        Ok(id)
+        // Said once, where the destination is accepted, so it reaches whichever
+        // client asked -- not only the one that reads stdin.
+        let warnings = destination_path
+            .parent()
+            .map(crate::shared_destination_warnings)
+            .unwrap_or_default();
+        Ok((id, warnings))
     }
 
     /// Where a client's bytes may land. A local peer is the same user, so this is
@@ -515,7 +521,10 @@ impl Handler for Service {
     async fn handle(&self, request: Request) -> Response {
         match request {
             Request::Add(add) => match self.add(add).await {
-                Ok(id) => Response::Accepted { job: id.get() },
+                Ok((id, warnings)) => Response::Accepted {
+                    job: id.get(),
+                    warnings,
+                },
                 Err(error) => Response::Failed {
                     code: crate::code(&error),
                 },

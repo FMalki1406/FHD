@@ -16,7 +16,10 @@ impl Handler for Counting {
     async fn handle(&self, request: Request) -> Response {
         self.seen.fetch_add(1, Ordering::SeqCst);
         match request {
-            Request::Pause { job } => Response::Accepted { job },
+            Request::Pause { job } => Response::Accepted {
+                job,
+                warnings: Vec::new(),
+            },
             Request::Shutdown => Response::Done,
             _ => Response::Failed {
                 code: "ENGINE-INVALID-INPUT".into(),
@@ -66,7 +69,10 @@ async fn requests_are_answered_in_order_over_a_real_endpoint() {
             ask(&mut client, job, &Request::Pause { job })
                 .await
                 .unwrap(),
-            Response::Accepted { job }
+            Response::Accepted {
+                job,
+                warnings: Vec::new()
+            }
         );
     }
     assert_eq!(
@@ -122,7 +128,10 @@ async fn a_peer_announcing_an_enormous_frame_is_dropped_and_others_keep_working(
         ask(&mut honest, 1, &Request::Pause { job: 1 })
             .await
             .unwrap(),
-        Response::Accepted { job: 1 }
+        Response::Accepted {
+            job: 1,
+            warnings: Vec::new()
+        }
     );
     let _ = stop.send(());
 }
@@ -160,7 +169,10 @@ async fn one_silent_client_does_not_stop_the_engine_answering_another() {
     for job in 1..=5 {
         assert_eq!(
             ask(&mut busy, job, &Request::Pause { job }).await.unwrap(),
-            Response::Accepted { job }
+            Response::Accepted {
+                job,
+                warnings: Vec::new()
+            }
         );
     }
     let _ = stop.send(());

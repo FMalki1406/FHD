@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkArchitecture, checkTestCoverage } from './check-architecture.mjs';
+import { attributesIn, checkArchitecture, checkTestCoverage, unsafeOffendersIn } from './check-architecture.mjs';
 
 function metadata(graph) {
   const packages = Object.entries(graph).map(([name, dependencies]) => ({
@@ -118,4 +118,78 @@ test('a workspace member no test step names is reported rather than shipping unt
   ]);
   const covered = `${workflow}\n        run: cargo +1.98.1 test -p fhd-newcomer --locked`;
   assert.deepEqual(checkTestCoverage(metadata, covered), []);
+});
+
+// R3 from the review of 2026-09-24: the gate matched a line prefix, so every
+// other spelling the compiler accepts walked past it. These are the spellings
+// the review demonstrated, plus the ones that search turned up.
+test('unsafe gate catches every spelling that can permit unsafe, not one prefix', () => {
+  const file = 'crates/adapters/platform/src/lib.rs';
+  const approved = '#[allow(unsafe_code)]\nfn our_uid() -> u32 {\n    0\n}\n';
+  // The approved spelling on the approved item is the baseline.
+  assert.deepEqual(unsafeOffendersIn(file, approved), []);
+
+  const bypasses = [
+    // A list: silences the lint just as well as the single form.
+    '#[allow(dead_code, unsafe_code)]\nfn our_uid() -> u32 { 0 }\n',
+    // Conditional: applies on the platform it names.
+    '#[cfg_attr(unix, allow(unsafe_code))]\nfn our_uid() -> u32 { 0 }\n',
+    // Split across lines: a line-based scan never saw the whole attribute.
+    '#[allow(\n    unsafe_code\n)]\nfn our_uid() -> u32 { 0 }\n',
+    // `expect` silences a deny exactly like `allow`, and was missed entirely.
+    '#[expect(unsafe_code)]\nfn our_uid() -> u32 { 0 }\n',
+    // Whitespace inside the approved form is still a different spelling.
+    '#[ allow( unsafe_code ) ]\nfn our_uid() -> u32 { 0 }\n',
+  ];
+  for (const source of bypasses) {
+    const offenders = unsafeOffendersIn(file, source);
+    // The property is that nothing which permits unsafe goes unreported, by
+    // whichever of the two routes fits: a spelling the gate will not accept,
+    // or the approved spelling on an item nobody approved. Each of these
+    // returned an empty list before, which is what made them bypasses.
+    assert.ok(
+      offenders.some(one =>
+        /spelling this gate does not accept|is not approved/u.test(one)),
+      `not reported: ${JSON.stringify(source)} -> ${JSON.stringify(offenders)}`,
+    );
+  }
+
+  // Crate- and module-wide allowances stay refused in every spelling.
+  for (const inner of [
+    '#![allow(unsafe_code)]\n',
+    '#![allow(dead_code, unsafe_code)]\n',
+    '#![cfg_attr(windows, allow(unsafe_code))]\n',
+  ]) {
+    const offenders = unsafeOffendersIn(file, inner);
+    assert.ok(offenders.some(one => one.includes('crate- or module-wide')), inner);
+  }
+
+  // The policy's own attributes are not allowances and must not be reported.
+  for (const restriction of [
+    `#![forbid(unsafe_code)]\n${approved}`,
+    `#![cfg_attr(not(windows), deny(unsafe_code))]\n${approved}`,
+    `#![deny(unsafe_code)]\n${approved}`,
+  ]) {
+    assert.deepEqual(unsafeOffendersIn(file, restriction), [], restriction);
+  }
+
+  // An approved item that disappears is still reported, as before.
+  assert.match(unsafeOffendersIn(file, 'fn nothing() {}\n')[0], /no longer present/u);
+
+  // A file with no approvals may not allow unsafe at all.
+  assert.match(
+    unsafeOffendersIn('crates/adapters/storage/src/lib.rs', approved)[0],
+    /not approved/u,
+  );
+});
+
+// A `]` inside a string must not end an attribute early, or the rest of it --
+// including an allowance -- would be read as ordinary code.
+test('attribute scanning survives brackets inside string literals', () => {
+  const [attribute] = attributesIn('#[doc = "a ] bracket"]\nfn f() {}');
+  assert.equal(attribute.text, '#[doc = "a ] bracket"]');
+  assert.equal(
+    unsafeOffendersIn('crates/adapters/storage/src/lib.rs', '#[doc = "]"]\n#[allow(unsafe_code)]\nfn f() {}').length,
+    1,
+  );
 });

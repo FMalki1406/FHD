@@ -1522,6 +1522,150 @@ mod tests {
             .expect("sound bytes publish again once a name is free");
         assert_eq!(fs::read(&elsewhere).unwrap(), b"abcdef");
     }
+    /// R1 from the review of 2026-09-24, by its name there.
+    ///
+    /// A part publishes, then a later publication to a *different* destination
+    /// fails at the link. The failure path used to lift the permanent seal,
+    /// without anything showing the first object was never delivered. Reopening
+    /// then made the very file the user received writable again.
+    ///
+    /// This is the storage handle's lifecycle, not a claim that the client asks
+    /// twice today, and not an attack from another account. What it measures is
+    /// whether a later failure can erase the evidence of an earlier delivery.
+    #[test]
+    fn review_second_publish_failure_must_not_unseal_delivered_file() {
+        /// Links by name until it is switched off, then fails at the link --
+        /// which is the branch that used to lift the seal.
+        struct FailAfterFirst {
+            source: PathBuf,
+            folder: PathBuf,
+            failing: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl HandleLinker for FailAfterFirst {
+            fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
+                if self.failing.load(Ordering::SeqCst) {
+                    return Err(StorageError::Io(std::io::ErrorKind::StorageFull));
+                }
+                fs::hard_link(&self.source, self.folder.join(name))
+                    .map_err(|error| StorageError::Io(error.kind()))
+            }
+            fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
+                Err(StorageError::Unsupported)
+            }
+        }
+
+        let directory = Directory::new();
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = FileStorage::default().with_linker(Arc::new(FailAfterFirst {
+            source: directory.part().join("1-1.part"),
+            folder: directory.0.clone(),
+            failing: failing.clone(),
+        }));
+        let mut part = store.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        publish_to(part.as_mut(), &directory.output()).expect("the first publication succeeds");
+
+        // A second destination, free, whose *link* fails. The review said why
+        // this matters: an occupied destination is refused by the absence check
+        // before the linker is ever called, so a test built on one never
+        // reaches the branch that lifts the seal. Written that way first, it
+        // passed with the guard removed -- proving nothing.
+        let free = directory.output().with_file_name("second.bin");
+        failing.store(true, Ordering::SeqCst);
+        assert!(
+            publish_to(part.as_mut(), &free).is_err(),
+            "a part that has delivered its bytes published again"
+        );
+        drop(part);
+
+        // The seal is the evidence. It must survive the second failure.
+        assert_eq!(
+            fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+            Some(&1u8),
+            "a later failure lifted the seal on a delivered object"
+        );
+        let mut reopened = publishing_store(&directory.part())
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        assert_eq!(
+            reopened.write_at(0, b"MUTATE"),
+            Err(StorageError::InvalidState),
+            "the delivered file was reopened writable"
+        );
+        assert_eq!(fs::read(directory.output()).unwrap(), b"AAAAAA");
+    }
+
+    /// R2 from the same review, by its name there.
+    ///
+    /// The crash window: the link succeeded and nothing recorded it. The part
+    /// object is dropped without cleanup, the published name is moved away so
+    /// reconciliation by path finds nothing, and the part is reopened and
+    /// retried. The retry fails -- and that failure must not be read as proof
+    /// that nothing was ever delivered.
+    ///
+    /// The in-memory `published` flag cannot carry this: it does not survive
+    /// the process. The seal on disk does, and it is what the decision rests on.
+    ///
+    /// **Two guards hold this, and either alone is enough**: publication
+    /// refuses when the part arrived sealed, and `unseal` refuses to lift a
+    /// seal this handle did not set. Mutation testing says so plainly -- remove
+    /// either and this still passes; remove both and it fails with "the
+    /// retry's failure lifted the seal on a delivered object". That redundancy
+    /// is deliberate for a property whose cost is a file the user already has,
+    /// and it is recorded here so nobody reads the surviving mutant as a test
+    /// that does not constrain anything.
+    #[test]
+    fn review_reopened_published_part_must_not_become_writable_on_link_failure() {
+        let directory = Directory::new();
+        let mut part = publishing_store(&directory.part())
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        publish_to(part.as_mut(), &directory.output()).expect("the first publication succeeds");
+        // The crash: everything in memory is gone, nothing was recorded.
+        drop(part);
+
+        // The delivered file moves, so nothing is at the path any more.
+        let elsewhere = directory.output().with_file_name("delivered.bin");
+        fs::rename(directory.output(), &elsewhere).unwrap();
+
+        let mut again = FileStorage::default()
+            .with_linker(std::sync::Arc::new(NoMechanism))
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        for (range, digest) in &record {
+            again.recover_extent(*range, *digest).unwrap();
+        }
+        again.sync().unwrap();
+        again.verify(None, &record).unwrap();
+        assert!(
+            publish_to(again.as_mut(), &directory.output()).is_err(),
+            "a part sealed on disk published again after the crash"
+        );
+        drop(again);
+
+        assert_eq!(
+            fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+            Some(&1u8),
+            "the retry's failure lifted the seal on a delivered object"
+        );
+        let mut third = publishing_store(&directory.part())
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        assert_eq!(
+            third.write_at(0, b"MUTATE"),
+            Err(StorageError::InvalidState),
+            "delivered file reopened writable"
+        );
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"AAAAAA");
+    }
+
     #[test]
     fn empty_file_is_a_valid_complete_transfer_without_nonempty_extents() {
         let directory = Directory::new();

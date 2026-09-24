@@ -103,9 +103,32 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     )
     .await
     .unwrap();
-    let Response::Accepted { job } = accepted else {
+    let Response::Accepted { job, warnings } = accepted else {
         panic!("the engine refused the request: {accepted:?}");
     };
+
+    // R4 from the review of 2026-09-24: the shared-destination warning existed
+    // only on the path that reads requests from stdin, so a download added
+    // through the service was never warned about. It travels on the response
+    // now, and this is the assertion that it reaches a client at all.
+    //
+    // Which way it goes depends on the folder the test runs in, and both
+    // answers are legitimate -- what is not legitimate is a field nobody fills.
+    // So the codes are checked for shape, and the decision is compared against
+    // the one the direct path would make for the same folder, which is what
+    //  is.
+    let folder = destination.parent().expect("the destination has a folder");
+    assert_eq!(
+        warnings,
+        fhd_daemon::shared_destination_warnings(folder),
+        "the service reached a different verdict than the direct path"
+    );
+    for warning in &warnings {
+        assert_eq!(
+            *warning, "DESTINATION-SHARED",
+            "an unknown warning code reached the client"
+        );
+    }
 
     // The job is real work, so it takes a moment; the socket stays answerable.
     let deadline = std::time::Instant::now() + Duration::from_secs(120);

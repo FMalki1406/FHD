@@ -239,7 +239,17 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
         Err(error) => fail(error.code()),
     };
     match fhd_ipc::ask(&mut connection, 1, &request).await {
-        Ok(Response::Accepted { job }) => {
+        Ok(Response::Accepted { job, warnings }) => {
+            for warning in &warnings {
+                // The service decided this; the client says it, so adding a
+                // download through the service warns like adding one directly.
+                eprintln!("{warning}");
+                if warning == "DESTINATION-SHARED" {
+                    eprintln!(
+                        "  other accounts on this machine can change files in this folder. \n                         the download is protected while it runs; the finished file is not."
+                    );
+                }
+            }
             println!("accepted {job}");
             std::process::exit(0)
         }
@@ -533,13 +543,8 @@ fn warn_about_shared_destinations(requests: &[fhd_daemon::Request]) {
         if told.iter().any(|seen| seen == folder) {
             continue;
         }
-        let Ok(swappable) = fhd_platform::swappable_components(folder) else {
-            continue;
-        };
-        let exposed = fhd_platform::foreign_writers(folder)
-            .map(|writers| !writers.is_empty())
-            .unwrap_or(false);
-        if swappable.is_empty() && !exposed {
+        // The same decision the service path uses, so the two cannot drift.
+        if fhd_daemon::shared_destination_warnings(folder).is_empty() {
             continue;
         }
         told.push(folder.to_path_buf());

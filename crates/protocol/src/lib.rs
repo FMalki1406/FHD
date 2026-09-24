@@ -118,6 +118,15 @@ impl std::fmt::Debug for Request {
 pub enum Response {
     Accepted {
         job: u64,
+        /// Stable codes for conditions the operator should know about -- a
+        /// destination folder other accounts can write, for one. Codes, never
+        /// text built from a request, for the reason `Failed` gives.
+        ///
+        /// It reaches the client because a warning only the process that
+        /// happens to read stdin can see is a warning the service path does not
+        /// have. That was R4 in the review of 2026-09-24.
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     Jobs {
         jobs: Vec<JobSummary>,
@@ -194,7 +203,7 @@ impl Checked for Request {
 impl Checked for Response {
     fn check(&self) -> Result<(), ProtocolError> {
         match self {
-            Self::Accepted { job } if *job == 0 => Err(ProtocolError::Invalid),
+            Self::Accepted { job, .. } if *job == 0 => Err(ProtocolError::Invalid),
             Self::Jobs { jobs, .. } if jobs.len() > MAX_JOBS_PER_PAGE => {
                 Err(ProtocolError::Invalid)
             }
@@ -369,7 +378,10 @@ mod tests {
     #[test]
     fn every_response_survives_the_wire_unchanged() {
         for response in [
-            Response::Accepted { job: 9 },
+            Response::Accepted {
+                job: 9,
+                warnings: Vec::new(),
+            },
             Response::Jobs {
                 jobs: vec![JobSummary {
                     job: 4,
