@@ -1,7 +1,7 @@
-//! Operating-system primitives the rest of the engine cannot express safely.
+﻿//! Operating-system primitives the rest of the engine cannot express safely.
 //!
-//! This is the one crate §4 allows `unsafe`, and it exists for a single reason:
-//! §3.1's control surface needs a Windows named pipe that carries the user's SID
+//! This is the one crate Â§4 allows `unsafe`, and it exists for a single reason:
+//! Â§3.1's control surface needs a Windows named pipe that carries the user's SID
 //! and session in its name, is created with a security descriptor only that user
 //! can reach, and can be checked by the client for who owns it before it sends a
 //! byte. None of that is expressible without calling Win32 directly.
@@ -29,7 +29,7 @@ pub struct UserScope {
 }
 impl UserScope {
     /// A short, stable component for an endpoint name: it identifies the account
-    /// and session without being a secret, which is exactly §3.1's requirement.
+    /// and session without being a secret, which is exactly Â§3.1's requirement.
     pub fn tag(&self) -> String {
         format!("{}-{}", self.identity, self.session)
     }
@@ -388,7 +388,7 @@ mod imp {
 
     /// Only the owning user and the system may touch this pipe, and nothing
     /// below medium integrity may open it at all -- which is what keeps a
-    /// sandboxed process of the same account out (§3.1, §16.1).
+    /// sandboxed process of the same account out (Â§3.1, Â§16.1).
     fn owner_only_descriptor(sid: &str) -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
         // O: the owner, stated rather than left to the token's default. An
         // elevated process on Windows stamps objects with the Administrators
@@ -1283,7 +1283,7 @@ mod imp {
     /// mandatory label no sandboxed process of the same account could have
     /// applied. A client that skipped this would hand its request -- and any
     /// credential in it -- to whoever took the name first, which is the attack
-    /// §3.1 names. Must be called inside a Tokio runtime with the I/O driver.
+    /// Â§3.1 names. Must be called inside a Tokio runtime with the I/O driver.
     pub fn open_pipe(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
         use windows_sys::Win32::{
             Security::{Authorization::GetSecurityInfo, Authorization::SE_KERNEL_OBJECT, PSID},

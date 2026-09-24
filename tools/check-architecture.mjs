@@ -48,22 +48,35 @@ const pureDependencies = new Set(['serde', 'thiserror']);
 // The workflow names the packages it tests, one step per area, so a failure on a
 // runner whose logs we cannot read still says where it is. The cost of naming
 // them is that a new member could ship untested; this is that cost paid.
-// Every place in the tree allowed to write `unsafe`, and nowhere else.
+// Every place in the tree allowed to write `unsafe`: which file, and which item.
 //
 // The policy used to be a comment beside the dependency rules, which is close
-// to not having one: a crate could add `#![allow(unsafe_code)]` and nothing
-// would say so. An exception that can be granted where it is used is not a
-// policy, it is a preference.
+// to not having one. Counting the attributes was the next version and was still
+// too weak: moving an allowance to another item, or widening it from a function
+// to the module around it, keeps the count identical. So an approved allowance
+// names the item it sits on, and an inner `#![allow(unsafe_code)]` -- which
+// covers everything below it -- is never approved.
 //
-// Each entry is a file and the exact number of `#[allow(unsafe_code)]`
-// attributes approved in it. A new one, or one in a file not listed, fails the
-// build -- so widening this is an edit to this file, which is reviewed, rather
-// than an attribute added in passing. `forbid` is still the rule everywhere
-// else; this is only for the crates that cannot use it.
+// Widening this is an edit to this file, which is reviewed. It is a gate, not
+// the review: an approved entry still needs somebody to have agreed that the
+// call in it is sound.
 export const UNSAFE_ALLOWANCES = new Map([
-  // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
-  ['crates/adapters/platform/src/lib.rs', 1],
+  ['crates/adapters/platform/src/lib.rs', [
+    // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
+    'fn our_uid() -> u32 {',
+  ]],
 ]);
+
+// The item an attribute sits on: the next line that is not blank, a comment, or
+// another attribute.
+function itemBelow(lines, from) {
+  for (let index = from + 1; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line || line.startsWith('//') || line.startsWith('#[') || line.startsWith('#![')) continue;
+    return line;
+  }
+  return '<end of file>';
+}
 
 export function checkUnsafePolicy(root) {
   const offenders = [];
@@ -73,14 +86,35 @@ export function checkUnsafePolicy(root) {
       const full = `${directory}/${entry}`;
       if (statSync(full).isDirectory()) { walk(full); continue; }
       if (!entry.endsWith('.rs')) continue;
-      const relative = full.slice(root.length + 1).split('\\').join('/');
-      const source = readFileSync(full, 'utf8');
-      const allowances = (source.match(/#!?\[allow\(unsafe_code\)\]/gu) ?? []).length;
-      const approved = UNSAFE_ALLOWANCES.get(relative) ?? 0;
-      if (allowances > approved) {
+      const relative = full.slice(root.length + 1).replaceAll('\\', '/');
+      const approved = UNSAFE_ALLOWANCES.get(relative) ?? [];
+      const remaining = [...approved];
+      const lines = readFileSync(full, 'utf8').split(/\r?\n/u);
+      lines.forEach((line, index) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('#![allow(unsafe_code)]')) {
+          offenders.push(
+            `${relative}:${index + 1}: a crate- or module-wide unsafe allowance is never approved. ` +
+            'Attach it to the one item that needs it.',
+          );
+          return;
+        }
+        if (!trimmed.startsWith('#[allow(unsafe_code)]')) return;
+        const item = itemBelow(lines, index);
+        const at = remaining.indexOf(item);
+        if (at === -1) {
+          offenders.push(
+            `${relative}:${index + 1}: unsafe allowed on an item that is not approved: ${item}. ` +
+            'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
+          );
+          return;
+        }
+        remaining.splice(at, 1);
+      });
+      for (const unused of remaining) {
         offenders.push(
-          `${relative}: ${allowances} unsafe allowance(s), ${approved} approved. ` +
-          'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
+          `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
+          'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
         );
       }
     }
