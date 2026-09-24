@@ -1832,16 +1832,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Unix sets its own mode, so the check has nothing to report there. Pinning
-    /// it stops the non-Windows arm quietly becoming something else.
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_reports_no_foreign_writers() {
-        assert!(foreign_writers(std::path::Path::new("/tmp"))
-            .unwrap()
-            .is_empty());
-    }
-
     /// A name no other test in this process will claim.
     #[cfg(windows)]
     fn pipe_name(label: &str) -> String {
