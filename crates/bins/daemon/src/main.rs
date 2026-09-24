@@ -392,7 +392,7 @@ async fn main() {
         }
     }
     match engine.run(receiver).await {
-        Ok(SessionEnd::Published(path)) => println!("published {}", path.display()),
+        Ok(SessionEnd::Published(outcome)) => println!("published {outcome}"),
         Ok(SessionEnd::Settled(state)) => {
             println!("stopped in {state:?}");
             std::process::exit(if state == fhd_domain::JobState::Completed {
@@ -487,7 +487,7 @@ fn report(outcomes: Vec<(usize, JobOutcome)>) -> i32 {
     let mut failed = false;
     for (index, outcome) in outcomes {
         match outcome {
-            JobOutcome::Published(path) => println!("{index} published {}", path.display()),
+            JobOutcome::Published(outcome) => println!("{index} published {outcome}"),
             JobOutcome::Settled(state, reason) => {
                 failed |= state != fhd_domain::JobState::Completed;
                 match reason {

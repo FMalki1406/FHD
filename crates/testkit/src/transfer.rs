@@ -1,7 +1,7 @@
 //! In-memory transfer ports with the same acceptance rules as the real adapters,
 //! plus fault injection. Deterministic and test-only.
 use fhd_app::{
-    storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
+    storage::{Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError},
     transport::{ByteStream, OriginId, Probe, Transport, TransportError},
     AppError, CommitError, Destinations, DurableExtent, PortFuture, PublishIntent,
     TransferRepository,
@@ -273,12 +273,17 @@ struct FileData {
     durable: Vec<u8>,
 }
 type Files = HashMap<(JobId, Generation), Arc<Mutex<FileData>>>;
-type Published = HashMap<PathBuf, Vec<u8>>;
+/// What the double has published so far, by path.
+///
+/// Renamed from `Published` when the port grew a `Published` outcome: two
+/// different meanings under one name in one file is how a reader ends up
+/// believing the double models something it does not.
+type PublishedFiles = HashMap<PathBuf, Vec<u8>>;
 /// Files outlive handles, like a disk across process restarts.
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     files: Arc<Mutex<Files>>,
-    published: Arc<Mutex<Published>>,
+    published: Arc<Mutex<PublishedFiles>>,
     blocked: Arc<Mutex<Vec<PathBuf>>>,
     faults: Arc<Mutex<StoreFaults>>,
 }
@@ -335,6 +340,7 @@ impl MemoryStore {
             blocked: self.blocked.clone(),
             files: self.files.clone(),
             published_once: false,
+            destination: None,
             abandoned: false,
             discarded: false,
         })
@@ -403,10 +409,12 @@ struct MemoryFile {
     synced: bool,
     verified: bool,
     faults: Arc<Mutex<StoreFaults>>,
-    published: Arc<Mutex<Published>>,
+    published: Arc<Mutex<PublishedFiles>>,
     blocked: Arc<Mutex<Vec<PathBuf>>>,
     files: Arc<Mutex<Files>>,
     published_once: bool,
+    /// The destination adopted for this transfer; `None` until adoption.
+    destination: Option<PathBuf>,
     abandoned: bool,
     discarded: bool,
 }
@@ -524,31 +532,33 @@ impl SegmentFile for MemoryFile {
     fn abandon(&mut self) {
         self.abandoned = true;
     }
+    /// Records the destination, as the real adapter does when the session opens
+    /// the part. This double keeps a path because it has no filesystem to hold
+    /// an object in; what it can still carry is the *ordering* -- that nothing
+    /// publishes without having adopted first.
+    fn adopt_destination(&mut self, destination: &Path) -> Result<(), StorageError> {
+        self.destination = Some(destination.to_path_buf());
+        Ok(())
+    }
     /// Atomic no-replace: an occupied destination is a conflict, never an overwrite.
-    /// Like the real adapter, only a verified, synced, complete file may be published.
-    fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError> {
+    /// Like the real adapter, only a verified, synced, complete file that has
+    /// adopted a destination may be published.
+    fn publish(&mut self) -> Result<Published, StorageError> {
         self.usable()?;
         if !self.complete() || !self.synced || !self.verified {
             return Err(StorageError::InvalidState);
         }
-        if self
-            .blocked
-            .lock()
-            .unwrap()
-            .contains(&destination.to_path_buf())
-        {
+        let destination = self.destination.clone().ok_or(StorageError::InvalidState)?;
+        if self.blocked.lock().unwrap().contains(&destination) {
             return Err(StorageError::Conflict);
         }
         let mut published = self.published.lock().unwrap();
-        if published.contains_key(destination) {
+        if published.contains_key(&destination) {
             return Err(StorageError::Conflict);
         }
-        published.insert(
-            destination.to_path_buf(),
-            self.data.lock().unwrap().live.clone(),
-        );
+        published.insert(destination.clone(), self.data.lock().unwrap().live.clone());
         self.published_once = true;
-        Ok(destination.to_path_buf())
+        Ok(Published::At(destination))
     }
 }
 

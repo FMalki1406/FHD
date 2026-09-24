@@ -1,4 +1,6 @@
-use fhd_app::{transport::TransportError, CommitError, DurableExtent, TransferRepository};
+use fhd_app::{
+    storage::Published, transport::TransportError, CommitError, DurableExtent, TransferRepository,
+};
 use fhd_domain::{
     DestinationRef, Job, JobCommand, JobId, JobSpec, JobState, Priority, RetryPolicy, SourceRef,
     StopReason,
@@ -139,7 +141,9 @@ async fn parallel_transfer_writes_exact_bytes_and_verifies() {
     let rig = rig(&content, true, None);
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     let job = rig.job().await;
     assert_eq!(job.state(), JobState::Completed);
@@ -167,7 +171,9 @@ async fn server_without_ranges_uses_one_connection() {
     let rig = rig(&content, false, None);
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.transport.fetches(), 1);
 }
@@ -195,7 +201,9 @@ async fn transient_failure_waits_then_resumes_keeping_durable_bytes() {
     let before = rig.transport.fetches();
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
     // Only the missing ranges are fetched again.
@@ -222,7 +230,9 @@ async fn pause_mid_transfer_persists_progress_and_resume_completes() {
     rig.command(JobCommand::Resume).await;
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
 }
 
@@ -251,7 +261,9 @@ async fn representation_change_restarts_under_a_new_generation() {
     assert_eq!(rig.durable().await, 0, "old generation extents are gone");
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
 }
 
@@ -357,7 +369,9 @@ async fn unavailable_extent_commit_is_retried_idempotently() {
     assert_eq!(rig.repo.state(rig.id), Some(JobState::Queued));
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
 }
 
@@ -377,7 +391,9 @@ async fn odd_split_never_exceeds_the_segment_budget() {
     );
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert!(rig.job().await.segments().unwrap().segments().len() <= 4);
 }
@@ -420,7 +436,9 @@ async fn power_loss_keeps_only_synced_bytes_and_resume_is_exact() {
     rig.command(JobCommand::Resume).await;
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
 }
@@ -467,7 +485,9 @@ async fn same_size_replacement_never_mixes_representations() {
     assert_eq!(rig.durable().await, 0);
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.store.published(&rig.destination).unwrap(), new);
 }
@@ -495,7 +515,9 @@ async fn server_without_validator_restarts_from_zero_on_resume() {
     assert_eq!(rig.job().await.generation().get(), 2);
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
 }
 
@@ -507,7 +529,9 @@ async fn crash_between_rename_and_commit_completes_without_republishing() {
     rig.store.place(rig.destination.clone(), content.clone());
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.job().await.state(), JobState::Completed);
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
@@ -549,7 +573,9 @@ async fn crash_before_the_rename_republishes_after_reproving_the_bytes() {
     let fetches = rig.transport.fetches();
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.job().await.state(), JobState::Completed);
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
@@ -585,7 +611,9 @@ async fn a_resumed_session_with_nothing_left_to_fetch_still_verifies() {
     // This session writes nothing, so only an explicit sync makes verification legal.
     assert_eq!(
         rig.run().await,
-        Ok(SessionEnd::Published(rig.destination.clone()))
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
     );
     assert_eq!(rig.transport.fetches(), fetches);
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);

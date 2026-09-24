@@ -27,7 +27,7 @@ enum Command {
         Vec<(ByteRange, [u8; 32])>,
         Reply<[u8; 32]>,
     ),
-    Publish(std::path::PathBuf, Reply<std::path::PathBuf>),
+    Publish(Reply<fhd_app::storage::Published>),
     Discard {
         abandon: bool,
         reply: Reply<()>,
@@ -136,10 +136,10 @@ impl Writer {
                             let _ = reply.send(result);
                         }
                         // A destination conflict is a verdict, not a broken lane.
-                        Command::Publish(destination, reply) => {
+                        Command::Publish(reply) => {
                             let result = match failure {
                                 Some(error) => Err(error),
-                                None => file.publish(&destination).map_err(WriterError::Storage),
+                                None => file.publish().map_err(WriterError::Storage),
                             };
                             if let Err(error) = result.as_ref() {
                                 if *error != WriterError::Storage(StorageError::Conflict) {
@@ -248,14 +248,17 @@ impl Writer {
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }
     /// Atomic no-replace publication, after every write and the verification.
+    ///
+    /// No destination is passed. The folder was adopted before this writer
+    /// existed -- by the session that opened the part -- so there is no command
+    /// on this lane that can introduce one, and nothing can be published
+    /// anywhere the session did not fix in advance.
     pub async fn publish(
         &self,
-        destination: std::path::PathBuf,
         cancel: &CancellationToken,
-    ) -> Result<std::path::PathBuf, WriterError> {
+    ) -> Result<fhd_app::storage::Published, WriterError> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::Publish(destination, reply), cancel)
-            .await?;
+        self.send(Command::Publish(reply), cancel).await?;
         result.await.map_err(|_| WriterError::WorkerFailed)?
     }
     /// Removes the part file: after publication, or with `abandon` for a cancelled job.

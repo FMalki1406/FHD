@@ -8,7 +8,7 @@ use fhd_runtime::{
 use std::{
     future::{poll_fn, Future},
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::Poll,
@@ -114,7 +114,10 @@ impl SegmentFile for FakeFile {
     ) -> Result<[u8; 32], StorageError> {
         Err(StorageError::Unsupported)
     }
-    fn publish(&mut self, _: &Path) -> Result<PathBuf, StorageError> {
+    fn adopt_destination(&mut self, _: &Path) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn publish(&mut self) -> Result<fhd_app::storage::Published, StorageError> {
         Err(StorageError::Unsupported)
     }
     fn discard(&mut self) -> Result<(), StorageError> {

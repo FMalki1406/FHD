@@ -84,6 +84,49 @@ pub enum Occupant {
     NotAFile,
 }
 
+/// What publication achieved, with the object kept separate from the path.
+///
+/// Publishing into the adopted folder and being able to say where that folder
+/// is are two different claims, and collapsing them is how an operator gets
+/// told a file sits at a path that leads nowhere. If the folder is renamed
+/// during the transfer the file is still exactly where the contract requires
+/// -- inside the object that was adopted -- and the path the operator typed no
+/// longer reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Published {
+    /// In the adopted folder, and this path reaches it. The ordinary answer.
+    At(PathBuf),
+    /// In the adopted folder, under `name`, but the path the operator gave no
+    /// longer reaches it: the folder was renamed or moved after adoption.
+    ///
+    /// **Nothing is republished and nothing is removed.** Publishing again
+    /// would put a second copy somewhere, and deleting would act on a file this
+    /// engine cannot prove is its own. The job is complete and needs the
+    /// operator, which is what this state says.
+    Moved {
+        /// The path that was asked for, which no longer leads to the file.
+        requested: PathBuf,
+        /// The file's name inside the adopted folder.
+        name: std::ffi::OsString,
+    },
+}
+
+impl std::fmt::Display for Published {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::At(path) => write!(f, "{}", path.display()),
+            // Never just the requested path: that is the sentence that tells an
+            // operator to look somewhere the file is not.
+            Self::Moved { requested, name } => write!(
+                f,
+                "{} as {} -- in the folder you chose, which was renamed during the transfer",
+                requested.display(),
+                name.to_string_lossy()
+            ),
+        }
+    }
+}
+
 /// Creates a second name for the file a handle already holds, inside a
 /// directory another handle already holds.
 ///
@@ -110,6 +153,23 @@ pub trait HandleLinker: Send + Sync {
         directory: &std::fs::File,
         name: &std::ffi::OsStr,
     ) -> Result<(), StorageError>;
+
+    /// Whether two open handles are the same file.
+    ///
+    /// It sits beside `link` for the same reason `link` is a port at all: the
+    /// answer needs the platform, and the storage adapter may not depend on it.
+    /// Windows exposes it only through `windows_by_handle`, which is unstable,
+    /// so the adapter cannot ask the question itself even in safe code.
+    ///
+    /// Publication uses it once, afterwards, to decide whether the path the
+    /// operator gave still reaches what was published. **An error or a `false`
+    /// must never become a claim that it does** -- not knowing is reported as
+    /// not knowing, and the file stays where it is either way.
+    fn same_object(
+        &self,
+        left: &std::fs::File,
+        right: &std::fs::File,
+    ) -> Result<bool, StorageError>;
 }
 
 pub trait SegmentStore: Send + Sync {
@@ -172,9 +232,25 @@ pub trait SegmentFile: Send {
         expected: Option<[u8; 32]>,
         record: &[(ByteRange, [u8; 32])],
     ) -> Result<[u8; 32], StorageError>;
-    /// Requires a synchronized, verified file and a durable PublishIntent in the
-    /// repository. Atomic no-replace is mandatory; unsupported filesystems fail.
-    fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError>;
+    /// Adopts the folder the operator named, as an object rather than a path.
+    ///
+    /// **This is the moment the destination's identity is decided**, and it is
+    /// the only place a destination enters: `publish` takes none, so nothing can
+    /// be published into a folder that was never adopted.
+    ///
+    /// Adoption is called when the session opens the part, before the first
+    /// byte, so everything that happens to the folder for the rest of the
+    /// transfer is defeated. **What it cannot do** is tell which directory the
+    /// operator meant before that moment: they named a path, and a path is all
+    /// the engine was given. A folder swapped before adoption is adopted, and
+    /// the engine cannot see the difference -- so the window is not closed, it
+    /// is moved to before the transfer starts and stated here rather than
+    /// implied by the mechanism.
+    fn adopt_destination(&mut self, destination: &Path) -> Result<(), StorageError>;
+    /// Requires a synchronized, verified file, an adopted destination, and a
+    /// durable PublishIntent in the repository. Atomic no-replace is mandatory;
+    /// unsupported filesystems fail.
+    fn publish(&mut self) -> Result<Published, StorageError>;
     /// Removes this generation's part file. Legitimate only after publication (the
     /// published name holds the bytes) or after `abandon`. The handle is unusable
     /// afterwards, so the caller drops it.

@@ -2,7 +2,7 @@
 //! real part files. No fakes anywhere in this path.
 mod harness;
 
-use fhd_app::AppError;
+use fhd_app::{storage::Published, AppError};
 use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request};
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
@@ -45,7 +45,7 @@ async fn downloads_verifies_and_publishes_over_real_adapters() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone())
+        SessionEnd::Published(Published::At(destination.clone()))
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(engine.state().await.unwrap(), JobState::Completed);
@@ -128,7 +128,7 @@ async fn a_dropped_connection_resumes_from_committed_bytes() {
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    assert_eq!(published, Some(destination.clone()));
+    assert_eq!(published, Some(Published::At(destination.clone())));
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }
 
@@ -191,7 +191,7 @@ async fn an_occupied_destination_is_never_overwritten() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone())
+        SessionEnd::Published(Published::At(destination.clone()))
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }
@@ -218,7 +218,7 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
     let (outcome, ()) = tokio::join!(run, pause);
     // Pausing may lose a race with completion; both outcomes are legitimate.
     match outcome.unwrap() {
-        SessionEnd::Published(path) => assert_eq!(path, destination),
+        SessionEnd::Published(outcome) => assert_eq!(outcome, Published::At(destination.clone())),
         SessionEnd::Settled(state) => assert_eq!(state, JobState::Paused),
     }
     drop(engine);
@@ -237,7 +237,7 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
         let outcome = engine.run(receiver).await.unwrap();
         assert_eq!(
             outcome,
-            SessionEnd::Published(destination.clone()),
+            SessionEnd::Published(Published::At(destination.clone())),
             "reason: {:?}",
             engine.reason().await.unwrap()
         );
@@ -273,7 +273,7 @@ async fn a_destination_away_from_the_state_directory_downloads_and_publishes() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone()),
+        SessionEnd::Published(Published::At(destination.clone())),
         "reason: {:?}",
         engine.reason().await.unwrap()
     );
@@ -337,7 +337,9 @@ async fn a_destination_on_a_second_volume_downloads_and_publishes() {
     // Compared after resolving, because the engine reports the path it opened
     // and Windows spells that one `\?\D:\...` where the caller wrote `D:\...`.
     let published = match &outcome {
-        SessionEnd::Published(path) => path.clone(),
+        // The path only exists on `At`; a `Moved` result here would mean the
+        // download folder was renamed mid-test, which it is not.
+        SessionEnd::Published(Published::At(path)) => path.clone(),
         other => panic!(
             "not published: {other:?}, reason: {:?}",
             engine.reason().await.unwrap()
@@ -397,7 +399,7 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone())
+        SessionEnd::Published(Published::At(destination.clone()))
     );
     drop(engine);
 
@@ -409,7 +411,7 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(destination.clone())
+        SessionEnd::Published(Published::At(destination.clone()))
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(part_bytes(&state), 0, "reconciled publish left a part");
@@ -449,7 +451,13 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
     assert_eq!(outcomes.len(), 2);
     for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
         match outcome {
-            JobOutcome::Published(path) => assert_eq!(path, request.destination, "job {index}"),
+            JobOutcome::Published(outcome) => {
+                assert_eq!(
+                    outcome,
+                    Published::At(request.destination.clone()),
+                    "job {index}"
+                )
+            }
             JobOutcome::Settled(state, reason) => {
                 panic!("job {index} stopped in {state:?} because {reason:?}")
             }
@@ -493,7 +501,7 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     let outcomes = engine.run_all(commands).await.unwrap();
     assert_eq!(outcomes.len(), 1);
     match &outcomes[0].1 {
-        JobOutcome::Published(path) => assert_eq!(path, &destination),
+        JobOutcome::Published(outcome) => assert_eq!(outcome, &Published::At(destination.clone())),
         // Already finished before the pause landed: the remembered job was still
         // found and settled, which is what continuing has to prove.
         JobOutcome::Settled(JobState::Completed, _) => {}
@@ -788,7 +796,7 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
     let (_control, receiver) = mpsc::channel(1);
     assert_eq!(
         other.run(receiver).await.unwrap(),
-        SessionEnd::Published(second_destination.clone()),
+        SessionEnd::Published(Published::At(second_destination.clone())),
         "reason: {:?}",
         other.reason().await.unwrap()
     );
@@ -808,7 +816,7 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
         let outcome = resumed.run(receiver).await.unwrap();
         assert_eq!(
             outcome,
-            SessionEnd::Published(first_destination.clone()),
+            SessionEnd::Published(Published::At(first_destination.clone())),
             "reason: {:?}",
             resumed.reason().await.unwrap()
         );

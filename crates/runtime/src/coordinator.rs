@@ -8,7 +8,7 @@ use crate::{
     CancellationToken,
 };
 use fhd_app::{
-    storage::{Occupant, PartSpec, SegmentFile, SegmentStore, StorageError},
+    storage::{Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError},
     transport::{OriginId, Transport, TransportError},
     CommitError, Destinations, DurableExtent, PortFuture, PublishIntent, TransferRepository,
 };
@@ -72,8 +72,12 @@ pub enum Control {
 pub enum SessionEnd {
     /// The job rests in this state; the scheduler decides what happens next.
     Settled(JobState),
-    /// Verified and published at this path; the job is Completed.
-    Published(PathBuf),
+    /// Verified and published into the adopted folder; the job is Completed.
+    ///
+    /// Carries `Published` rather than a path, because "the file is in the
+    /// folder you chose" and "this path reaches it" are different claims and
+    /// the operator needs to be told which one holds.
+    Published(fhd_app::storage::Published),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,18 +433,34 @@ impl Session<'_> {
             .c
             .part_directory(&self.job)
             .map_err(RunError::Storage)?;
+        // The moment the destination folder's identity is decided, and the
+        // earliest the engine can decide it: the session is opening and not one
+        // byte has been written. Everything done to that folder from here on is
+        // defeated, because publication names the object, not the path. What
+        // happened to it *before* now is not something the engine can see -- the
+        // operator gave a path, and resolving a path is all anyone can do with
+        // it. The window is moved to before the transfer, not closed.
+        let destination = self
+            .c
+            .ports
+            .destinations
+            .resolve(self.job.spec().destination())
+            .map_err(|_| RunError::Repository)?;
         let opened =
             tokio::task::spawn_blocking(move || -> Result<Box<dyn SegmentFile>, StorageError> {
-                if extents.is_empty() {
-                    return match store.create(&directory, spec) {
+                let mut file = if extents.is_empty() {
+                    match store.create(&directory, spec) {
                         Err(StorageError::Conflict) => store.open(&directory, spec),
                         other => other,
-                    };
-                }
-                let mut file = store.open(&directory, spec)?;
-                for extent in extents {
-                    file.recover_extent(extent.range(), extent.digest())?;
-                }
+                    }?
+                } else {
+                    let mut file = store.open(&directory, spec)?;
+                    for extent in extents {
+                        file.recover_extent(extent.range(), extent.digest())?;
+                    }
+                    file
+                };
+                file.adopt_destination(&destination)?;
                 Ok(file)
             })
             .await
@@ -941,7 +961,7 @@ impl Session<'_> {
                 // This handle never published, but the bytes are at the destination.
                 self.release_part(true).await;
                 report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
-                return Ok(SessionEnd::Published(destination));
+                return Ok(SessionEnd::Published(Published::At(destination)));
             }
             Some(_) => return self.publish_blocked(StopReason::Destination).await,
             None => {}
@@ -978,12 +998,12 @@ impl Session<'_> {
                 Err(_) => return self.publish_blocked(StopReason::Storage).await,
             }
         }
-        match writer.publish(destination.clone(), &self.io).await {
-            Ok(path) => {
+        match writer.publish(&self.io).await {
+            Ok(outcome) => {
                 self.step(JobCommand::PublishCommitted).await?;
                 self.release_part(false).await;
                 report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
-                Ok(SessionEnd::Published(path))
+                Ok(SessionEnd::Published(outcome))
             }
             // Lost a race for the name, or an unrelated file appeared meanwhile.
             Err(WriterError::Storage(StorageError::Conflict)) => {

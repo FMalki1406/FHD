@@ -1,6 +1,8 @@
 //! Single-owner positional storage. Blocking methods belong on the writer thread.
 #![forbid(unsafe_code)]
-use fhd_app::storage::{HandleLinker, Occupant, PartSpec, SegmentFile, SegmentStore, StorageError};
+use fhd_app::storage::{
+    HandleLinker, Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError,
+};
 use fhd_domain::ByteRange;
 use sha2::{Digest, Sha256};
 use std::{
@@ -158,6 +160,18 @@ fn open_directory(path: &Path) -> Result<File, StorageError> {
         File::open(path).map_err(io)
     }
 }
+/// The destination as an object plus the name the operator gave for it.
+///
+/// `folder` is the authority; `requested` is only what to show and what to
+/// compare against afterwards. Keeping both, and never deriving one from the
+/// other at publication time, is what lets the engine say "published, but not
+/// where you asked" instead of reporting a path that leads nowhere.
+struct Destination {
+    folder: File,
+    leaf: std::ffi::OsString,
+    requested: PathBuf,
+}
+
 fn identity(spec: PartSpec, sealed: bool) -> [u8; META_LEN] {
     let mut data = [0; META_LEN];
     data[..9].copy_from_slice(MAGIC);
@@ -275,6 +289,9 @@ struct FilePart {
     /// How this part becomes a name at publication. `None` means nothing
     /// supplied one, and publication refuses rather than linking a path.
     linker: Option<Arc<dyn HandleLinker>>,
+    /// The folder adopted for this transfer, and the name to give it there.
+    /// `None` until adoption, and publication refuses while it is `None`.
+    destination: Option<Destination>,
     file: File,
     metadata: File,
     path: PathBuf,
@@ -368,6 +385,7 @@ impl FilePart {
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         Ok(Self {
             linker,
+            destination: None,
             file,
             metadata,
             path: part_path,
@@ -614,25 +632,50 @@ impl SegmentFile for FilePart {
     fn abandon(&mut self) {
         self.cancelled = true;
     }
-    fn publish(&mut self, destination: &Path) -> Result<PathBuf, StorageError> {
-        self.healthy()?;
-        let expected = self.verified.ok_or(StorageError::InvalidState)?;
-        if !self.synchronized || !self.complete() {
-            return Err(StorageError::InvalidState);
-        }
+    fn adopt_destination(&mut self, destination: &Path) -> Result<(), StorageError> {
         let destination = resolve_destination(destination)?;
-        // Fix the destination *folder* as an object before anything else
-        // happens, for the same reason the source is a handle. Measured: with
-        // the folder named rather than held, moving it aside and creating
-        // another directory at its name during publication put the file in the
-        // new directory -- somebody else's -- and the operator's folder stayed
-        // empty. Holding it means the leaf is resolved inside the directory the
-        // operator approved, whatever its name leads to by then.
+        // Fix the destination *folder* as an object, for the same reason the
+        // source is a handle. Measured: with the folder named rather than held,
+        // moving it aside and creating another directory at its name during
+        // publication put the file in the new directory -- somebody else's --
+        // and the operator's folder stayed empty.
+        //
+        // This runs when the session opens the part, before the first byte, so
+        // the whole transfer is inside the protected window. Before it, the
+        // engine has a path and nothing else; that limit is on the port.
         let folder = open_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
         let leaf = destination
             .file_name()
             .ok_or(StorageError::InvalidInput)?
             .to_os_string();
+        self.destination = Some(Destination {
+            folder,
+            leaf,
+            requested: destination,
+        });
+        Ok(())
+    }
+
+    fn publish(&mut self) -> Result<Published, StorageError> {
+        self.healthy()?;
+        let expected = self.verified.ok_or(StorageError::InvalidState)?;
+        if !self.synchronized || !self.complete() {
+            return Err(StorageError::InvalidState);
+        }
+        // No destination may enter here: publishing into a folder that was
+        // never adopted is the whole failure this design exists to prevent, so
+        // it is unrepresentable rather than guarded.
+        let Some(target) = self.destination.as_ref() else {
+            return Err(StorageError::InvalidState);
+        };
+        // A duplicate of the adopted handle: the same object, borrowed for the
+        // rest of this call so the checks below can still take `&mut self`. The
+        // adoption itself stays in place, because a refused publication must
+        // remain retryable against the folder that was adopted, not against
+        // whatever its path leads to by then.
+        let folder = target.folder.try_clone().map_err(io)?;
+        let leaf = target.leaf.clone();
+        let destination = target.requested.clone();
         // Advisory only. The authority for never replacing is the linker's
         // no-replace flag, which acts on the directory object; this is here so
         // an already-taken name is a clear `Conflict` instead of an error out of
@@ -717,13 +760,34 @@ impl SegmentFile for FilePart {
         sync_directory(&self.directory)?;
         self.published = true;
         self.poisoned = false;
-        // The path as the caller spelled it. If the approved folder was renamed
-        // during publication the file is in that folder -- which is the contract
-        // -- but this spelling no longer reaches it. Reporting the folder's
-        // current name would mean resolving the handle back to a path, which
-        // Windows answers for a directory only through another NT class; the
-        // stale spelling is recorded as a known limit rather than papered over.
-        Ok(destination)
+
+        // Publishing into the adopted object succeeded. Whether the path the
+        // operator gave still reaches it is a separate question, asked
+        // separately: the folder can have been renamed while the transfer ran.
+        //
+        // The comparison is by identity, not by existence. A file appearing at
+        // the requested path is not evidence it is ours -- anyone able to move
+        // the folder could also put something there -- so `At` is claimed only
+        // when the path leads to the object that was just linked.
+        let requested = destination.clone();
+        let name = leaf.clone();
+        let moved = Published::Moved {
+            requested: requested.clone(),
+            name: name.clone(),
+        };
+        // Nothing is republished and nothing is removed on this branch. A second
+        // publication would leave a copy somewhere, and a removal would act on a
+        // file this engine cannot prove is its own.
+        let Ok(at_path) = File::open(&requested) else {
+            return Ok(moved);
+        };
+        let Ok(linker) = linker else { return Ok(moved) };
+        match linker.same_object(&self.file, &at_path) {
+            Ok(true) => Ok(Published::At(requested)),
+            // Either the path leads elsewhere, or the platform could not say.
+            // Neither is a reason to claim it leads here.
+            Ok(false) | Err(_) => Ok(moved),
+        }
     }
 }
 
@@ -845,7 +909,7 @@ mod tests {
         part.verify(None, &record).unwrap();
 
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::Unsupported),
             "publication found some other way to name the file"
         );
@@ -900,7 +964,7 @@ mod tests {
             "a part changed after it was recorded verified anyway"
         );
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::InvalidState),
             "an unverified part published"
         );
@@ -982,6 +1046,11 @@ mod tests {
                 }
             })
         }
+        fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
+            // This double links by name, so it cannot answer for the mechanism;
+            // saying so keeps `Published::At` out of tests it cannot support.
+            Err(StorageError::Unsupported)
+        }
     }
 
     /// A store whose publication reaches its end, for tests about something
@@ -1009,6 +1078,23 @@ mod tests {
         fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
+        fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+    }
+
+    /// Adopt then publish, which is the order production uses.
+    ///
+    /// Adoption is a separate call because it is the moment the destination's
+    /// identity is decided; these tests do both at the end because what they
+    /// are about is publication, and the tests that are about the moment itself
+    /// call them apart.
+    fn publish_to(
+        part: &mut dyn SegmentFile,
+        destination: &Path,
+    ) -> Result<Published, StorageError> {
+        part.adopt_destination(destination)?;
+        part.publish()
     }
 
     fn attested(part: &mut dyn SegmentFile) -> Vec<(ByteRange, [u8; 32])> {
@@ -1048,7 +1134,7 @@ mod tests {
             part.verify(Some(hash(b"abcdef")), &record).unwrap(),
             hash(b"abcdef")
         );
-        part.publish(&directory.output()).unwrap();
+        publish_to(part.as_mut(), &directory.output()).unwrap();
         assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
     }
     #[test]
@@ -1064,7 +1150,7 @@ mod tests {
         // Unpublished bytes are never thrown away by mistake.
         assert_eq!(part.discard(), Err(StorageError::InvalidState));
         assert!(directory.part().join("1-1.part").exists());
-        part.publish(&directory.output()).unwrap();
+        publish_to(part.as_mut(), &directory.output()).unwrap();
         part.discard().unwrap();
         // The published name still holds the bytes; the part and its sidecar are gone.
         assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
@@ -1103,7 +1189,7 @@ mod tests {
             Err(StorageError::InvalidState)
         );
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::InvalidState)
         );
     }
@@ -1147,7 +1233,7 @@ mod tests {
         part.verify(None, &record).unwrap();
         part.write_at(1, b"x").unwrap();
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::InvalidState)
         );
         part.sync().unwrap();
@@ -1157,7 +1243,7 @@ mod tests {
             Err(StorageError::Integrity)
         );
         part.verify(Some(hash(b"axc")), &record).unwrap();
-        part.publish(&directory.output()).unwrap();
+        publish_to(part.as_mut(), &directory.output()).unwrap();
         assert_eq!(fs::read(directory.output()).unwrap(), b"axc");
     }
     #[test]
@@ -1172,7 +1258,7 @@ mod tests {
         part.verify(None, &record).unwrap();
         fs::write(directory.output(), b"USER").unwrap();
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::Conflict)
         );
         assert_eq!(fs::read(directory.output()).unwrap(), b"USER");
@@ -1187,7 +1273,7 @@ mod tests {
         part.sync().unwrap();
         let record = attested(part.as_mut());
         part.verify(None, &record).unwrap();
-        part.publish(&directory.output()).unwrap();
+        publish_to(part.as_mut(), &directory.output()).unwrap();
         assert_eq!(part.write_at(0, b"xyz"), Err(StorageError::InvalidState));
         drop(part);
         let mut reopened = publishing_store(&directory.part())
@@ -1280,7 +1366,7 @@ mod tests {
         );
         assert_eq!(part.verify(None, &[]), Err(StorageError::InvalidState));
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(&mut part, &directory.output()),
             Err(StorageError::InvalidState)
         );
         drop(part);
@@ -1304,7 +1390,7 @@ mod tests {
         part.verify(None, &record).unwrap();
         fs::write(directory.part().join("1-1.part"), b"xyz").unwrap();
         assert_eq!(
-            part.publish(&directory.output()),
+            publish_to(part.as_mut(), &directory.output()),
             Err(StorageError::Integrity)
         );
         assert!(!directory.output().exists());
@@ -1317,7 +1403,7 @@ mod tests {
             .unwrap();
         let record = attested(part.as_mut());
         assert_eq!(part.verify(Some(hash(b"")), &record).unwrap(), hash(b""));
-        part.publish(&directory.output()).unwrap();
+        publish_to(part.as_mut(), &directory.output()).unwrap();
         assert_eq!(fs::metadata(directory.output()).unwrap().len(), 0);
     }
     #[cfg(unix)]
