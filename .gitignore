@@ -2,6 +2,7 @@ node_modules/
 target/
 target-isolated/
 target-mutation/
+pr-integration.md
 dist/
 coverage/
 .tools/
