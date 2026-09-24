@@ -5,7 +5,9 @@ mod harness;
 use fhd_daemon::{EngineConfig, EngineError, Intent, Resident};
 use fhd_ipc::{ask, connect, Endpoint};
 use fhd_protocol::{AddRequest, Request, Response};
-use harness::{content, expected_digest, serve as serve_file, Directory};
+use harness::{
+    content, expected_digest, kept_beside_matches, serve as serve_file, Directory, PUBLISHES,
+};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -130,9 +132,21 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
         );
     }
 
-    // The job is real work, so it takes a moment; the socket stays answerable.
+    // The state this job settles in, which is not the same on every platform.
+    //
+    // This is what failed CI on Linux and macOS at 11dd794: the test waited two
+    // minutes for "Completed" while publication is unsupported there, so the
+    // wait could only ever time out. Raising the timeout would have been a way
+    // of not noticing; deleting the test would have hidden the missing support.
+    // It now waits for the state the engine declares for this platform, and a
+    // wrong one fails immediately instead of after the deadline.
+    let wanted = if PUBLISHES {
+        "Completed"
+    } else {
+        "NeedsAction"
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let mut published = false;
+    let mut settled = None;
     while std::time::Instant::now() < deadline {
         let Response::Jobs { jobs, .. } = ask(&mut client, 2, &Request::List { after: None })
             .await
@@ -141,14 +155,39 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
             panic!("listing failed")
         };
         let ours = jobs.iter().find(|summary| summary.job == job).unwrap();
-        if ours.state == "Completed" {
-            published = true;
+        // Any resting state is an answer; only the moving ones are worth waiting
+        // out. Accepting "whatever turns up" is how a wrong state passes.
+        if matches!(
+            ours.state.as_str(),
+            "Completed" | "NeedsAction" | "Failed" | "Cancelled"
+        ) {
+            settled = Some(ours.clone());
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(published, "the job never completed over the socket");
-    assert_eq!(std::fs::read(&destination).unwrap(), body);
+    let settled = settled.expect("the job never came to rest over the socket");
+    assert_eq!(
+        settled.state, wanted,
+        "the job settled in a state this platform does not declare"
+    );
+
+    if PUBLISHES {
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+    } else {
+        // The declared refusal, over the socket rather than in-process: nothing
+        // published, and the work kept so the transfer can finish the day a
+        // mechanism exists. Contents, not size -- a part is created at its full
+        // length before a byte arrives.
+        assert!(
+            !destination.exists(),
+            "a refused publication created the destination"
+        );
+        assert!(
+            kept_beside_matches(&destination, &body),
+            "no part beside the destination holds the bytes that were downloaded"
+        );
+    }
 
     // Asking it to stop ends the engine; the client's answer comes first.
     assert_eq!(
@@ -183,7 +222,11 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     };
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].job, job);
-    assert_eq!(jobs[0].state, "Completed");
+    // Restored to the same state it settled in, whichever that was: the point
+    // of this half is that a later engine remembers a job it was never told
+    // about, and that holds whether the job completed or is waiting for a
+    // mechanism.
+    assert_eq!(jobs[0].state, wanted);
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
 }

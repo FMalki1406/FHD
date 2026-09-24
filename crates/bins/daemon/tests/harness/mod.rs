@@ -5,12 +5,51 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
+
+/// Whether this build can publish on this platform.
+///
+/// Windows only today: the mechanism is an NT call, and no measured equivalent
+/// exists yet for Linux or macOS. Publication refuses there rather than falling
+/// back to linking by path, which is the behaviour being replaced.
+///
+/// **Green tests are not a support claim.** This constant is what the tests
+/// below assert against, and `publication_support_on_this_platform_is_declared`
+/// is what ties it to the engine's actual behaviour, so the two cannot drift
+/// into a suite that passes while nothing works.
+pub const PUBLISHES: bool = cfg!(windows);
+
+/// Whether a part beside `destination` holds exactly `body`.
+///
+/// The part lives in `.fhd-parts` next to the destination rather than under
+/// the state directory, which is what lets a download land on a volume the
+/// engine does not live on. Contents rather than length, because a part is
+/// created at its full size before anything is fetched.
+pub fn kept_beside_matches(destination: &Path, body: &[u8]) -> bool {
+    fn walk(path: &Path, body: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => walk(&path, body),
+                Ok(metadata) if metadata.len() == body.len() as u64 => std::fs::read(&path)
+                    .map(|held| held == body)
+                    .unwrap_or(false),
+                _ => false,
+            }
+        })
+    }
+    destination
+        .parent()
+        .is_some_and(|folder| walk(&folder.join(".fhd-parts"), body))
+}
 
 pub struct Directory(pub PathBuf);
 impl Directory {

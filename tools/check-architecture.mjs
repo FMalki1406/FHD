@@ -78,6 +78,67 @@ function itemBelow(lines, from) {
   return '<end of file>';
 }
 
+/// `text` with Rust comments removed, leaving string literals alone.
+///
+/// F1 in the re-review of 11dd794: `#[allow /* reason */ (unsafe_code)]` is
+/// valid Rust, silences the lint, and walked past a gate that stripped only
+/// whitespace before looking for `allow(`. Block comments nest in Rust, line
+/// comments run to the newline, and a `/*` inside a string is not a comment --
+/// all three matter, because getting any of them wrong leaves a gate that can
+/// be talked past with punctuation.
+export function withoutComments(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const two = text.slice(i, i + 2);
+    if (two === '/*') {
+      let depth = 0;
+      while (i < text.length) {
+        const here = text.slice(i, i + 2);
+        if (here === '/*') { depth += 1; i += 2; continue; }
+        if (here === '*/') { depth -= 1; i += 2; if (depth === 0) break; continue; }
+        i += 1;
+      }
+      out += ' ';
+      continue;
+    }
+    if (two === '//') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      out += ' ';
+      continue;
+    }
+    // Raw strings: r"..." and r#.."..".."#, where the hash count sets the end.
+    if (text[i] === 'r' && (text[i + 1] === '"' || text[i + 1] === '#')) {
+      let j = i + 1;
+      let hashes = 0;
+      while (text[j] === '#') { hashes += 1; j += 1; }
+      if (text[j] === '"') {
+        const close = `"${'#'.repeat(hashes)}`;
+        const end = text.indexOf(close, j + 1);
+        const stop = end === -1 ? text.length : end + close.length;
+        out += text.slice(i, stop);
+        i = stop;
+        continue;
+      }
+    }
+    if (text[i] === '"') {
+      out += text[i];
+      i += 1;
+      while (i < text.length && text[i] !== '"') {
+        if (text[i] === '\\') { out += text.slice(i, i + 2); i += 2; continue; }
+        out += text[i];
+        i += 1;
+      }
+      out += text[i] ?? '';
+      i += 1;
+      continue;
+    }
+    out += text[i];
+    i += 1;
+  }
+  return out;
+}
+
 /// Every attribute in `text`, as whole attributes rather than lines.
 ///
 /// A line-based scan was the flaw the review of 2026-09-24 found: it matched
@@ -132,8 +193,9 @@ export function attributesIn(text) {
 /// left alone -- but only when the attribute does not *also* allow, so
 /// `cfg_attr(windows, allow(unsafe_code))` beside a deny is still caught.
 function permitsUnsafe(text) {
-  if (!text.includes('unsafe_code')) return false;
-  const stripped = text.replaceAll(/\s+/gu, '');
+  const bare = withoutComments(text);
+  if (!bare.includes('unsafe_code')) return false;
+  const stripped = bare.replaceAll(/\s+/gu, '');
   return stripped.includes('allow(') || stripped.includes('expect(');
 }
 
@@ -173,7 +235,7 @@ export function unsafeOffendersIn(relative, text) {
     // One spelling is approved, and everything else is refused rather than
     // interpreted. A gate that guesses at what an attribute means is a gate
     // whose coverage nobody can state.
-    if (attribute.text.replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') {
+    if (withoutComments(attribute.text).replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') {
       offenders.push(
         `${where}: unsafe is permitted by a spelling this gate does not accept: ` +
         `${attribute.text.replaceAll(/\s+/gu, ' ')}. Write it as #[allow(unsafe_code)] ` +

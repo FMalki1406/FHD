@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { attributesIn, checkArchitecture, checkTestCoverage, unsafeOffendersIn } from './check-architecture.mjs';
+import {
+  attributesIn, checkArchitecture, checkTestCoverage, unsafeOffendersIn, withoutComments,
+} from './check-architecture.mjs';
 
 function metadata(graph) {
   const packages = Object.entries(graph).map(([name, dependencies]) => ({
@@ -192,4 +194,41 @@ test('attribute scanning survives brackets inside string literals', () => {
     unsafeOffendersIn('crates/adapters/storage/src/lib.rs', '#[doc = "]"]\n#[allow(unsafe_code)]\nfn f() {}').length,
     1,
   );
+});
+
+// F1 from the re-review of 11dd794: a comment inside the attribute walked past
+// a gate that stripped only whitespace. Rust accepts all of these and each
+// silences `deny(unsafe_code)`; the first is the one the reviewer compiled.
+test('unsafe gate is not talked past with a comment inside the attribute', () => {
+  const file = 'crates/adapters/platform/src/lib.rs';
+  const bypasses = [
+    '#[allow /* reason */ (unsafe_code)]\npub fn unauthorized() {}\n',
+    // Block comments nest in Rust, so a naive scan for the first `*/` stops early.
+    '#[allow /* a /* b */ c */ (unsafe_code)]\npub fn unauthorized() {}\n',
+    '#[allow( // why\n    unsafe_code\n)]\npub fn unauthorized() {}\n',
+    // A `]` inside a comment must not end the attribute early, or the allowance
+    // would be read as ordinary code and never examined at all.
+    '#[allow /* ] */ (unsafe_code)]\npub fn unauthorized() {}\n',
+    '#![allow /* reason */ (unsafe_code)]\n',
+  ];
+  for (const source of bypasses) {
+    assert.ok(
+      unsafeOffendersIn(file, source).length > 0,
+      `not reported: ${JSON.stringify(source)}`,
+    );
+  }
+
+  // A comment on the approved allowance is still the approved allowance: the
+  // point is to read the attribute correctly, not to ban explaining it.
+  assert.deepEqual(
+    unsafeOffendersIn(file, '#[allow /* geteuid */ (unsafe_code)]\nfn our_uid() -> u32 {\n}\n'),
+    [],
+  );
+
+  // And a `/*` inside a string is not a comment.
+  assert.equal(withoutComments('#[doc = "/* not a comment */"]'), '#[doc = "/* not a comment */"]');
+  assert.equal(withoutComments('a /* b */ c'), 'a   c');
+  // A comment becomes one space and the newline stays, so tokens never merge.
+  assert.equal(withoutComments('a // b\nc'), 'a  \nc');
+  assert.equal(withoutComments('allow/*x*/(unsafe_code)'), 'allow (unsafe_code)');
 });

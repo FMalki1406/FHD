@@ -6,25 +6,15 @@ use fhd_app::{storage::Published, AppError};
 use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request};
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
-use harness::{content, expected_digest, part_bytes, serve, Directory};
+use harness::{
+    content, expected_digest, kept_beside_matches, part_bytes, serve, Directory, PUBLISHES,
+};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     time::Duration,
 };
 use tokio::sync::mpsc;
-
-/// Whether this build can publish on this platform.
-///
-/// Windows only today: the mechanism is an NT call, and no measured equivalent
-/// exists yet for Linux or macOS. Publication refuses there rather than falling
-/// back to linking by path, which is the behaviour being replaced.
-///
-/// **Green tests are not a support claim.** This constant is what the tests
-/// below assert against, and `publication_support_on_this_platform_is_declared`
-/// is what ties it to the engine's actual behaviour, so the two cannot drift
-/// into a suite that passes while nothing works.
-const PUBLISHES: bool = cfg!(windows);
 
 /// The declared outcome of a run that fetched and verified everything.
 ///
@@ -40,8 +30,9 @@ const PUBLISHES: bool = cfg!(windows);
 #[track_caller]
 fn published_as_declared(
     outcome: Result<SessionEnd, fhd_daemon::EngineError>,
+    reason: Option<StopReason>,
     destination: &Path,
-    state: &Directory,
+    body: &[u8],
 ) -> Option<PathBuf> {
     if PUBLISHES {
         match outcome {
@@ -52,17 +43,30 @@ fn published_as_declared(
             other => panic!("expected a published file, got {other:?}"),
         }
     }
+    // The exact settlement, not merely "not published". F2 in the re-review of
+    // 11dd794: anything short of this would let a transport failure, a storage
+    // failure, or a run that stopped early satisfy the same assertion, and the
+    // test would report success for a download that never happened.
     assert!(
-        !matches!(outcome, Ok(SessionEnd::Published(_))),
-        "publication succeeded on a platform with no mechanism: {outcome:?}"
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "a refused publication did not settle the way the engine declares: {outcome:?}"
+    );
+    assert_eq!(
+        reason,
+        Some(StopReason::Storage),
+        "the job stopped for some reason other than publication being refused"
     );
     assert!(
         !destination.exists(),
         "a refused publication created the destination"
     );
+    // The bytes, not the size. `create` sets the part's length before a single
+    // byte arrives, so a positive file size proves only that a file was
+    // allocated -- which is what the re-review objected to. Comparing contents
+    // proves the transfer finished and that what stopped it was publication.
     assert!(
-        part_bytes(state) + kept_beside(destination) > 0,
-        "the downloaded bytes were discarded when publication was refused"
+        kept_beside_matches(destination, body),
+        "no part beside the destination holds the bytes that were downloaded"
     );
     None
 }
@@ -70,10 +74,8 @@ fn published_as_declared(
 /// Bytes still held in the parts directory beside a destination.
 ///
 /// `part_bytes` reads the state directory, which is where parts stopped living
-/// when they moved next to the file they become -- so on its own it answers zero
-/// for a transfer whose work is perfectly intact. The refusal contract is about
-/// those bytes surviving, so they are measured where the engine actually puts
-/// them: `<destination's directory>/.fhd-parts/<engine>/`.
+/// when they moved next to the file they become -- so on its own it answers
+/// zero for a transfer whose work is perfectly intact.
 fn kept_beside(destination: &Path) -> u64 {
     fn walk(path: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -115,7 +117,6 @@ fn resuming(state: &Directory, destination: PathBuf, connections: usize) -> Engi
         ..config(state, destination, connections)
     }
 }
-/// Total size of everything still under the engine's parts directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn downloads_verifies_and_publishes_over_real_adapters() {
     let body = content(3 * 1024 * 1024 + 517);
@@ -129,7 +130,9 @@ async fn downloads_verifies_and_publishes_over_real_adapters() {
     let engine = Engine::open(settings, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
     let outcome = engine.run(receiver).await;
-    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+    let Some(_) =
+        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body)
+    else {
         return;
     };
     assert_eq!(std::fs::read(&destination).unwrap(), body);
@@ -198,6 +201,9 @@ async fn a_dropped_connection_resumes_from_committed_bytes() {
             .unwrap();
         let (_control, receiver) = mpsc::channel(1);
         let outcome = engine.run(receiver).await;
+        // Read before the engine is dropped: the stop reason is part of the
+        // refusal contract, and after the drop there is nothing left to ask.
+        let reason = engine.reason().await.unwrap();
         drop(engine);
         if !PUBLISHES {
             // Publication is unsupported here, so no run in this loop can
@@ -212,7 +218,7 @@ async fn a_dropped_connection_resumes_from_committed_bytes() {
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 continue;
             }
-            published_as_declared(outcome, &destination, &state);
+            published_as_declared(outcome, reason, &destination, &body);
             return;
         }
         match outcome.unwrap() {
@@ -295,7 +301,9 @@ async fn an_occupied_destination_is_never_overwritten() {
     // already proved above -- the occupied name was left alone and a rerun did
     // not resume by itself -- and the resume that follows the operator freeing
     // the name is held to the refusal contract instead of to a published file.
-    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+    let Some(_) =
+        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body)
+    else {
         return;
     };
     assert_eq!(std::fs::read(&destination).unwrap(), body);
@@ -327,7 +335,7 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
         // this test is about is on disk: the refusal contract below asserts
         // nothing was published, the destination was not created and the fetched
         // bytes were kept, which is as far as a later run could get.
-        published_as_declared(outcome, &destination, &state);
+        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body);
         return;
     }
     // Pausing may lose a race with completion; both outcomes are legitimate.
@@ -386,7 +394,8 @@ async fn a_destination_away_from_the_state_directory_downloads_and_publishes() {
     let engine = Engine::open(settings, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
     let outcome = engine.run(receiver).await;
-    let published = published_as_declared(outcome, &destination, &state);
+    let published =
+        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body);
     if published.is_none() {
         // Publication is unsupported here: the run was held to the refusal
         // contract above, which includes the fetched bytes surviving in the
@@ -540,7 +549,9 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
     // Publication is unsupported here: the first run is held to the refusal
     // contract instead, and with nothing published there is no file for a second
     // request to reconcile against.
-    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+    let Some(_) =
+        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body)
+    else {
         return;
     };
     drop(engine);
