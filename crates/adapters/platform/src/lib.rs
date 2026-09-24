@@ -155,7 +155,7 @@ mod imp {
         if mode & 0o002 != 0 {
             foreign.push("other".to_owned());
         }
-        let us = our_uid();
+        let us = our_uid()?;
         if metadata.uid() != us {
             foreign.push(format!("owner:{}", metadata.uid()));
         }
@@ -164,29 +164,40 @@ mod imp {
 
     /// The user id this process's files are created as.
     ///
-    /// Read once from a file we make, rather than through `getuid`, so this
-    /// crate's one `unsafe` allowance stays where the security descriptor work
-    /// needs it. It cannot change while the process runs, so it is computed once
-    /// and kept.
+    /// **The direct call is `geteuid(2)`, and it is not used here on purpose.**
+    /// Reaching it means `libc` -- which is already in `Cargo.lock` as a
+    /// transitive dependency, so it would add no new code to the build -- and an
+    /// `unsafe` block, which `crates/adapters/platform/src/lib.rs:11` forbids off
+    /// Windows. That prohibition is an architectural decision and is not for
+    /// this function to spend. If it is ever relaxed, `geteuid` is the answer
+    /// and everything below can go.
     ///
-    /// **Once matters, not merely for speed.** A version of this made a probe
-    /// file on every call, named from the pid and the clock. Under parallel
-    /// tests on a runner whose clock is coarser than nanoseconds, two calls
-    /// chose the same name, `create_new` refused the second, and the failure
-    /// path returned `u32::MAX` -- which reads as a foreign owner, so the engine
-    /// refused a directory of its own with `STATE-DIRECTORY-EXPOSED`. Failing
-    /// closed is right; failing closed at random because of a name collision is
-    /// not, and it took a macOS runner to show it.
+    /// Until then, in order of directness:
     ///
-    /// `create_new` with an explicit mode, because the plain create was
-    /// `O_WRONLY|O_CREAT|O_TRUNC` and followed symlinks in a directory that is
-    /// usually world-writable: guessing the name gave an attacker a way to
-    /// truncate any file this uid can write. Retried on a taken name so that a
-    /// collision costs an attempt rather than the answer.
-    fn our_uid() -> u32 {
+    /// 1. **Linux: `/proc/self`.** Owned by the process's effective user, so its
+    ///    owner *is* the answer -- one `stat`, no probe, no write, nothing to
+    ///    collide with. Documented in `proc(5)`.
+    /// 2. **Elsewhere: a file we create.** macOS has no `/proc`. Made with
+    ///    `create_new` and an explicit mode, because a plain create followed
+    ///    symlinks in a usually world-writable directory and let a guessed name
+    ///    truncate anything this uid can write.
+    ///
+    /// **A failure is an error, not a stand-in identity.** This used to answer
+    /// `u32::MAX` when the probe failed, which reads as an owner who is not us
+    /// -- so a name collision between two parallel calls made the engine refuse
+    /// a directory it had just created, on a macOS runner, at random. A refusal
+    /// has to be about what was measured; "we could not tell" is a different
+    /// answer and says so.
+    ///
+    /// Computed once: it cannot change while the process runs.
+    fn our_uid() -> io::Result<u32> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        *UID.get_or_init(|| {
+        static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let found = *UID.get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            if let Ok(metadata) = std::fs::metadata("/proc/self") {
+                return Some(metadata.uid());
+            }
             for attempt in 0..8u32 {
                 let probe = std::env::temp_dir().join(format!(
                     "fhd-uid-{}-{}-{attempt}",
@@ -205,13 +216,16 @@ mod imp {
                     .map(|metadata| metadata.uid());
                 let _ = std::fs::remove_file(&probe);
                 if let Ok(uid) = read {
-                    return uid;
+                    return Some(uid);
                 }
             }
-            // Every attempt failed, which is a real problem rather than a
-            // collision. An id nothing owns makes every directory read as
-            // foreign, so callers refuse rather than proceed blind.
-            u32::MAX
+            None
+        });
+        found.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "this process's user id could not be read, so ownership cannot be judged",
+            )
         })
     }
 
