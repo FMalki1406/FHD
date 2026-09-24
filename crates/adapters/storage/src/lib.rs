@@ -253,6 +253,35 @@ struct FilePart {
     // Released after every open data/metadata handle of this part.
     _lock: Option<Arc<File>>,
 }
+/// The SHA-256 of a whole file, read through a handle the caller opened.
+///
+/// Used to check the destination after it has been linked. Publication links a
+/// path, and a path is a name rather than the object that was verified: a review
+/// renamed a verified part aside, put its own file at the name, and watched
+/// those bytes get published. Windows happens to refuse renaming a directory
+/// with an open file beneath it, which closed one route there by a property of
+/// NTFS this code never asserts; Unix refuses nothing of the sort.
+///
+/// Reading the destination through one handle, opened once, settles it: if those
+/// bytes hash to what was verified, the file the user is about to have is the
+/// file we meant. It replaces the re-read that used to happen through our own
+/// handle just before linking -- same number of passes over the data, and it
+/// answers the question that matters instead of one we already knew the answer
+/// to.
+fn hash_whole(file: &mut File, length: u64) -> Result<[u8; 32], StorageError> {
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    let mut left = length;
+    let mut buffer = [0; BUFFER];
+    let mut hash = Sha256::new();
+    while left > 0 {
+        let take = left.min(BUFFER as u64) as usize;
+        file.read_exact(&mut buffer[..take]).map_err(io)?;
+        hash.update(&buffer[..take]);
+        left -= take as u64;
+    }
+    Ok(hash.finalize().into())
+}
+
 /// The part file's own permissions, not only its directory's.
 ///
 /// A part now lives beside its destination rather than inside the engine's own
@@ -567,9 +596,7 @@ impl SegmentFile for FilePart {
             Err(error) => return Err(io(error)),
         }
         ordinary(&self.path, false)?;
-        if self.file.metadata().map_err(io)?.len() != self.spec.size()
-            || self.hash(0, self.spec.size())? != expected
-        {
+        if self.file.metadata().map_err(io)?.len() != self.spec.size() {
             self.verified = None;
             return Err(StorageError::Integrity);
         }
@@ -593,6 +620,21 @@ impl SegmentFile for FilePart {
                 });
             }
         }
+        // The link exists; whether it carries the bytes that were verified is a
+        // separate question, and this is the only moment it can be answered.
+        let mut linked = File::open(&destination).map_err(io)?;
+        let published = hash_whole(&mut linked, self.spec.size());
+        if published.as_ref() != Ok(&expected) {
+            drop(linked);
+            // Undo our own link. It cannot be somebody else's file: `hard_link`
+            // refuses a name that exists, so this path did not a moment ago.
+            let _ = fs::remove_file(&destination);
+            self.poisoned = false;
+            self.sealed = false;
+            self.verified = None;
+            return Err(StorageError::Integrity);
+        }
+        drop(linked);
         self.file.sync_all().map_err(io)?;
         sync_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
         sync_directory(&self.directory)?;
@@ -644,6 +686,42 @@ mod tests {
     fn hash(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
     }
+    /// A part swapped at its name between verification and publication does not
+    /// become the user's file.
+    ///
+    /// Publication links a path. A review renamed the verified part aside, put
+    /// its own file at that name, and watched those bytes get published --
+    /// nothing in the suite constrained it. The link is checked against the
+    /// verified handle afterwards now, so the question asked is whether the file
+    /// that exists is the one we meant.
+    #[test]
+    fn a_part_swapped_at_its_name_before_publication_never_becomes_the_file() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        // The name is moved aside and another file takes it. The handle survives
+        // the rename, which is exactly why the path and the object can differ.
+        let name = directory.part().join("1-1.part");
+        fs::rename(&name, directory.part().join("moved.bin")).unwrap();
+        fs::write(&name, b"EVIL!!").unwrap();
+
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::Integrity),
+            "a file planted at the part's name was published"
+        );
+        assert!(
+            !directory.output().exists(),
+            "the planted file was left behind at the destination"
+        );
+    }
+
     /// Bytes changed after they were recorded do not publish.
     ///
     /// Verification used to hash the file and compare it with that same hash, so

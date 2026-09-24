@@ -123,12 +123,18 @@ pub trait SegmentFile: Send {
     /// because an uncovered range is one nothing ever attested, and it must
     /// rehash each recorded range rather than trusting that it was written.
     ///
-    /// **What the record does not do.** It shows the bytes are the ones that were
-    /// recorded, not that they are the ones the source sent: the digests are
-    /// computed from what arrived. An attacker able to change the data and the
-    /// repository together defeats it. Only `expected` -- supplied with the
-    /// request, from somewhere we did not derive -- speaks to authenticity, and
-    /// it stays for exactly that reason.
+    /// **What each of the two shows, exactly.** The record shows the bytes agree
+    /// with what was recorded earlier -- consistency, and only as far as the
+    /// record itself was protected, since the digests are computed from what
+    /// arrived and an attacker able to change the data and the repository
+    /// together defeats both halves at once.
+    ///
+    /// `expected` shows the bytes match the digest the request carried. That
+    /// becomes evidence about the source only if the digest itself came from
+    /// somewhere trustworthy: one read off the same page that supplied the link
+    /// says nothing an attacker who controls the page could not also say. The
+    /// check is worth making either way, and what it proves depends on where the
+    /// digest came from, which is not something this layer can know.
     ///
     /// Coordinator must first drain workers. File length and zero contents do
     /// not prove coverage. Implementation invalidates any verification on
