@@ -255,19 +255,24 @@ struct FilePart {
 }
 /// The SHA-256 of a whole file, read through a handle the caller opened.
 ///
-/// Used to check the destination after it has been linked. Publication links a
-/// path, and a path is a name rather than the object that was verified: a review
-/// renamed a verified part aside, put its own file at the name, and watched
-/// those bytes get published. Windows happens to refuse renaming a directory
-/// with an open file beneath it, which closed one route there by a property of
-/// NTFS this code never asserts; Unix refuses nothing of the sort.
+/// Used on the staged link, before the destination name exists.
 ///
-/// Reading the destination through one handle, opened once, settles it: if those
-/// bytes hash to what was verified, the file the user is about to have is the
-/// file we meant. It replaces the re-read that used to happen through our own
-/// handle just before linking -- same number of passes over the data, and it
-/// answers the question that matters instead of one we already knew the answer
-/// to.
+/// **And it does not make publication safe.** A joint review measured the
+/// remaining hole: the hash reads a handle, so replacing the staged *name*
+/// while it runs does not disturb it, and the link that follows resolves that
+/// name again. The window is the length of the hash -- O(file size), longer
+/// than the one it replaced -- and a racer that renamed a same-size file over
+/// the staged name mid-hash had its bytes published with `Ok`.
+///
+/// What actually closes it is linking from the verified handle
+/// (`NtSetInformationFile` with `FILE_LINK_INFORMATION` on Windows, `linkat`
+/// through `/proc/self/fd` on Linux), which this crate cannot do: it forbids
+/// `unsafe` and may not depend on `fhd-platform`. That is a port, and the port
+/// is an architectural decision, not a patch. Until it exists, the containment
+/// is the access list on the parts directory -- measured to deny another
+/// account everything -- and on Windows the fact that NTFS will not rename a
+/// directory with an open file beneath it. The second of those is a property of
+/// the filesystem that no line here asserts, and it is false on Unix.
 fn hash_whole(file: &mut File, length: u64) -> Result<[u8; 32], StorageError> {
     file.seek(SeekFrom::Start(0)).map_err(io)?;
     let mut left = length;
@@ -802,6 +807,69 @@ mod tests {
         assert!(
             staged.is_empty(),
             "a staged link was left behind: {staged:?}"
+        );
+    }
+
+    /// The destination name appears only after the bytes are proved, and the
+    /// staged link does not survive a success.
+    ///
+    /// A review found the commit that introduced staging left its own claim
+    /// unguarded: reverting to linking straight at the destination, or creating
+    /// the destination name before the proof, both left the suite green. Two of
+    /// the three properties in that commit's title were pinned by nothing.
+    #[test]
+    fn publication_proves_before_it_names_and_leaves_nothing_staged() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        // A staged link has to exist while the proof runs, and it has to be
+        // inside the engine's own directory rather than beside the destination.
+        // Asserted through the failure path, because that is the moment the
+        // staged name is observable: with the part swapped, publication stops
+        // and the destination is never named.
+        let name = directory.part().join("1-1.part");
+        fs::rename(&name, directory.part().join("aside.bin")).unwrap();
+        fs::write(&name, b"EVIL!!").unwrap();
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::Integrity)
+        );
+        assert!(
+            !directory.output().exists(),
+            "the destination was named for bytes that were never proved"
+        );
+
+        // Put the real part back and publish for real.
+        fs::remove_file(&name).unwrap();
+        fs::rename(directory.part().join("aside.bin"), &name).unwrap();
+        let mut part = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        part.recover_extent(range(0, 6), hash(b"abcdef")).unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        part.publish(&directory.output()).unwrap();
+        assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
+
+        // A staged link that outlives a success is a second name for the user's
+        // file, in a directory nothing cleans -- so a file they later delete
+        // stays on disk and readable there.
+        let staged: Vec<_> = fs::read_dir(directory.part())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".staged"))
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "a staged link outlived a successful publication: {staged:?}"
         );
     }
 
