@@ -7,7 +7,8 @@ use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request}
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use harness::{
-    content, expected_digest, kept_beside_matches, part_bytes, serve, Directory, PUBLISHES,
+    content, expected_digest, kept_beside_matches, part_bytes, serve, settled_without_publishing,
+    Directory, PUBLISHES,
 };
 use std::{
     path::{Path, PathBuf},
@@ -329,40 +330,79 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
         control.send(Control::Pause).await.unwrap();
     };
     let (outcome, ()) = tokio::join!(run, pause);
-    if !PUBLISHES {
-        // Publication is unsupported here, so a run that outran the pause stops
-        // at publication rather than finishing. Either way the durable progress
-        // this test is about is on disk: the refusal contract below asserts
-        // nothing was published, the destination was not created and the fetched
-        // bytes were kept, which is as far as a later run could get.
-        published_as_declared(outcome, engine.reason().await.unwrap(), &destination, &body);
-        return;
-    }
-    // Pausing may lose a race with completion; both outcomes are legitimate.
-    match outcome.unwrap() {
-        SessionEnd::Published(outcome) => assert_eq!(outcome, Published::At(destination.clone())),
-        SessionEnd::Settled(state) => assert_eq!(state, JobState::Paused),
+    let first_reason = engine.reason().await.unwrap();
+    let first = outcome.expect("the first run ended with an error");
+
+    // Three phases, kept apart. Folding them together is what broke this on
+    // Unix at 24445c4: a paused run was handed to the publication helper, which
+    // asks for a finished transfer, and the failure said `Ok(Settled(Paused))`.
+    // Pausing and publishing are different questions and are asked separately.
+    //
+    // Phase one: however the race between the pause and the transfer went, the
+    // work already committed must still be on disk.
+    let finished_early = match &first {
+        // The pause won, which is the case this test is really about.
+        SessionEnd::Settled(JobState::Paused) => false,
+        // The transfer outran the pause and published. Written as a guard
+        // rather than an assertion inside the arm, because `PUBLISHES` is a
+        // constant and asserting on one is a lint -- a lint that is right:
+        // the condition belongs in the match, where a platform that cannot
+        // publish falls through to the panic below.
+        SessionEnd::Published(Published::At(path)) if PUBLISHES => {
+            assert_eq!(path, &destination);
+            true
+        }
+        // The transfer outran the pause and reached publication, which this
+        // platform refuses. That is as finished as a transfer gets here.
+        SessionEnd::Settled(JobState::NeedsAction) if !PUBLISHES => {
+            assert_eq!(first_reason, Some(StopReason::Storage));
+            true
+        }
+        other => panic!("the first run settled in a state nothing declares: {other:?}"),
+    };
+    if !finished_early {
+        // Size, not contents: the transfer is deliberately incomplete here, so
+        // what is being claimed is that progress survived a pause -- not that it
+        // is the whole file. Correctness is proved at the end, by comparison.
+        assert!(
+            kept_beside(&destination) > 0,
+            "pausing lost the progress that had already been committed"
+        );
     }
     drop(engine);
-    if !destination.exists() {
-        // A stopped job stays stopped until the operator asks for it.
-        let idle = Engine::open(config(&state, destination.clone(), 2), &url)
-            .await
-            .unwrap();
-        let (_control, receiver) = mpsc::channel(1);
-        assert!(idle.run(receiver).await.is_err(), "no automatic resume");
-        drop(idle);
-        let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
-            .await
-            .unwrap();
-        let (_control, receiver) = mpsc::channel(1);
-        let outcome = engine.run(receiver).await.unwrap();
-        assert_eq!(
-            outcome,
-            SessionEnd::Published(Published::At(destination.clone())),
-            "reason: {:?}",
-            engine.reason().await.unwrap()
-        );
+
+    if finished_early {
+        if PUBLISHES {
+            assert_eq!(std::fs::read(&destination).unwrap(), body);
+        } else {
+            assert!(
+                kept_beside_matches(&destination, &body),
+                "the bytes were not kept after publication was refused"
+            );
+        }
+        return;
+    }
+
+    // Phase two: a stopped job stays stopped until the operator asks, and then
+    // resumes. This runs on every platform -- resuming has nothing to do with
+    // whether the finished bytes can be named.
+    let idle = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    assert!(idle.run(receiver).await.is_err(), "no automatic resume");
+    drop(idle);
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await;
+    let reason = engine.reason().await.unwrap();
+
+    // Phase three: the transfer is complete, so now the publication outcome is
+    // the platform's to declare -- and the content is checked either way.
+    if published_as_declared(outcome, reason, &destination, &body).is_none() {
+        return;
     }
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }
@@ -512,9 +552,13 @@ async fn a_cancelled_job_leaves_no_part_behind() {
         // at publication instead of finishing. Cancelling still has to leave the
         // destination uncreated, which is asserted; whether the part survives is
         // decided by which of the two won the race, so it is not asserted here.
-        assert!(
-            !matches!(outcome, Ok(SessionEnd::Published(_))),
-            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        // Cancelled, or stopped at a publication this platform refuses, and
+        // nothing else: "not published" alone would have been satisfied by a
+        // transport failure that fetched nothing.
+        settled_without_publishing(
+            &outcome,
+            engine.reason().await.unwrap(),
+            &[JobState::Cancelled, JobState::NeedsAction],
         );
         assert!(
             !destination.exists(),
@@ -608,10 +652,17 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
         // and what is asserted is that each stopped at publication with its own
         // name untouched and its own bytes kept.
         for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
-            assert!(
-                !matches!(outcome, JobOutcome::Published(_)),
-                "job {index} published on a platform with no mechanism: {outcome:?}"
-            );
+            // Each job reached publication and was refused there. Accepting any
+            // non-published outcome would have passed for two jobs that never
+            // fetched a byte.
+            match outcome {
+                JobOutcome::Settled(JobState::NeedsAction, reason) => assert_eq!(
+                    reason,
+                    Some(StopReason::Storage),
+                    "job {index} stopped for something other than publication"
+                ),
+                other => panic!("job {index} settled in a state nothing declares: {other:?}"),
+            }
             assert!(
                 !request.destination.exists(),
                 "job {index} created its destination without publishing"
@@ -671,9 +722,12 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
         // Asserted: nothing was published and the destination was not created.
         // Not asserted: bytes kept -- this pause is on a timer rather than on
         // the server's count, so it can land before there is a part to keep.
-        assert!(
-            !matches!(outcome, Ok(SessionEnd::Published(_))),
-            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        // Paused, or stopped at a publication this platform refuses, and
+        // nothing else -- the same objection as above applies here.
+        settled_without_publishing(
+            &outcome,
+            engine.reason().await.unwrap(),
+            &[JobState::Paused, JobState::NeedsAction],
         );
         assert!(
             !destination.exists(),

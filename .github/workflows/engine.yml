@@ -153,8 +153,18 @@ jobs:
       # Named separately, and NOT overlapping: every file under tests/ is an
       # auto-discovered target, so an unqualified `test -p fhd-daemon` would run
       # the process suite as well and it would cost its wall time twice.
+      # One target per step, on purpose. Run together, a failure said only
+      # "Test engine end to end" and three suites shared the blame: two rounds
+      # of diagnosis were spent finding out which. Logs need a token, step
+      # names do not, so the split is what makes a red run legible without one.
+      # Every check is kept -- this changes where the boundary is drawn, not
+      # what runs.
+      - name: Test engine library
+        run: cargo +1.98.1 test -p fhd-daemon --locked --lib
       - name: Test engine end to end
-        run: cargo +1.98.1 test -p fhd-daemon --locked --lib --test end_to_end --test resident
+        run: cargo +1.98.1 test -p fhd-daemon --locked --test end_to_end
+      - name: Test engine over its socket
+        run: cargo +1.98.1 test -p fhd-daemon --locked --test resident
       # The library suites never start the program. Argument parsing, the
       # one-shot/serve/client dispatch and the control surface between two real
       # processes are only covered here.

@@ -51,6 +51,40 @@ pub fn kept_beside_matches(destination: &Path, body: &[u8]) -> bool {
         .is_some_and(|folder| walk(&folder.join(".fhd-parts"), body))
 }
 
+/// Assert a session that did not publish settled in one of the states the
+/// engine declares for it, rather than merely failing somehow.
+///
+/// F2 in the re-review of 11dd794: "not published" plus "no destination" is
+/// satisfied by any error at all, including a transport failure that fetched
+/// nothing. A test that accepts those is not measuring a publication refusal.
+///
+/// `allowed` is the set of resting states the caller's race can legitimately
+/// produce. When the state is `NeedsAction`, the reason must be the storage one
+/// -- that is what a refused publication looks like, and it is what separates
+/// it from a job that stopped for some other cause.
+#[track_caller]
+pub fn settled_without_publishing(
+    outcome: &Result<fhd_runtime::coordinator::SessionEnd, fhd_daemon::EngineError>,
+    reason: Option<fhd_domain::StopReason>,
+    allowed: &[fhd_domain::JobState],
+) {
+    use fhd_runtime::coordinator::SessionEnd;
+    let Ok(SessionEnd::Settled(state)) = outcome else {
+        panic!("expected a settled session without publication, got {outcome:?}");
+    };
+    assert!(
+        allowed.contains(state),
+        "settled in {state:?}, which is not one of the declared outcomes {allowed:?}"
+    );
+    if *state == fhd_domain::JobState::NeedsAction {
+        assert_eq!(
+            reason,
+            Some(fhd_domain::StopReason::Storage),
+            "the job needs action for some reason other than publication being refused"
+        );
+    }
+}
+
 pub struct Directory(pub PathBuf);
 impl Directory {
     /// The engine's own tree. Downloads land beside it, never inside it.
