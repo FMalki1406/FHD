@@ -7,8 +7,93 @@ use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, JobOutcome, Request}
 use fhd_domain::{JobState, StopReason};
 use fhd_runtime::coordinator::{Control, SessionEnd};
 use harness::{content, expected_digest, part_bytes, serve, Directory};
-use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    time::Duration,
+};
 use tokio::sync::mpsc;
+
+/// Whether this build can publish on this platform.
+///
+/// Windows only today: the mechanism is an NT call, and no measured equivalent
+/// exists yet for Linux or macOS. Publication refuses there rather than falling
+/// back to linking by path, which is the behaviour being replaced.
+///
+/// **Green tests are not a support claim.** This constant is what the tests
+/// below assert against, and `publication_support_on_this_platform_is_declared`
+/// is what ties it to the engine's actual behaviour, so the two cannot drift
+/// into a suite that passes while nothing works.
+const PUBLISHES: bool = cfg!(windows);
+
+/// The declared outcome of a run that fetched and verified everything.
+///
+/// Returns the published path where publication is supported, and `None` where
+/// it is not -- after asserting, in that case, the contract the engine actually
+/// offers: no published file, no completed job, and the downloaded bytes still
+/// on disk so the transfer can finish the day a mechanism exists.
+///
+/// This is not a way of switching tests off. Every test still runs on every
+/// platform and still asserts something the engine must do; what changes is
+/// which contract it is held to. A caller that gets `None` stops, because what
+/// follows is about a file this platform does not create.
+#[track_caller]
+fn published_as_declared(
+    outcome: Result<SessionEnd, fhd_daemon::EngineError>,
+    destination: &Path,
+    state: &Directory,
+) -> Option<PathBuf> {
+    if PUBLISHES {
+        match outcome {
+            Ok(SessionEnd::Published(Published::At(path))) => {
+                assert_eq!(&path, destination, "published somewhere else");
+                return Some(path);
+            }
+            other => panic!("expected a published file, got {other:?}"),
+        }
+    }
+    assert!(
+        !matches!(outcome, Ok(SessionEnd::Published(_))),
+        "publication succeeded on a platform with no mechanism: {outcome:?}"
+    );
+    assert!(
+        !destination.exists(),
+        "a refused publication created the destination"
+    );
+    assert!(
+        part_bytes(state) + kept_beside(destination) > 0,
+        "the downloaded bytes were discarded when publication was refused"
+    );
+    None
+}
+
+/// Bytes still held in the parts directory beside a destination.
+///
+/// `part_bytes` reads the state directory, which is where parts stopped living
+/// when they moved next to the file they become -- so on its own it answers zero
+/// for a transfer whose work is perfectly intact. The refusal contract is about
+/// those bytes surviving, so they are measured where the engine actually puts
+/// them: `<destination's directory>/.fhd-parts/<engine>/`.
+fn kept_beside(destination: &Path) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => walk(&entry.path()),
+                // owner.lock and similar bookkeeping are not payload.
+                Ok(metadata) if metadata.len() > 4096 => metadata.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+    match destination.parent() {
+        Some(parent) => walk(&parent.join(".fhd-parts")),
+        None => 0,
+    }
+}
 
 fn config(state: &Directory, destination: PathBuf, connections: usize) -> EngineConfig {
     EngineConfig {
@@ -43,10 +128,10 @@ async fn downloads_verifies_and_publishes_over_real_adapters() {
 
     let engine = Engine::open(settings, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(Published::At(destination.clone()))
-    );
+    let outcome = engine.run(receiver).await;
+    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+        return;
+    };
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(engine.state().await.unwrap(), JobState::Completed);
     // The part is released: its bytes live under the final name now.
@@ -112,9 +197,25 @@ async fn a_dropped_connection_resumes_from_committed_bytes() {
             .await
             .unwrap();
         let (_control, receiver) = mpsc::channel(1);
-        let outcome = engine.run(receiver).await.unwrap();
+        let outcome = engine.run(receiver).await;
         drop(engine);
-        match outcome {
+        if !PUBLISHES {
+            // Publication is unsupported here, so no run in this loop can
+            // finish. The retries are still waited out -- that is what this test
+            // is about -- and the run that gets past them is held to the refusal
+            // contract: nothing published, no destination, and the bytes
+            // committed before the server dropped the connection still on disk.
+            if matches!(
+                outcome,
+                Ok(SessionEnd::Settled(JobState::RetryWait | JobState::Queued))
+            ) {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            }
+            published_as_declared(outcome, &destination, &state);
+            return;
+        }
+        match outcome.unwrap() {
             SessionEnd::Published(path) => {
                 published = Some(path);
                 break;
@@ -189,10 +290,14 @@ async fn an_occupied_destination_is_never_overwritten() {
         .await
         .unwrap();
     let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(Published::At(destination.clone()))
-    );
+    let outcome = engine.run(receiver).await;
+    // Publication is unsupported here. What this test set out to prove is
+    // already proved above -- the occupied name was left alone and a rerun did
+    // not resume by itself -- and the resume that follows the operator freeing
+    // the name is held to the refusal contract instead of to a published file.
+    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+        return;
+    };
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }
 
@@ -216,6 +321,15 @@ async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
         control.send(Control::Pause).await.unwrap();
     };
     let (outcome, ()) = tokio::join!(run, pause);
+    if !PUBLISHES {
+        // Publication is unsupported here, so a run that outran the pause stops
+        // at publication rather than finishing. Either way the durable progress
+        // this test is about is on disk: the refusal contract below asserts
+        // nothing was published, the destination was not created and the fetched
+        // bytes were kept, which is as far as a later run could get.
+        published_as_declared(outcome, &destination, &state);
+        return;
+    }
     // Pausing may lose a race with completion; both outcomes are legitimate.
     match outcome.unwrap() {
         SessionEnd::Published(outcome) => assert_eq!(outcome, Published::At(destination.clone())),
@@ -271,12 +385,22 @@ async fn a_destination_away_from_the_state_directory_downloads_and_publishes() {
 
     let engine = Engine::open(settings, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(Published::At(destination.clone())),
-        "reason: {:?}",
-        engine.reason().await.unwrap()
-    );
+    let outcome = engine.run(receiver).await;
+    let published = published_as_declared(outcome, &destination, &state);
+    if published.is_none() {
+        // Publication is unsupported here: the run was held to the refusal
+        // contract above, which includes the fetched bytes surviving in the
+        // download folder. The state directory is still measured, because
+        // keeping the part out of it is the claim this test exists for and it
+        // holds whether or not the file can be published.
+        assert_eq!(
+            part_bytes(&state),
+            0,
+            "the part was written under the state directory after all"
+        );
+        assert!(served.load(Ordering::Relaxed) > 1, "used several requests");
+        return;
+    }
     assert_eq!(std::fs::read(&destination).unwrap(), body);
     assert_eq!(engine.state().await.unwrap(), JobState::Completed);
     assert!(served.load(Ordering::Relaxed) > 1, "used several requests");
@@ -374,6 +498,21 @@ async fn a_cancelled_job_leaves_no_part_behind() {
         control.send(Control::Cancel).await.unwrap();
     };
     let (outcome, ()) = tokio::join!(run, cancel);
+    if !PUBLISHES {
+        // Publication is unsupported here, so a run that outran the cancel stops
+        // at publication instead of finishing. Cancelling still has to leave the
+        // destination uncreated, which is asserted; whether the part survives is
+        // decided by which of the two won the race, so it is not asserted here.
+        assert!(
+            !matches!(outcome, Ok(SessionEnd::Published(_))),
+            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        );
+        assert!(
+            !destination.exists(),
+            "a cancelled job that never published created the destination"
+        );
+        return;
+    }
     match outcome.unwrap() {
         SessionEnd::Settled(JobState::Cancelled) => {}
         // Publication can win the race; then the part is released the other way.
@@ -397,10 +536,13 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
         .await
         .unwrap();
     let (_control, receiver) = mpsc::channel(1);
-    assert_eq!(
-        engine.run(receiver).await.unwrap(),
-        SessionEnd::Published(Published::At(destination.clone()))
-    );
+    let outcome = engine.run(receiver).await;
+    // Publication is unsupported here: the first run is held to the refusal
+    // contract instead, and with nothing published there is no file for a second
+    // request to reconcile against.
+    let Some(_) = published_as_declared(outcome, &destination, &state) else {
+        return;
+    };
     drop(engine);
 
     // A second request for the same bytes to the same name finds them already
@@ -449,6 +591,28 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
     let outcomes = engine.run_all(commands).await.unwrap();
 
     assert_eq!(outcomes.len(), 2);
+    if !PUBLISHES {
+        // Publication is unsupported here, so neither job can land in its file.
+        // Both jobs still ran side by side in the one directory the engine owns,
+        // and what is asserted is that each stopped at publication with its own
+        // name untouched and its own bytes kept.
+        for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
+            assert!(
+                !matches!(outcome, JobOutcome::Published(_)),
+                "job {index} published on a platform with no mechanism: {outcome:?}"
+            );
+            assert!(
+                !request.destination.exists(),
+                "job {index} created its destination without publishing"
+            );
+        }
+        // The two parts share one folder, so this is measured once for both.
+        assert!(
+            kept_beside(&state.0.join("first.bin")) > 0,
+            "the downloaded bytes were discarded when publication was refused"
+        );
+        return;
+    }
     for ((index, outcome), request) in outcomes.into_iter().zip(&requests) {
         match outcome {
             JobOutcome::Published(outcome) => {
@@ -490,6 +654,22 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     // Pausing may lose the race with a fast local server; either way the second run
     // is the one under test, and it is told nothing.
     let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
+    if !PUBLISHES {
+        // Publication is unsupported here, so the first run stops at its pause
+        // or at publication, and a second run could only reach the same place.
+        // Asserted: nothing was published and the destination was not created.
+        // Not asserted: bytes kept -- this pause is on a timer rather than on
+        // the server's count, so it can land before there is a part to keep.
+        assert!(
+            !matches!(outcome, Ok(SessionEnd::Published(_))),
+            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        );
+        assert!(
+            !destination.exists(),
+            "a refused publication created the destination"
+        );
+        return;
+    }
     outcome.unwrap();
     drop(engine);
 
@@ -526,7 +706,19 @@ async fn a_sensitive_link_is_not_remembered_so_it_cannot_be_continued() {
         .await
         .unwrap();
     let (_keep, commands) = mpsc::channel(4);
-    engine.run_all(commands).await.unwrap();
+    let outcomes = engine.run_all(commands).await.unwrap();
+    if !PUBLISHES {
+        // Publication is unsupported here, so the run stops at publication
+        // rather than finishing. That is asserted and the test goes on: what it
+        // is really about is what was written down, and a link that was never
+        // recorded is not recorded on this platform either.
+        assert!(
+            !outcomes
+                .iter()
+                .any(|(_, outcome)| matches!(outcome, JobOutcome::Published(_))),
+            "publication succeeded on a platform with no mechanism: {outcomes:?}"
+        );
+    }
     drop(engine);
 
     // The link was never written, so there is nothing here to continue with.
@@ -785,7 +977,17 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
         paused.send(Control::Pause).await.unwrap();
     };
     let (outcome, ()) = tokio::join!(run, pause);
-    outcome.expect("the first run settles");
+    if PUBLISHES {
+        outcome.expect("the first run settles");
+    } else {
+        // Publication is unsupported here, so engine A stops at its pause or at
+        // publication -- either way with its bytes in the shared folder, which
+        // is what engine B must not touch. Engine B still runs below.
+        assert!(
+            !matches!(outcome, Ok(SessionEnd::Published(_))),
+            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        );
+    }
     drop(engine);
 
     // Engine B runs a different download to completion in the same folder.
@@ -794,8 +996,29 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
     settings.expected_sha256 = Some(expected_digest(&second_body));
     let other = Engine::open(settings, &second_url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
+    let outcome = other.run(receiver).await;
+    if !PUBLISHES {
+        // Publication is unsupported here, so engine B cannot finish either.
+        // Both engines still wrote their parts into the one shared folder, which
+        // is where they used to collide: what is asserted is that neither
+        // published, neither destination was created, and bytes are still held
+        // there -- engine A's among them, since it never got to release them.
+        assert!(
+            !matches!(outcome, Ok(SessionEnd::Published(_))),
+            "publication succeeded on a platform with no mechanism: {outcome:?}"
+        );
+        assert!(
+            !second_destination.exists() && !first_destination.exists(),
+            "a refused publication created a destination"
+        );
+        assert!(
+            kept_beside(&first_destination) > 0,
+            "the downloaded bytes were discarded when publication was refused"
+        );
+        return;
+    }
     assert_eq!(
-        other.run(receiver).await.unwrap(),
+        outcome.unwrap(),
         SessionEnd::Published(Published::At(second_destination.clone())),
         "reason: {:?}",
         other.reason().await.unwrap()
@@ -879,8 +1102,16 @@ async fn a_platform_without_a_mechanism_refuses_to_publish_and_keeps_the_bytes()
     );
     // The transfer's work survives: this is a job waiting for a mechanism, not
     // one that has to be downloaded again.
+    //
+    // Measured where the parts actually are. `part_bytes` walks the state
+    // directory, but a part lives in `.fhd-parts` beside its destination --
+    // that is what lets a download land on a volume the engine does not live
+    // on -- so `part_bytes` answers zero for a transfer whose work is
+    // completely intact. Written against it alone, this assertion could never
+    // have held, and would have failed here for a reason that has nothing to
+    // do with what it is checking.
     assert!(
-        part_bytes(&state) > 0,
+        part_bytes(&state) + kept_beside(&destination) > 0,
         "the downloaded bytes were discarded when publication was refused"
     );
 }
