@@ -699,22 +699,30 @@ async fn several_requests_share_one_engine_and_each_lands_in_its_own_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     let body = content(2 * 1024 * 1024 + 33);
-    let (port, _) = serve(body.clone(), 0);
+    // Delivered slowly and paused on the bytes that actually arrived, not on a
+    // timer. The timer was a race the test could lose: on a fast runner the
+    // transfer finished inside the 15 ms, and then there was no unfinished work
+    // for the second run to continue -- which is the whole subject. Where
+    // publication is refused that also left the job needing action rather than
+    // paused, so the run under test had nothing to pick up.
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
     let state = Directory::new("continue");
     let destination = state.0.join("remembered.bin");
-    let url = format!("http://127.0.0.1:{port}/file");
+    let url = format!("http://127.0.0.1:{}/file", server.port);
 
     // First run: pause it, so there is unfinished work worth continuing.
     let engine = Engine::open(config(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
     let (control, receiver) = mpsc::channel(1);
+    let delivered = server.delivered.clone();
+    let quarter = body.len() as u64 / 4;
     let pause = async {
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        while delivered.load(Ordering::Relaxed) < quarter {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         control.send(Control::Pause).await.unwrap();
     };
-    // Pausing may lose the race with a fast local server; either way the second run
-    // is the one under test, and it is told nothing.
     let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
     // Paused, or stopped at a publication this platform refuses, and nothing
     // else. The first run is scaffolding either way -- the second is the one
@@ -725,19 +733,16 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     // named after. Not being able to name the finished bytes has nothing to do
     // with whether a later run can find a job it was never told about, which is
     // what is being tested.
-    if PUBLISHES {
-        outcome.unwrap();
-    } else {
-        settled_without_publishing(
-            &outcome,
-            engine.reason().await.unwrap(),
-            &[JobState::Paused, JobState::NeedsAction],
-        );
-        assert!(
-            !destination.exists(),
-            "a refused publication created the destination"
-        );
-    }
+    // Paused on every platform now, because the pause is bound to the transfer
+    // rather than to a clock. That is what leaves work for the second run.
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::Paused))),
+        "the first run did not pause, so there is nothing to continue: {outcome:?}"
+    );
+    assert!(
+        !destination.exists(),
+        "a paused run created the destination"
+    );
     drop(engine);
 
     // Second run knows nothing but the directory: no URL, no destination given.
