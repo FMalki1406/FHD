@@ -504,6 +504,16 @@ async fn a_destination_on_a_second_volume_downloads_and_publishes() {
         "FHD_SECOND_VOLUME is on the same volume as the state directory, so this          would pass without crossing anything"
     );
 
+    // Ignored by default, so CI never reaches this. Run by hand on a platform
+    // that cannot publish, it would fail at a destination that was never going
+    // to exist and blame the second volume for it. Whether a download can land
+    // on another volume is a question about publication, so where there is no
+    // publication there is no question to ask.
+    if !PUBLISHES {
+        eprintln!("skipped: this build does not publish on this platform");
+        return;
+    }
+
     let engine = Engine::open(settings, &url).await.unwrap();
     let (_control, receiver) = mpsc::channel(1);
     let outcome = engine.run(receiver).await.unwrap();
@@ -776,7 +786,14 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
         }
         other => panic!("continuing ended as {other:?}"),
     }
-    assert_eq!(std::fs::read(&destination).unwrap(), body);
+    // The published file, where there is one. The non-publishing arm above has
+    // already made its own two assertions -- no destination, and the bytes
+    // still beside it -- and this line contradicted the first of them: it read
+    // a file the same test had just required not to exist, and CI said so with
+    // a NotFound at this line.
+    if PUBLISHES {
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
