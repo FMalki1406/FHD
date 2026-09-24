@@ -24,6 +24,16 @@ libc = "=0.2.189"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
+    # `NtSetInformationFile` with `FILE_LINK_INFORMATION`: the only route on
+    # Windows to create a link from an open handle rather than from a path.
+    # `SetFileInformationByHandle` does not accept `FileLinkInfo`, so the
+    # documented Win32 surface has none. Support: the function is documented on
+    # learn.microsoft.com under the Windows Driver Kit, exported from ntdll.dll,
+    # and callable from user mode; the class is FileLinkInformation (11). It is
+    # not part of the Win32 API contract, which is the limit worth stating --
+    # Microsoft may change it, and this project pins nothing about that.
+    "Wdk_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

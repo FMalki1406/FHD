@@ -248,7 +248,17 @@ mod imp {
     use super::*;
     use std::fs::File;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::{ffi::c_void, iter::once, os::windows::ffi::OsStrExt, ptr};
+    use std::{
+        ffi::{c_void, OsStr},
+        iter::once,
+        os::windows::ffi::OsStrExt,
+        path::Path,
+        ptr,
+    };
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileLinkInformation, NtSetInformationFile, FILE_LINK_INFORMATION,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::{
         Foundation::{GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE},
         Security::{
@@ -1132,6 +1142,87 @@ mod imp {
             && left.FileId.Identifier == right.FileId.Identifier)
     }
 
+    /// The extended-length prefix a caller's path may carry. The object manager
+    /// does not use it, and leaving it on produced STATUS_OBJECT_NAME_INVALID.
+    const VERBATIM: &str = r"\\?\";
+    /// How the object manager spells a drive-letter path.
+    const OBJECT_ROOT: &str = r"\??\";
+    /// STATUS_OBJECT_NAME_COLLISION.
+    const NAME_COLLISION: u32 = 0xC000_0035;
+
+    /// Creates `destination` as another name for the file this handle holds.
+    ///
+    /// The point is *which* file. `hard_link` takes a source path and resolves
+    /// it at the moment it runs, so between proving some bytes and publishing
+    /// them the name can be made to mean a different file -- measured, and it
+    /// published the other bytes. A handle cannot be redirected that way.
+    ///
+    /// `SetFileInformationByHandle` has no class for this: `FileLinkInfo` is an
+    /// NT-level class, so `NtSetInformationFile` from ntdll is the only route.
+    /// **It is not part of the Win32 API contract.** It is documented under the
+    /// Windows Driver Kit, exported from ntdll.dll and callable from user mode,
+    /// and nothing here pins Microsoft to keeping it so. That limit belongs
+    /// beside the mechanism rather than in a footnote.
+    ///
+    /// Never replaces: `ReplaceIfExists` is false, so an occupied name comes
+    /// back as `AlreadyExists`, which is what `hard_link` does today.
+    ///
+    /// The path is made absolute and spelled the way the object manager expects.
+    pub fn link_from_handle(file: &File, destination: &Path) -> io::Result<()> {
+        let absolute = std::path::absolute(destination)?;
+        let text = absolute.to_string_lossy();
+        let text = text.strip_prefix(VERBATIM).unwrap_or(&text);
+        let name: Vec<u16> = OsStr::new(&format!("{OBJECT_ROOT}{text}"))
+            .encode_wide()
+            .collect();
+        let name_bytes = std::mem::size_of_val(name.as_slice());
+
+        // The struct ends in a one-character array the name runs past, so the
+        // buffer is the header plus the remaining characters.
+        let header = std::mem::size_of::<FILE_LINK_INFORMATION>();
+        let total = header + name_bytes.saturating_sub(std::mem::size_of::<u16>());
+        let mut buffer = vec![0u64; total.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+        // SAFETY: `buffer` is a `Vec<u64>` large enough for `total` bytes, so it
+        // is at least as aligned as this struct and long enough for the header
+        // and the name. It outlives the call below.
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = ptr::null_mut();
+            (*info).FileNameLength = u32::try_from(name_bytes).unwrap_or(0);
+            ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<u8>(),
+                ptr::addr_of_mut!((*info).FileName).cast::<u8>(),
+                name_bytes,
+            );
+        }
+
+        // SAFETY: zeroed is a valid state for this out-parameter, which the call
+        // fills in.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is borrowed from a live `File`; the buffer holds a
+        // `FILE_LINK_INFORMATION` and its name and is `total` bytes long, which
+        // is what is passed; the status block is a live local. Nothing is
+        // retained after the call returns.
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as HANDLE,
+                ptr::addr_of_mut!(status_block),
+                buffer.as_ptr().cast(),
+                u32::try_from(total).unwrap_or(0),
+                FileLinkInformation,
+            )
+        };
+        match status as u32 {
+            0 => Ok(()),
+            // An occupied name, which callers already handle from `hard_link`.
+            NAME_COLLISION => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            other => Err(io::Error::other(format!(
+                "NtSetInformationFile(FileLinkInformation) failed: {other:#010x}"
+            ))),
+        }
+    }
+
     /// Untrusted principals an object grants any of `rights` to, its owner
     /// included.
     fn holders(path: &std::path::Path, rights: u32) -> io::Result<Vec<String>> {
@@ -1373,7 +1464,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{acceptable_descriptor, create_pipe, open_pipe, same_object};
+pub use imp::{acceptable_descriptor, create_pipe, link_from_handle, open_pipe, same_object};
 pub use imp::{
     create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
     swappable_components, user_scope,
@@ -2081,6 +2172,73 @@ mod tests {
 
         drop(held);
         drop(impostor);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Linking from a handle publishes the file that was held, not the file the
+    /// name now leads to -- and it refuses a name already taken.
+    ///
+    /// This is the acceptance measurement for the publication contract, run
+    /// here rather than quoted. `hard_link` is in the same test as the control:
+    /// given the same takeover, it delivers the impostor. If both delivered the
+    /// same bytes this would be proving nothing, so the two are compared.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_from_a_handle_carries_the_held_file_and_never_replaces() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!(
+            "fhd-ntlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.bin");
+        fs::write(&source, b"ours").unwrap();
+        let held = fs::File::open(&source).unwrap();
+
+        // The takeover: the name now leads somewhere else.
+        fs::rename(&source, base.join("aside.bin")).unwrap();
+        fs::write(&source, b"theirs").unwrap();
+
+        // What a path-resolving link does with it, as the control.
+        let by_name = base.join("by-name.bin");
+        fs::hard_link(&source, &by_name).unwrap();
+        assert_eq!(
+            fs::read(&by_name).unwrap(),
+            b"theirs",
+            "the control did not reproduce the substitution, so the comparison \
+             below would prove nothing"
+        );
+
+        // What a handle-resolving link does with it.
+        let by_handle = base.join("by-handle.bin");
+        link_from_handle(&held, &by_handle).expect("the handle link succeeds");
+        assert_eq!(
+            fs::read(&by_handle).unwrap(),
+            b"ours",
+            "the handle link delivered the file the name led to"
+        );
+        assert!(
+            same_object(&held, &fs::File::open(&by_handle).unwrap()).unwrap(),
+            "the published name is not the object that was held"
+        );
+
+        // And it never replaces: an occupied name is refused, and what was
+        // there is untouched.
+        let occupied = base.join("occupied.bin");
+        fs::write(&occupied, b"somebody else").unwrap();
+        let refused = link_from_handle(&held, &occupied).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "an occupied name was refused for the wrong reason: {refused}"
+        );
+        assert_eq!(fs::read(&occupied).unwrap(), b"somebody else");
+
+        drop(held);
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -64,7 +64,7 @@
 
 | المنصة | الآلية المرشَّحة | المرجع | الحالة |
 | --- | --- | --- | --- |
-| **Windows** | `NtSetInformationFile` + `FILE_LINK_INFORMATION` | `ntifs.h`؛ و`FILE_LINK_INFORMATION` يحمل `ReplaceIfExists` فيُضبط `FALSE` لدلالة «بلا استبدال» | **بُني وجُرِّب في مراجعة**: بعد الاستيلاء على اسم المصدر، سلّم الربط بالمقبض البايتات المتحقَّق منها بينما سلّم `hard_link` بالاسم بايتات المهاجم. بلا حزمة جديدة (`windows-sys` موجودة). **يحتاج مراجعة مستقلة** |
+| **Windows** | `NtSetInformationFile` + `FILE_LINK_INFORMATION` (الصنف `FileLinkInformation` = 11) | مُوثَّقة تحت **Windows Driver Kit**، ومُصدَّرة من `ntdll.dll`، وقابلة للنداء من وضع المستخدم. **وليست جزءًا من عقد Win32** — وهذا حدّ مُعلَن لا هامش. و`ReplaceIfExists` تُضبط `false` لدلالة «بلا استبدال» | **منفَّذة ومقيسة هنا، لا منقولة.** `link_from_handle` في `fhd-platform`، واختبار `a_link_from_a_handle_carries_the_held_file_and_never_replaces`: في التشغيل نفسه، `hard_link` بالاسم يسلّم بايتات المهاجم (ضبط موجب) والربط من المقبض يسلّم المحفوظة، والاسم المشغول يُرفض `AlreadyExists` بلا مساس بمحتواه. **مصيدة:** `FileName` يبدأ عند الإزاحة 20 والبنية 24 بايت، وإبقاء بادئة `\?\` يعطي `STATUS_OBJECT_NAME_INVALID` — وقع كلاهما |
 | | `SetFileInformationByHandle` + `FileLinkInfoEx` | Win32، أحدث، وفيه أعلام صريحة للاستبدال | **غير مقيسة** — بديل يستحق المقارنة لأنه واجهة موثقة لا داخلية |
 | **Linux** | `linkat` بـ`AT_EMPTY_PATH` على مقبض | `linkat(2)`: يتطلب `CAP_DAC_READ_SEARCH` | **غير مقيسة**، ويُرجَّح أنها غير متاحة بلا امتياز |
 | | `linkat` على `/proc/self/fd/N` بـ`AT_SYMLINK_FOLLOW` | `proc(5)` يصف `/proc/self/fd` وصلات سحرية؛ **وسلوك `linkat` معها ليس مضمونًا بالتعريف** | **غير مقيسة — خيار بحث لا ضمان** |
