@@ -310,97 +310,97 @@ async fn an_occupied_destination_is_never_overwritten() {
     assert_eq!(std::fs::read(&destination).unwrap(), body);
 }
 
+/// Pausing stops the run, the job stays stopped, and a later run finishes it.
+///
+/// **What this does not claim, and why.** The review of 9f4127d objected that
+/// `kept_beside > 0` proved nothing, because a part is created at its full
+/// length before a byte arrives. Replacing it with the repository's own
+/// `durable_bytes` found something better than a stronger assertion: measured
+/// here, 491 KiB of a 1 MiB file had been delivered and the record still said
+/// **zero**. An extent is committed when a segment completes, not as bytes
+/// arrive, and `initial_split` cuts a transfer into at most one segment per
+/// connection, all fetched at once. So the record goes from nothing to
+/// everything, and a pause part-way through keeps nothing.
+///
+/// That is a property of the engine, not of this test, and it is worth writing
+/// down: **this build does not preserve partial progress across a pause taken
+/// mid-segment.** A test that manufactured a window to assert otherwise would
+/// be describing an engine we do not have.
+///
+/// What is asserted instead is what the pause is actually for: the run stops,
+/// it does not restart by itself, an explicit resume finishes it, and the
+/// record is the same after the state directory is closed and reopened. The
+/// claim that a resume reuses committed work belongs to
+/// `a_dropped_connection_resumes_from_committed_bytes`, where a segment has
+/// completed and there is something to reuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pause_keeps_durable_progress_and_a_later_run_finishes() {
-    let body = content(8 * 1024 * 1024);
-    let (port, served) = serve(body.clone(), 0);
+async fn pause_stops_the_run_and_a_later_run_finishes_it() {
+    // Delivered slowly so the pause lands mid-transfer rather than racing the
+    // end of it, and counted so the resume can be compared against it.
+    let body = content(2 * 1024 * 1024);
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
     let state = Directory::new("pause");
     let destination = state.0.join("paused.bin");
-    let url = format!("http://127.0.0.1:{port}/file");
+    let url = format!("http://127.0.0.1:{}/file", server.port);
 
     let engine = Engine::open(config(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
     let (control, receiver) = mpsc::channel(1);
     let run = engine.run(receiver);
+    let delivered = server.delivered.clone();
+    let quarter = body.len() as u64 / 4;
     let pause = async {
-        while served.load(Ordering::Relaxed) < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        while delivered.load(Ordering::Relaxed) < quarter {
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         control.send(Control::Pause).await.unwrap();
     };
     let (outcome, ()) = tokio::join!(run, pause);
-    let first_reason = engine.reason().await.unwrap();
-    let first = outcome.expect("the first run ended with an error");
 
-    // Three phases, kept apart. Folding them together is what broke this on
-    // Unix at 24445c4: a paused run was handed to the publication helper, which
-    // asks for a finished transfer, and the failure said `Ok(Settled(Paused))`.
-    // Pausing and publishing are different questions and are asked separately.
-    //
-    // Phase one: however the race between the pause and the transfer went, the
-    // work already committed must still be on disk.
-    let finished_early = match &first {
-        // The pause won, which is the case this test is really about.
-        SessionEnd::Settled(JobState::Paused) => false,
-        // The transfer outran the pause and published. Written as a guard
-        // rather than an assertion inside the arm, because `PUBLISHES` is a
-        // constant and asserting on one is a lint -- a lint that is right:
-        // the condition belongs in the match, where a platform that cannot
-        // publish falls through to the panic below.
-        SessionEnd::Published(Published::At(path)) if PUBLISHES => {
-            assert_eq!(path, &destination);
-            true
-        }
-        // The transfer outran the pause and reached publication, which this
-        // platform refuses. That is as finished as a transfer gets here.
-        SessionEnd::Settled(JobState::NeedsAction) if !PUBLISHES => {
-            assert_eq!(first_reason, Some(StopReason::Storage));
-            true
-        }
-        other => panic!("the first run settled in a state nothing declares: {other:?}"),
-    };
-    if !finished_early {
-        // Size, not contents: the transfer is deliberately incomplete here, so
-        // what is being claimed is that progress survived a pause -- not that it
-        // is the whole file. Correctness is proved at the end, by comparison.
-        assert!(
-            kept_beside(&destination) > 0,
-            "pausing lost the progress that had already been committed"
-        );
-    }
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::Paused))),
+        "the run did not pause: {outcome:?}"
+    );
+    // Whatever the record holds, it is the record that decides -- and it has to
+    // survive the state directory being closed and reopened, which is what
+    // makes it durable rather than remembered.
+    let kept = engine.durable_bytes().await.unwrap();
+    assert!(kept <= body.len() as u64);
     drop(engine);
 
-    if finished_early {
-        if PUBLISHES {
-            assert_eq!(std::fs::read(&destination).unwrap(), body);
-        } else {
-            assert!(
-                kept_beside_matches(&destination, &body),
-                "the bytes were not kept after publication was refused"
-            );
-        }
-        return;
-    }
-
-    // Phase two: a stopped job stays stopped until the operator asks, and then
-    // resumes. This runs on every platform -- resuming has nothing to do with
-    // whether the finished bytes can be named.
     let idle = Engine::open(config(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
     let (_control, receiver) = mpsc::channel(1);
     assert!(idle.run(receiver).await.is_err(), "no automatic resume");
+    assert_eq!(
+        idle.durable_bytes().await.unwrap(),
+        kept,
+        "the committed progress did not survive reopening the state directory"
+    );
     drop(idle);
-    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+
+    let resumed = Engine::open(resuming(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
+    let before = server.delivered.load(Ordering::Relaxed);
     let (_control, receiver) = mpsc::channel(1);
-    let outcome = engine.run(receiver).await;
-    let reason = engine.reason().await.unwrap();
+    let outcome = resumed.run(receiver).await;
+    let reason = resumed.reason().await.unwrap();
 
-    // Phase three: the transfer is complete, so now the publication outcome is
-    // the platform's to declare -- and the content is checked either way.
+    // The resume fetched what was missing and no more than the file. With
+    // nothing committed that is the whole of it, which is the honest number
+    // here rather than a saving this engine does not make at this granularity.
+    let refetched = server.delivered.load(Ordering::Relaxed) - before;
+    // The upper bound allows for the probe, which is a one-byte ranged request
+    // the server counts like any other delivery.
+    assert!(
+        refetched >= body.len() as u64 - kept && refetched <= body.len() as u64 + 1024,
+        "the resume fetched {refetched} bytes with {kept} committed, out of {}",
+        body.len()
+    );
+
     if published_as_declared(outcome, reason, &destination, &body).is_none() {
         return;
     }
@@ -716,14 +716,18 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     // Pausing may lose the race with a fast local server; either way the second run
     // is the one under test, and it is told nothing.
     let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
-    if !PUBLISHES {
-        // Publication is unsupported here, so the first run stops at its pause
-        // or at publication, and a second run could only reach the same place.
-        // Asserted: nothing was published and the destination was not created.
-        // Not asserted: bytes kept -- this pause is on a timer rather than on
-        // the server's count, so it can land before there is a part to keep.
-        // Paused, or stopped at a publication this platform refuses, and
-        // nothing else -- the same objection as above applies here.
+    // Paused, or stopped at a publication this platform refuses, and nothing
+    // else. The first run is scaffolding either way -- the second is the one
+    // under test, and it runs on every platform.
+    //
+    // F3 in the review of 9f4127d: this used to return here where publication
+    // is unsupported, so on Linux and macOS it never reached the reopen it is
+    // named after. Not being able to name the finished bytes has nothing to do
+    // with whether a later run can find a job it was never told about, which is
+    // what is being tested.
+    if PUBLISHES {
+        outcome.unwrap();
+    } else {
         settled_without_publishing(
             &outcome,
             engine.reason().await.unwrap(),
@@ -733,9 +737,7 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
             !destination.exists(),
             "a refused publication created the destination"
         );
-        return;
     }
-    outcome.unwrap();
     drop(engine);
 
     // Second run knows nothing but the directory: no URL, no destination given.
@@ -745,11 +747,28 @@ async fn a_later_run_continues_what_it_remembers_without_being_told_the_link() {
     let (_keep, commands) = mpsc::channel(4);
     let outcomes = engine.run_all(commands).await.unwrap();
     assert_eq!(outcomes.len(), 1);
+    // The job was found and carried to its end, and what "its end" is depends
+    // on the platform. That it was found at all is the claim.
     match &outcomes[0].1 {
-        JobOutcome::Published(outcome) => assert_eq!(outcome, &Published::At(destination.clone())),
+        JobOutcome::Published(outcome) if PUBLISHES => {
+            assert_eq!(outcome, &Published::At(destination.clone()));
+        }
         // Already finished before the pause landed: the remembered job was still
         // found and settled, which is what continuing has to prove.
-        JobOutcome::Settled(JobState::Completed, _) => {}
+        JobOutcome::Settled(JobState::Completed, _) if PUBLISHES => {}
+        // Found, continued, and stopped where this platform stops -- at
+        // publication, for the storage reason.
+        JobOutcome::Settled(JobState::NeedsAction, reason) if !PUBLISHES => {
+            assert_eq!(*reason, Some(StopReason::Storage));
+            assert!(
+                !destination.exists(),
+                "a refused publication created the destination"
+            );
+            assert!(
+                kept_beside_matches(&destination, &body),
+                "continuing did not leave the downloaded bytes on disk"
+            );
+        }
         other => panic!("continuing ended as {other:?}"),
     }
     assert_eq!(std::fs::read(&destination).unwrap(), body);

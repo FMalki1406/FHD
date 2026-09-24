@@ -264,6 +264,79 @@ pub fn serve(body: Vec<u8>, failures: usize) -> (u16, Arc<AtomicU64>) {
     });
     (port, served)
 }
+/// A server that delivers the body slowly, and counts the bytes it delivered.
+///
+/// The pause test needs two things the ordinary server cannot give. It needs
+/// the pause to land while the transfer is genuinely part-way -- the request
+/// counter rises before a byte is sent, so triggering on it can pause before
+/// any progress exists, or after the whole file has already gone out, and then
+/// the test measures a race rather than a resume. And it needs to know how many
+/// bytes were actually sent, which is the only way to tell a resume that used
+/// the saved progress from one that fetched the file again.
+///
+/// Slow rather than blocking: an earlier version held the body open until the
+/// test released it, and hung. A server that always makes progress cannot
+/// deadlock with the client no matter how the pause lands.
+pub struct Slow {
+    pub port: u16,
+    pub requests: Arc<AtomicU64>,
+    pub delivered: Arc<AtomicU64>,
+}
+
+pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> Slow {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(AtomicU64::new(0));
+    let delivered = Arc::new(AtomicU64::new(0));
+    let body = Arc::new(body);
+    let (counter, bytes) = (requests.clone(), delivered.clone());
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let (body, counter, bytes) = (body.clone(), counter.clone(), bytes.clone());
+            std::thread::spawn(move || {
+                let request = read_request(&mut stream);
+                counter.fetch_add(1, Ordering::Relaxed);
+                let range = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .map(|value| {
+                        let value = value.trim();
+                        let (start, end) = value.split_once('-').unwrap_or((value, ""));
+                        let start: u64 = start.parse().unwrap_or(0);
+                        let end: u64 = end.parse().unwrap_or(body.len() as u64 - 1);
+                        (start, end.min(body.len() as u64 - 1))
+                    });
+                let (start, end) = range.unwrap_or((0, body.len() as u64 - 1));
+                let slice = &body[start as usize..=end as usize];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nAccept-Ranges: bytes\r\n\
+                 Content-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    body.len(),
+                    slice.len()
+                );
+                if stream.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                for piece in slice.chunks(chunk.max(1)) {
+                    if stream.write_all(piece).is_err() {
+                        return;
+                    }
+                    if stream.flush().is_err() {
+                        return;
+                    }
+                    bytes.fetch_add(piece.len() as u64, Ordering::Relaxed);
+                    std::thread::sleep(pause);
+                }
+            });
+        }
+    });
+    Slow {
+        port,
+        requests,
+        delivered,
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut byte = [0u8; 1];

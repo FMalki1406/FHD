@@ -196,39 +196,89 @@ test('attribute scanning survives brackets inside string literals', () => {
   );
 });
 
-// F1 from the re-review of 11dd794: a comment inside the attribute walked past
-// a gate that stripped only whitespace. Rust accepts all of these and each
-// silences `deny(unsafe_code)`; the first is the one the reviewer compiled.
+// F1, twice reported. The first fix stripped comments before deciding what an
+// attribute meant, but the attribute's own boundaries were found first, so
+// `#[allow /* ] */ (unsafe_code)]` ended at the bracket inside the comment and
+// came back as `#[allow /* ]` -- no mention of unsafe_code, dropped unexamined.
+//
+// The regression test missed it too, and that is the more useful lesson: it ran
+// against the platform file, whose approved allowance was absent from the
+// sample, so a "no longer present" complaint made the offender list non-empty
+// and the assertion passed without the bypass ever being seen. A count of "any
+// message" is not a diagnosis. These use a file with no approvals at all, so
+// the only thing that can be reported is the thing under test, and they match
+// the message rather than counting it.
 test('unsafe gate is not talked past with a comment inside the attribute', () => {
-  const file = 'crates/adapters/platform/src/lib.rs';
+  // A file with no approved allowance: any offender here is the one we want.
+  const clean = 'crates/adapters/storage/src/lib.rs';
   const bypasses = [
-    '#[allow /* reason */ (unsafe_code)]\npub fn unauthorized() {}\n',
-    // Block comments nest in Rust, so a naive scan for the first `*/` stops early.
-    '#[allow /* a /* b */ c */ (unsafe_code)]\npub fn unauthorized() {}\n',
-    '#[allow( // why\n    unsafe_code\n)]\npub fn unauthorized() {}\n',
-    // A `]` inside a comment must not end the attribute early, or the allowance
-    // would be read as ordinary code and never examined at all.
-    '#[allow /* ] */ (unsafe_code)]\npub fn unauthorized() {}\n',
-    '#![allow /* reason */ (unsafe_code)]\n',
+    ['a block comment', '#[allow /* reason */ (unsafe_code)]\npub fn unauthorized() {}\n'],
+    // Block comments nest in Rust, so a scan for the first `*/` stops early.
+    ['nested block comments', '#[allow /* a /* b */ c */ (unsafe_code)]\npub fn unauthorized() {}\n'],
+    ['a line comment', '#[allow( // why\n    unsafe_code\n)]\npub fn unauthorized() {}\n'],
+    // The one that survived the first fix: the attribute's end was found
+    // before its comments were removed.
+    ['a bracket inside a comment', '#![deny(unsafe_code)]\n#[allow /* ] */ (unsafe_code)]\npub fn unauthorized() {}\n'],
+    ['a bracket inside a line comment', '#[allow( // ]\n    unsafe_code\n)]\npub fn unauthorized() {}\n'],
+    ['a bracket inside nested comments', '#[allow /* a /* ] */ b */ (unsafe_code)]\npub fn unauthorized() {}\n'],
   ];
-  for (const source of bypasses) {
-    assert.ok(
-      unsafeOffendersIn(file, source).length > 0,
-      `not reported: ${JSON.stringify(source)}`,
+  for (const [what, source] of bypasses) {
+    const offenders = unsafeOffendersIn(clean, source);
+    assert.equal(
+      offenders.length, 1,
+      `${what}: expected exactly one report, got ${JSON.stringify(offenders)}`,
+    );
+    assert.match(
+      offenders[0],
+      /unsafe allowed on an item that is not approved|spelling this gate does not accept/u,
+      `${what}: reported something other than the allowance`,
     );
   }
 
-  // A comment on the approved allowance is still the approved allowance: the
-  // point is to read the attribute correctly, not to ban explaining it.
+  // Inner attributes stay refused, and for the stated reason.
+  for (const inner of [
+    '#![allow(unsafe_code)]\n',
+    '#![allow /* reason */ (unsafe_code)]\n',
+    '#![allow(dead_code, unsafe_code)]\n',
+    '#![cfg_attr(windows, allow(unsafe_code))]\n',
+  ]) {
+    const offenders = unsafeOffendersIn(clean, inner);
+    assert.equal(offenders.length, 1, inner);
+    assert.match(offenders[0], /crate- or module-wide/u, inner);
+  }
+
+  // And a file that keeps every allowance it is entitled to reports nothing --
+  // so the checks above are detecting the bypass, not the sample's tidiness.
+  const platform = 'crates/adapters/platform/src/lib.rs';
   assert.deepEqual(
-    unsafeOffendersIn(file, '#[allow /* geteuid */ (unsafe_code)]\nfn our_uid() -> u32 {\n}\n'),
+    unsafeOffendersIn(platform, '#[allow(unsafe_code)]\nfn our_uid() -> u32 {\n    0\n}\n'),
     [],
   );
+  assert.deepEqual(
+    unsafeOffendersIn(platform, '#[allow /* geteuid */ (unsafe_code)]\nfn our_uid() -> u32 {\n}\n'),
+    [],
+    'a comment explaining the approved allowance is still the approved allowance',
+  );
+  // The same file with the allowance moved off its approved item: two reports,
+  // one for the unapproved item and one for the approved one going missing.
+  assert.equal(
+    unsafeOffendersIn(platform, '#[allow(unsafe_code)]\nfn somewhere_else() {}\n').length,
+    2,
+  );
 
-  // And a `/*` inside a string is not a comment.
+  // Restrictions are the policy, not a breach of it.
+  for (const restriction of [
+    '#![forbid(unsafe_code)]\n',
+    '#![deny(unsafe_code)]\n',
+    '#![cfg_attr(not(windows), deny(unsafe_code))]\n',
+  ]) {
+    assert.deepEqual(unsafeOffendersIn(clean, restriction), [], restriction);
+  }
+
+  // A `/*` inside a string is not a comment, and a comment becomes one space
+  // so tokens on either side of it never merge.
   assert.equal(withoutComments('#[doc = "/* not a comment */"]'), '#[doc = "/* not a comment */"]');
   assert.equal(withoutComments('a /* b */ c'), 'a   c');
-  // A comment becomes one space and the newline stays, so tokens never merge.
   assert.equal(withoutComments('a // b\nc'), 'a  \nc');
   assert.equal(withoutComments('allow/*x*/(unsafe_code)'), 'allow (unsafe_code)');
 });

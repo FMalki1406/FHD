@@ -162,6 +162,26 @@ export function attributesIn(text) {
     let end = -1;
     for (let j = open; j < text.length; j += 1) {
       const ch = text[j];
+      // Comments are skipped here, not later. Stripping them afterwards was
+      // too late: `#[allow /* ] */ (unsafe_code)]` ended at the bracket inside
+      // the comment, so the attribute came back as `#[allow /* ]`, which does
+      // not mention unsafe_code and was dropped without ever being examined.
+      // Rust nests block comments, so the depth is counted.
+      if (text.slice(j, j + 2) === '/*') {
+        let comment = 0;
+        while (j < text.length) {
+          const here = text.slice(j, j + 2);
+          if (here === '/*') { comment += 1; j += 2; continue; }
+          if (here === '*/') { comment -= 1; j += 2; if (comment === 0) break; continue; }
+          j += 1;
+        }
+        j -= 1;
+        continue;
+      }
+      if (text.slice(j, j + 2) === '//') {
+        while (j < text.length && text[j] !== '\n') j += 1;
+        continue;
+      }
       if (ch === '"') {
         j += 1;
         while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
