@@ -7,10 +7,18 @@ publish = false
 [dependencies]
 tokio = { version = "=1.51.4", features = ["net"] }
 
-# `geteuid(2)` and nothing else. Already in Cargo.lock as a transitive
-# dependency, so this adds no code to the build -- but it is named here rather
-# than relied on incidentally, because a direct dependency is reviewed and a
-# transitive one is not.
+# `geteuid(2)` and nothing else.
+#
+# Already in Cargo.lock as a transitive dependency, so naming it here adds no
+# code to the build. That does not make it exempt from review: direct and
+# transitive dependencies are both in scope for the licence and security review
+# this project requires, and arriving through another crate has never been a way
+# round it.
+#
+# What is used and what is not: one function, `geteuid`, in `our_uid`. No
+# allocation, no pointers, no file descriptors, nothing that can fail. If a
+# second use appears it is a change to this comment and to the unsafe allowance
+# in tools/check-architecture.mjs, both of which are reviewed.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
 

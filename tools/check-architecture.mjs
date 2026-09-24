@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +48,47 @@ const pureDependencies = new Set(['serde', 'thiserror']);
 // The workflow names the packages it tests, one step per area, so a failure on a
 // runner whose logs we cannot read still says where it is. The cost of naming
 // them is that a new member could ship untested; this is that cost paid.
+// Every place in the tree allowed to write `unsafe`, and nowhere else.
+//
+// The policy used to be a comment beside the dependency rules, which is close
+// to not having one: a crate could add `#![allow(unsafe_code)]` and nothing
+// would say so. An exception that can be granted where it is used is not a
+// policy, it is a preference.
+//
+// Each entry is a file and the exact number of `#[allow(unsafe_code)]`
+// attributes approved in it. A new one, or one in a file not listed, fails the
+// build -- so widening this is an edit to this file, which is reviewed, rather
+// than an attribute added in passing. `forbid` is still the rule everywhere
+// else; this is only for the crates that cannot use it.
+export const UNSAFE_ALLOWANCES = new Map([
+  // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
+  ['crates/adapters/platform/src/lib.rs', 1],
+]);
+
+export function checkUnsafePolicy(root) {
+  const offenders = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory)) {
+      if (entry === 'target' || entry === '.git') continue;
+      const full = `${directory}/${entry}`;
+      if (statSync(full).isDirectory()) { walk(full); continue; }
+      if (!entry.endsWith('.rs')) continue;
+      const relative = full.slice(root.length + 1).split('\\').join('/');
+      const source = readFileSync(full, 'utf8');
+      const allowances = (source.match(/#!?\[allow\(unsafe_code\)\]/gu) ?? []).length;
+      const approved = UNSAFE_ALLOWANCES.get(relative) ?? 0;
+      if (allowances > approved) {
+        offenders.push(
+          `${relative}: ${allowances} unsafe allowance(s), ${approved} approved. ` +
+          'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
+        );
+      }
+    }
+  };
+  walk(`${root}/crates`);
+  return offenders;
+}
+
 export function checkTestCoverage(metadata, workflow) {
   const members = metadata.workspace_members
     .map(id => metadata.packages.find(pkg => pkg.id === id))
@@ -135,7 +176,12 @@ function main(args) {
   const workflow = readFileSync(fileURLToPath(new URL('../.github/workflows/engine.yml', import.meta.url)), 'utf8');
   const untested = checkTestCoverage(metadata, workflow);
   if (untested.length) throw new Error(`Untested workspace members:\n${untested.join('\n')}`);
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step).`);
+  // An unsafe allowance that nobody approved would otherwise be one attribute
+  // away from being policy.
+  const root = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/u, '');
+  const unapproved = checkUnsafePolicy(root);
+  if (unapproved.length) throw new Error(`Unapproved unsafe allowances:\n${unapproved.join('\n')}`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
