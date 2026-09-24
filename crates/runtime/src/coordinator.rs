@@ -954,6 +954,17 @@ impl Session<'_> {
             .map_err(|_| RunError::Repository)?;
         match self.occupant(&destination, intent.size()).await? {
             // Our own bytes: the rename happened before the crash.
+            //
+            // `At` is claimed on different evidence here than after a live
+            // publication, and the difference is worth naming. There, the path
+            // is compared with the published handle by object identity. Here,
+            // no handle survived the crash, so what is checked is that the file
+            // at the path has the size and digest the intent recorded -- the
+            // path leads to a file whose bytes are the proved bytes, which is
+            // what `At` promises an operator. It is not weaker in what it
+            // claims; it is a content match rather than an inode match, and a
+            // reader who assumes otherwise would be wrong about which
+            // substitutions it excludes.
             Some(Occupant::File { size, digest })
                 if size == intent.size() && digest == intent.digest() =>
             {

@@ -658,6 +658,20 @@ impl SegmentFile for FilePart {
 
     fn publish(&mut self) -> Result<Published, StorageError> {
         self.healthy()?;
+        // Once is all. A published part is finished, and asking again is not a
+        // retry -- the bytes are already somebody's file.
+        //
+        // This is not a tidiness rule. After a `Moved` publication the
+        // destination path does not exist, so the absence check below does not
+        // stop a second attempt; it reaches the linker, which refuses because
+        // the name is taken inside the adopted folder, and the refusal path
+        // then does what it does for a publication that never happened -- it
+        // lifts the seal. The seal is what stops a reopened part writing to the
+        // inode the published file is a link to, so lifting it would make a
+        // delivered file writable again. Measured, and refused here instead.
+        if self.published {
+            return Err(StorageError::InvalidState);
+        }
         let expected = self.verified.ok_or(StorageError::InvalidState)?;
         if !self.synchronized || !self.complete() {
             return Err(StorageError::InvalidState);

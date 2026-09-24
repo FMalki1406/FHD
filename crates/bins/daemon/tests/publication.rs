@@ -793,3 +793,86 @@ fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
         "an unverified location led to a second copy or a removal"
     );
 }
+
+/// A part that has published is finished, and asking again must not undo it.
+///
+/// Found by asking what happens after `Moved`. The destination path does not
+/// exist then -- the folder moved -- so the absence check that stops an
+/// ordinary second publication does not stop this one. It reaches the linker,
+/// which refuses because the name is taken **inside the adopted folder**, and
+/// the refusal path then does what it does for a publication that never
+/// happened: it lifts the seal.
+///
+/// The seal is what stops a reopened part writing to the inode the published
+/// file is a link to. Lifting it on a part whose bytes have already been
+/// delivered would make a delivered file writable again. Nothing in the engine
+/// asks twice today; this makes it safe for the one that eventually does.
+#[cfg(windows)]
+#[test]
+fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
+    struct RealLinker;
+    impl HandleLinker for RealLinker {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
+            })
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+        }
+    }
+
+    let directory = Directory::new("publish-twice");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let downloads = directory.0.join("downloads");
+    fs::create_dir_all(&downloads).unwrap();
+    let destination = downloads.join("published.bin");
+
+    let store = FileStorage::default().with_linker(Arc::new(RealLinker));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+    part.publish().expect("the first publication succeeds");
+
+    // The folder moves, exactly as in the `Moved` case, so the destination path
+    // no longer exists and the absence check lets a second attempt through.
+    let aside = directory.0.join("downloads-moved-away");
+    fs::rename(&downloads, &aside).unwrap();
+    assert!(!destination.exists());
+
+    assert_eq!(
+        part.publish(),
+        Err(StorageError::InvalidState),
+        "a part that has published was allowed to publish again"
+    );
+    drop(part);
+
+    // The seal still stands, so the delivered file's inode is still protected.
+    let meta = fs::read(parts.join("1-1.meta")).unwrap();
+    assert_eq!(
+        meta.get(33),
+        Some(&1u8),
+        "asking twice lifted the seal on a part whose bytes were delivered"
+    );
+
+    // And the delivered file is untouched, with no second copy anywhere.
+    let landed: Vec<_> = fs::read_dir(&aside)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(landed, vec!["published.bin".to_string()]);
+    assert_eq!(fs::read(aside.join("published.bin")).unwrap(), b"AAAAAA");
+}
