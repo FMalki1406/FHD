@@ -492,7 +492,11 @@ impl SegmentFile for MemoryFile {
         // Like the real adapter: a reopened handle has not synced anything yet.
         Ok(())
     }
-    fn verify(&mut self, expected: Option<[u8; 32]>) -> Result<[u8; 32], StorageError> {
+    fn verify(
+        &mut self,
+        expected: Option<[u8; 32]>,
+        _record: &[(fhd_domain::ByteRange, [u8; 32])],
+    ) -> Result<[u8; 32], StorageError> {
         if !self.complete() || !self.synced {
             return Err(StorageError::InvalidState);
         }

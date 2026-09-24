@@ -848,8 +848,20 @@ impl Session<'_> {
             .await?;
             return Ok(SessionEnd::Settled(self.job.state()));
         }
+        // The committed extents are the prior evidence this check is made
+        // against. Reading them from the repository rather than from the file
+        // is the whole point: verifying against a digest taken from the file a
+        // moment earlier is this code checking itself.
+        let record: Vec<(ByteRange, [u8; 32])> =
+            match self.c.ports.repository.durable_extents(self.job.id()).await {
+                Ok(extents) => extents
+                    .into_iter()
+                    .map(|extent| (extent.range(), extent.digest()))
+                    .collect(),
+                Err(_) => return Err(RunError::Repository),
+            };
         match writer
-            .verify(self.job.spec().expected_sha256(), &self.io)
+            .verify(self.job.spec().expected_sha256(), record, &self.io)
             .await
         {
             Ok(digest) => self.publish(digest).await,
@@ -947,8 +959,16 @@ impl Session<'_> {
             if writer.sync(&self.io).await.is_err() {
                 return self.publish_blocked(StopReason::Storage).await;
             }
+            let record: Vec<(ByteRange, [u8; 32])> =
+                match self.c.ports.repository.durable_extents(self.job.id()).await {
+                    Ok(extents) => extents
+                        .into_iter()
+                        .map(|extent| (extent.range(), extent.digest()))
+                        .collect(),
+                    Err(_) => return Err(RunError::Repository),
+                };
             match writer
-                .verify(self.job.spec().expected_sha256(), &self.io)
+                .verify(self.job.spec().expected_sha256(), record, &self.io)
                 .await
             {
                 Ok(digest) if digest == intent.digest() => {}

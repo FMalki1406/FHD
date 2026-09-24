@@ -25,8 +25,7 @@ use std::{
 use tokio::sync::mpsc;
 
 /// Destinations learned as jobs are admitted, rather than fixed at startup.
-#[derive(Default)]
-struct Registry(Mutex<HashMap<DestinationRef, PathBuf>>);
+struct Registry(Mutex<HashMap<DestinationRef, PathBuf>>, String);
 impl Registry {
     fn insert(&self, destination: DestinationRef, path: PathBuf) {
         if let Ok(mut map) = self.0.lock() {
@@ -52,7 +51,7 @@ impl Destinations for Registry {
     }
 
     fn parts_for(&self, destination: DestinationRef) -> Result<PathBuf, AppError> {
-        crate::private_parts_directory(&self.resolve(destination)?)
+        crate::private_parts_directory(&self.resolve(destination)?, &self.1)
     }
 }
 
@@ -99,7 +98,12 @@ impl Resident {
         );
         let transport =
             Arc::new(HttpTransport::new(HttpConfig::default()).map_err(EngineError::Binding)?);
-        let destinations = Arc::new(Registry::default());
+        // Named after the directory holding this engine's job record, so two
+        // engines sharing a download folder do not both claim the same part.
+        let destinations = Arc::new(Registry(
+            Mutex::default(),
+            crate::engine_tag(&config.state_directory),
+        ));
         let governor = Arc::new(
             OriginGovernor::new(OriginLimits {
                 connections: config.engine_connections,

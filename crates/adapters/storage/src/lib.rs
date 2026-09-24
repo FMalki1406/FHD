@@ -253,6 +253,28 @@ struct FilePart {
     // Released after every open data/metadata handle of this part.
     _lock: Option<Arc<File>>,
 }
+/// The part file's own permissions, not only its directory's.
+///
+/// A part now lives beside its destination rather than inside the engine's own
+/// directory, and on Unix `create_new` leaves the default `0666 & ~umask` --
+/// commonly `0644`, readable by everyone. The directory is `0700`, so nothing
+/// gets in through it today; a file that protects itself does not depend on
+/// that staying true, and a review named the gap.
+///
+/// Windows takes its access list from the directory it is created in, which the
+/// composition root has made private, so there is nothing to set here.
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600)
+    }
+    #[cfg(not(unix))]
+    {
+        options
+    }
+}
+
 impl FilePart {
     fn open_inner(
         path: &Path,
@@ -267,9 +289,7 @@ impl FilePart {
         check_optional(&part_path)?;
         check_optional(&metadata_path)?;
         // Create-new never truncates a surviving generation or unrelated file.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut file = owner_only(OpenOptions::new().read(true).write(true))
             .create_new(create)
             .open(&part_path)
             .map_err(|error| {
@@ -280,9 +300,7 @@ impl FilePart {
                 }
             })?;
 
-        let mut metadata = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut metadata = owner_only(OpenOptions::new().read(true).write(true))
             .create_new(create)
             .open(&metadata_path)
             .map_err(io)?;
@@ -466,7 +484,11 @@ impl SegmentFile for FilePart {
         self.add_coverage(plan);
         Ok(())
     }
-    fn verify(&mut self, expected: Option<[u8; 32]>) -> Result<[u8; 32], StorageError> {
+    fn verify(
+        &mut self,
+        expected: Option<[u8; 32]>,
+        record: &[(ByteRange, [u8; 32])],
+    ) -> Result<[u8; 32], StorageError> {
         self.healthy()?;
         self.verified = None;
         if !self.complete() || !self.synchronized {
@@ -475,6 +497,35 @@ impl SegmentFile for FilePart {
         if self.file.metadata().map_err(io)?.len() != self.spec.size() {
             return Err(StorageError::Integrity);
         }
+
+        // Every byte has to sit inside something that was recorded. A range
+        // nobody attested is a range nothing here can speak for, so a record
+        // with a hole in it fails rather than covering the hole with a digest
+        // taken from the file.
+        let mut ranges: Vec<ByteRange> = record.iter().map(|(range, _)| *range).collect();
+        ranges.sort_by_key(|range| range.start());
+        let mut reached = 0u64;
+        for range in &ranges {
+            if range.start() > reached {
+                return Err(StorageError::Integrity);
+            }
+            reached = reached.max(range.end());
+        }
+        if reached != self.spec.size() {
+            return Err(StorageError::Integrity);
+        }
+
+        // And each recorded range is rehashed against what was recorded for it,
+        // rather than assumed to be whatever is there now.
+        for (range, digest) in record {
+            if range.end() > self.spec.size() {
+                return Err(StorageError::Bounds);
+            }
+            if self.hash(range.start(), range.len())? != *digest {
+                return Err(StorageError::Integrity);
+            }
+        }
+
         let digest = self.hash(0, self.spec.size())?;
         if expected.is_some_and(|expected| expected != digest) {
             return Err(StorageError::Integrity);
@@ -593,6 +644,109 @@ mod tests {
     fn hash(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
     }
+    /// Bytes changed after they were recorded do not publish.
+    ///
+    /// Verification used to hash the file and compare it with that same hash, so
+    /// it could not see a change at all. A review overwrote sixteen bytes of a
+    /// live part with no digest on the request and watched them become the
+    /// user's file. Here the record is taken first and the file is changed
+    /// afterwards, which is the order that matters.
+    #[test]
+    fn a_part_changed_after_it_was_recorded_never_publishes() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+
+        // Somebody else gets to the bytes. Written through a second handle,
+        // because that is how it would happen.
+        {
+            use std::io::Write;
+            let mut other = fs::OpenOptions::new()
+                .write(true)
+                .open(directory.part().join("1-1.part"))
+                .unwrap();
+            other.write_all(b"XX").unwrap();
+            other.sync_all().unwrap();
+        }
+
+        assert_eq!(
+            part.verify(None, &record),
+            Err(StorageError::Integrity),
+            "a part changed after it was recorded verified anyway"
+        );
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::InvalidState),
+            "an unverified part published"
+        );
+        assert!(!directory.output().exists());
+    }
+
+    /// A record that does not reach every byte is refused.
+    ///
+    /// An uncovered range is one nothing ever attested, so accepting it would
+    /// mean verifying part of the file against evidence and the rest against
+    /// nothing.
+    #[test]
+    fn a_record_with_a_gap_in_it_is_refused() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+
+        // Everything except the middle two bytes.
+        let head = range(0, 2);
+        let tail = range(4, 6);
+        let gapped = vec![
+            (head, part.hash_range(head).unwrap()),
+            (tail, part.hash_range(tail).unwrap()),
+        ];
+        assert_eq!(part.verify(None, &gapped), Err(StorageError::Integrity));
+
+        // A record that stops short is refused too. This is the separate case:
+        // the one above is caught by the ranges not meeting, this one only by
+        // the record being required to reach the end of the file.
+        let prefix = range(0, 4);
+        let short = vec![(prefix, part.hash_range(prefix).unwrap())];
+        assert_eq!(
+            part.verify(None, &short),
+            Err(StorageError::Integrity),
+            "a record covering four of six bytes was accepted"
+        );
+
+        // And the same ranges with the hole filled do verify, so the refusals
+        // above are about the coverage and not about the shape of the record.
+        let middle = range(2, 4);
+        let mut whole = gapped;
+        whole.push((middle, part.hash_range(middle).unwrap()));
+        part.verify(None, &whole).unwrap();
+    }
+
+    /// The whole file, attested as it stands right now.
+    ///
+    /// Verification takes the repository's committed extents as its prior
+    /// evidence. These tests are about other things, so they hand it a record
+    /// that matches -- the behaviour the record exists for is proved by
+    /// `a_part_changed_after_it_was_recorded_never_publishes`, which builds the
+    /// record first and changes the bytes afterwards.
+    fn attested(part: &mut dyn SegmentFile) -> Vec<(ByteRange, [u8; 32])> {
+        let size = part.spec().size();
+        // An empty transfer has nothing to attest, and no byte goes unattested
+        // by saying so: the coverage check asks that the record reach the end of
+        // the file, and for a file of length zero it already has.
+        if size == 0 {
+            return Vec::new();
+        }
+        let whole = ByteRange::new(0, size).unwrap();
+        vec![(whole, part.hash_range(whole).unwrap())]
+    }
+
     fn range(start: u64, end: u64) -> ByteRange {
         ByteRange::new(start, end).unwrap()
     }
@@ -609,11 +763,15 @@ mod tests {
             fs::read(directory.part().join("1-1.part")).unwrap(),
             b"\0\0\0def"
         );
-        assert_eq!(part.verify(None), Err(StorageError::InvalidState));
+        assert_eq!(part.verify(None, &[]), Err(StorageError::InvalidState));
         part.write_at(0, b"abc").unwrap();
-        assert_eq!(part.verify(None), Err(StorageError::InvalidState));
+        assert_eq!(part.verify(None, &[]), Err(StorageError::InvalidState));
         part.sync().unwrap();
-        assert_eq!(part.verify(Some(hash(b"abcdef"))).unwrap(), hash(b"abcdef"));
+        let record = attested(part.as_mut());
+        assert_eq!(
+            part.verify(Some(hash(b"abcdef")), &record).unwrap(),
+            hash(b"abcdef")
+        );
         part.publish(&directory.output()).unwrap();
         assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
     }
@@ -625,7 +783,8 @@ mod tests {
             .unwrap();
         part.write_at(0, b"abcdef").unwrap();
         part.sync().unwrap();
-        part.verify(None).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
         // Unpublished bytes are never thrown away by mistake.
         assert_eq!(part.discard(), Err(StorageError::InvalidState));
         assert!(directory.part().join("1-1.part").exists());
@@ -664,7 +823,7 @@ mod tests {
             8
         );
         assert_eq!(
-            part.verify(Some(hash(&[0; 8]))),
+            part.verify(Some(hash(&[0; 8])), &[]),
             Err(StorageError::InvalidState)
         );
         assert_eq!(
@@ -685,17 +844,18 @@ mod tests {
         let mut reopened = FileStorage::default()
             .open(&directory.part(), spec(6))
             .unwrap();
-        assert_eq!(reopened.verify(None), Err(StorageError::InvalidState));
+        assert_eq!(reopened.verify(None, &[]), Err(StorageError::InvalidState));
         reopened.recover_extent(range(3, 6), hash(b"def")).unwrap();
         assert_eq!(
             reopened.recover_extent(range(0, 3), hash(b"bad")),
             Err(StorageError::Integrity)
         );
         reopened.sync().unwrap();
-        assert_eq!(reopened.verify(None), Err(StorageError::InvalidState));
+        assert_eq!(reopened.verify(None, &[]), Err(StorageError::InvalidState));
         reopened.recover_extent(range(0, 3), hash(b"abc")).unwrap();
+        let record = attested(reopened.as_mut());
         assert_eq!(
-            reopened.verify(Some(hash(b"abcdef"))).unwrap(),
+            reopened.verify(Some(hash(b"abcdef")), &record).unwrap(),
             hash(b"abcdef")
         );
     }
@@ -707,18 +867,20 @@ mod tests {
             .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
-        part.verify(None).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
         part.write_at(1, b"x").unwrap();
         assert_eq!(
             part.publish(&directory.output()),
             Err(StorageError::InvalidState)
         );
         part.sync().unwrap();
+        let record = attested(part.as_mut());
         assert_eq!(
-            part.verify(Some(hash(b"abc"))),
+            part.verify(Some(hash(b"abc")), &record),
             Err(StorageError::Integrity)
         );
-        part.verify(Some(hash(b"axc"))).unwrap();
+        part.verify(Some(hash(b"axc")), &record).unwrap();
         part.publish(&directory.output()).unwrap();
         assert_eq!(fs::read(directory.output()).unwrap(), b"axc");
     }
@@ -730,7 +892,8 @@ mod tests {
             .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
-        part.verify(None).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
         fs::write(directory.output(), b"USER").unwrap();
         assert_eq!(
             part.publish(&directory.output()),
@@ -746,7 +909,8 @@ mod tests {
             .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
-        part.verify(None).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
         part.publish(&directory.output()).unwrap();
         assert_eq!(part.write_at(0, b"xyz"), Err(StorageError::InvalidState));
         drop(part);
@@ -825,7 +989,8 @@ mod tests {
         );
         part.write_at(0, b"abcdef").unwrap();
         part.sync().unwrap();
-        part.verify(Some(hash(b"abcdef"))).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(Some(hash(b"abcdef")), &record).unwrap();
     }
     #[test]
     fn failed_sync_requires_reopen_and_reconciliation() {
@@ -837,7 +1002,7 @@ mod tests {
             part.sync(),
             Err(StorageError::Io(std::io::ErrorKind::Other))
         );
-        assert_eq!(part.verify(None), Err(StorageError::InvalidState));
+        assert_eq!(part.verify(None, &[]), Err(StorageError::InvalidState));
         assert_eq!(
             part.publish(&directory.output()),
             Err(StorageError::InvalidState)
@@ -848,7 +1013,8 @@ mod tests {
             .unwrap();
         part.recover_extent(range(0, 3), hash(b"abc")).unwrap();
         part.sync().unwrap();
-        part.verify(Some(hash(b"abc"))).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(Some(hash(b"abc")), &record).unwrap();
     }
     #[test]
     fn changed_bytes_after_verification_are_rejected_at_publication() {
@@ -858,7 +1024,8 @@ mod tests {
             .unwrap();
         part.write_at(0, b"abc").unwrap();
         part.sync().unwrap();
-        part.verify(None).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
         fs::write(directory.part().join("1-1.part"), b"xyz").unwrap();
         assert_eq!(
             part.publish(&directory.output()),
@@ -872,7 +1039,8 @@ mod tests {
         let mut part = FileStorage::default()
             .create(&directory.part(), spec(0))
             .unwrap();
-        assert_eq!(part.verify(Some(hash(b""))).unwrap(), hash(b""));
+        let record = attested(part.as_mut());
+        assert_eq!(part.verify(Some(hash(b"")), &record).unwrap(), hash(b""));
         part.publish(&directory.output()).unwrap();
         assert_eq!(fs::metadata(directory.output()).unwrap().len(), 0);
     }
@@ -906,7 +1074,8 @@ mod tests {
         assert_eq!(part.write_at(2, b"XX"), Err(StorageError::InvalidState));
         part.write_at(3, b"def").unwrap();
         part.sync().unwrap();
-        part.verify(Some(hash(b"abcdef"))).unwrap();
+        let record = attested(part.as_mut());
+        part.verify(Some(hash(b"abcdef")), &record).unwrap();
         assert_eq!(
             fs::read(directory.part().join("1-1.part")).unwrap(),
             b"abcdef"

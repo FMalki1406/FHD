@@ -107,7 +107,11 @@ impl SegmentFile for FakeFile {
     fn recover_extent(&mut self, _: ByteRange, _: [u8; 32]) -> Result<(), StorageError> {
         Err(StorageError::Unsupported)
     }
-    fn verify(&mut self, _: Option<[u8; 32]>) -> Result<[u8; 32], StorageError> {
+    fn verify(
+        &mut self,
+        _: Option<[u8; 32]>,
+        _: &[(fhd_domain::ByteRange, [u8; 32])],
+    ) -> Result<[u8; 32], StorageError> {
         Err(StorageError::Unsupported)
     }
     fn publish(&mut self, _: &Path) -> Result<PathBuf, StorageError> {

@@ -129,10 +129,61 @@ mod imp {
         })
     }
 
-    /// Unix states the permissions it wants with `set_permissions`, so there is
-    /// nothing to inspect here: the mode is set, not inherited.
-    pub fn foreign_writers(_: &std::path::Path) -> io::Result<ForeignWriters> {
-        Ok(ForeignWriters::default())
+    /// Who besides us may write into this directory, from its mode and owner.
+    ///
+    /// This used to answer "nobody", on the reasoning that Unix sets the mode it
+    /// wants rather than inheriting one. That is true of a directory we create
+    /// and false of one we find -- and the caller's whole question is about one
+    /// it found. A review pointed out the consequence: on Unix a `.fhd-parts`
+    /// somebody else had already made, world-writable, passed this check and was
+    /// adopted, while the same case on Windows was refused.
+    ///
+    /// Group and other write are reported, and so is an owner who is not us,
+    /// because an owner can put the mode back whatever we set. Read access is
+    /// not reported here: the name says writers, and the caller refuses on
+    /// anything non-empty either way.
+    pub fn foreign_writers(path: &std::path::Path) -> io::Result<ForeignWriters> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let mut foreign = Vec::new();
+        // Group- or other-writable. The sticky bit narrows deletion, not
+        // writing, so it does not make this safe.
+        let mode = metadata.mode();
+        if mode & 0o020 != 0 {
+            foreign.push(format!("group:{}", metadata.gid()));
+        }
+        if mode & 0o002 != 0 {
+            foreign.push("other".to_owned());
+        }
+        let us = our_uid();
+        if metadata.uid() != us {
+            foreign.push(format!("owner:{}", metadata.uid()));
+        }
+        Ok(ForeignWriters(foreign))
+    }
+
+    /// This process's real user id.
+    ///
+    /// Read from a file we have just created rather than through `getuid`, so
+    /// this crate's one `unsafe` allowance stays where the security descriptor
+    /// work needs it and no libc dependency is added for one integer. The file
+    /// goes in the temporary directory and is removed immediately.
+    fn our_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        let probe = std::env::temp_dir().join(format!(
+            "fhd-uid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0)
+        ));
+        let uid = std::fs::File::create(&probe)
+            .and_then(|file| file.metadata())
+            .map(|metadata| metadata.uid())
+            .unwrap_or(u32::MAX);
+        let _ = std::fs::remove_file(&probe);
+        uid
     }
 
     /// The caller sets the mode on Unix; there is no inherited list to replace.
