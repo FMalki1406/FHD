@@ -1410,6 +1410,78 @@ mod tests {
         );
         assert!(!directory.output().exists());
     }
+    /// A failed publication leaves a job that can come back, for both reasons
+    /// it can fail.
+    ///
+    /// Carried across from the recovery branch, where it was written, because
+    /// the integration branch had kept the integrity *refusal* and lost what
+    /// happens afterwards. Refusing is half a contract: the part must also be
+    /// writable again, and sound bytes must still publish once a name is free,
+    /// without anything being downloaded twice.
+    #[test]
+    fn a_failed_publication_leaves_the_job_recoverable() {
+        // Corrupt data: verification passed, then the bytes changed. The part
+        // has to be writable again, because a re-download is the only way out.
+        let directory = Directory::new();
+        let mut part = publishing_store(&directory.part())
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        // Through the *object*, not the name. On the branch this came from,
+        // publication resolved a path, so renaming the part aside and writing
+        // another file at its name produced an integrity failure. It no longer
+        // does, and that is the point of the change: publication holds the
+        // handle it verified, so a substituted name reaches nothing. What still
+        // has to be caught is the bytes of that handle changing, which is what
+        // this does.
+        fs::write(directory.part().join("1-1.part"), b"EVIL!!").unwrap();
+        assert_eq!(
+            publish_to(part.as_mut(), &directory.output()),
+            Err(StorageError::Integrity)
+        );
+        drop(part);
+
+        // Reopened from disk, which is where the seal lives. Nothing in memory
+        // carries over, so this is the assertion an unsealed version fails.
+        let mut reopened = publishing_store(&directory.part())
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        reopened
+            .write_at(0, b"abcdef")
+            .expect("a part whose publication failed can be written again");
+
+        // Sound data, publication refused: the destination is taken. Nothing is
+        // re-downloaded -- the same bytes publish to a free name afterwards.
+        let second = Directory::new();
+        let mut part = publishing_store(&second.part())
+            .create(&second.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        fs::write(second.output(), b"theirs").unwrap();
+        assert_eq!(
+            publish_to(part.as_mut(), &second.output()),
+            Err(StorageError::Conflict),
+            "an occupied destination is a conflict"
+        );
+        assert_eq!(
+            fs::read(second.output()).unwrap(),
+            b"theirs",
+            "a refused publication overwrote the file that was there"
+        );
+        // A second adoption replaces the first: the destination is decided once
+        // per attempt, and a retry is a new attempt.
+        let elsewhere = second.output().with_file_name("free.bin");
+        part.verify(None, &record).unwrap();
+        publish_to(part.as_mut(), &elsewhere)
+            .expect("sound bytes publish again once a name is free");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"abcdef");
+    }
     #[test]
     fn empty_file_is_a_valid_complete_transfer_without_nonempty_extents() {
         let directory = Directory::new();
