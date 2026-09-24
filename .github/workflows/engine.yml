@@ -100,8 +100,15 @@ jobs:
         run: cargo +1.98.1 test -p fhd-platform --locked used_to_miss
       # Each test above is named by a step, and a step that matched nothing would
       # pass in silence. This fails if the crate grows a test no step runs.
+      - name: Platform - a stranger who may write a unix directory is reported
+        if: runner.os != 'Windows'
+        run: cargo +1.98.1 test -p fhd-platform --locked stranger_may_write_a_unix
+      # It runs everywhere now. While it was Windows-only, a test compiled
+      # under cfg(unix) could be added and run nowhere with nothing saying
+      # so -- which is what happened to the Unix half of foreign_writers:
+      # green on Linux and macOS, and no test on either touched it. `--list`
+      # reports the tests this platform has, so each runner checks its own.
       - name: Platform - every test here is named by a step
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           listed=$(cargo +1.98.1 test -p fhd-platform --locked -- --list \
