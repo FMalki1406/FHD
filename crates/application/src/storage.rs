@@ -84,6 +84,22 @@ pub enum Occupant {
     NotAFile,
 }
 
+/// Creates a second name for the file a handle already holds.
+///
+/// Publication is the one place the engine turns bytes it has proved into a
+/// file somebody else will open, and the difference between naming a *path* and
+/// naming a *handle* is the whole of it: a path is resolved when the call runs,
+/// so between proving the bytes and publishing them the name can be made to
+/// mean a different file. Measured, and it published the other file's bytes.
+///
+/// **A platform without a mechanism says so.** It does not fall back to linking
+/// by name: that is the behaviour being replaced, and a fallback that happens
+/// quietly would leave the same hole under a new arrangement. Returning
+/// `Unsupported` makes publication refuse with a reason instead.
+pub trait HandleLinker: Send + Sync {
+    fn link(&self, file: &std::fs::File, destination: &Path) -> Result<(), StorageError>;
+}
+
 pub trait SegmentStore: Send + Sync {
     /// `None` when the destination is free. Hashes only a file of exactly
     /// `expected_size`, so a large stranger is never read. Never follows links.

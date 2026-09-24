@@ -158,6 +158,11 @@ jobs:
       # The library suites never start the program. Argument parsing, the
       # one-shot/serve/client dispatch and the control surface between two real
       # processes are only covered here.
+      # The publication contract, on the wired path. Named on its own because
+      # the storage adapter cannot reach the platform mechanism, so this is the
+      # only place it is measured.
+      - name: Test the publication contract
+        run: cargo +1.98.1 test -p fhd-daemon --test publication --locked
       - name: Test the engine as a program
         run: cargo +1.98.1 test -p fhd-daemon --locked --test process
       - name: Test legacy engine and stores
