@@ -827,3 +827,60 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
         "the first engine's file did not survive the second engine"
     );
 }
+
+/// What a platform with no publication mechanism actually does, end to end.
+///
+/// **This branch does not finish downloads on Linux or macOS**, and that is a
+/// deliberate refusal: the alternative was linking by path, which is the
+/// behaviour being replaced, and taking it quietly would leave the same hole
+/// wearing a new arrangement. The other end-to-end tests here expect a
+/// published file, so they fail on those platforms, and CI is red there.
+///
+/// A prose statement of that is not evidence. This measures it, so the record
+/// says what the engine does rather than what was intended:
+///
+/// - the bytes arrive and are verified, so the refusal is at publication and
+///   nothing earlier;
+/// - the destination is never created;
+/// - the job stops needing a decision rather than reporting completion;
+/// - the downloaded bytes are still on disk, so the day a mechanism exists the
+///   transfer finishes rather than starting again.
+///
+/// It is `cfg(not(windows))` on purpose. The day Linux or macOS gains a
+/// mechanism this test fails, which is the notice that it should be rewritten
+/// -- not a gate that quietly keeps passing.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_platform_without_a_mechanism_refuses_to_publish_and_keeps_the_bytes() {
+    let body = content(64 * 1024 + 17);
+    let (port, _served) = serve(body.clone(), 0);
+    let state = Directory::new("no-mechanism");
+    let destination = state.0.join("result.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+    let mut settings = config(&state, destination.clone(), 2);
+    settings.expected_sha256 = Some(expected_digest(&body));
+
+    let engine = Engine::open(settings, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await;
+
+    assert!(
+        !matches!(outcome, Ok(SessionEnd::Published(_))),
+        "publication succeeded on a platform with no mechanism: {outcome:?}"
+    );
+    assert!(
+        !destination.exists(),
+        "a refused publication created the destination"
+    );
+    assert_ne!(
+        engine.state().await.unwrap(),
+        JobState::Completed,
+        "a job that never published reported completion"
+    );
+    // The transfer's work survives: this is a job waiting for a mechanism, not
+    // one that has to be downloaded again.
+    assert!(
+        part_bytes(&state) > 0,
+        "the downloaded bytes were discarded when publication was refused"
+    );
+}

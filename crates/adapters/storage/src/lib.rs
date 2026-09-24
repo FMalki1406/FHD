@@ -302,6 +302,18 @@ struct FilePart {
     synchronized: bool,
     verified: Option<[u8; 32]>,
     sealed: bool,
+    /// The seal was already on disk when this handle opened it.
+    ///
+    /// Publication seals, links, then the completion is recorded. A crash
+    /// between the link and the record leaves exactly this: a sealed part, a
+    /// job still marked publishing, and a file that may or may not have been
+    /// created. Whether it was cannot be decided from here -- the destination
+    /// can be empty because the link never happened, or because the folder
+    /// moved after adoption -- and one of those means a delivered file.
+    ///
+    /// So this flag is "publication may already have happened", and it forbids
+    /// both publishing again and lifting the seal.
+    sealed_on_open: bool,
     published: bool,
     cancelled: bool,
     poisoned: bool,
@@ -385,6 +397,7 @@ impl FilePart {
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         Ok(Self {
             linker,
+            sealed_on_open: sealed,
             destination: None,
             file,
             metadata,
@@ -465,6 +478,12 @@ impl FilePart {
     /// `InvalidState` for ever -- a part that was genuinely corrupt could never
     /// be re-downloaded.
     fn unseal(&mut self) -> Result<(), StorageError> {
+        // Never a seal this handle did not set. A seal found on disk means
+        // publication may already have happened, and the inode a published file
+        // links to must not become writable again on the strength of a guess.
+        if self.sealed_on_open {
+            return Err(StorageError::InvalidState);
+        }
         self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
         self.metadata.write_all(&[0]).map_err(io)?;
         self.metadata.sync_all().map_err(io)?;
@@ -670,6 +689,13 @@ impl SegmentFile for FilePart {
         // inode the published file is a link to, so lifting it would make a
         // delivered file writable again. Measured, and refused here instead.
         if self.published {
+            return Err(StorageError::InvalidState);
+        }
+        // Found sealed on disk: this part reached the point of publication in
+        // an earlier run and nothing here can say whether the file was made.
+        // Publishing again would risk a second copy; the answer is a job that
+        // stops and needs an operator, which is what refusing produces.
+        if self.sealed_on_open {
             return Err(StorageError::InvalidState);
         }
         let expected = self.verified.ok_or(StorageError::InvalidState)?;

@@ -888,3 +888,99 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
     assert_eq!(landed, vec!["published.bin".to_string()]);
     assert_eq!(fs::read(aside.join("published.bin")).unwrap(), b"AAAAAA");
 }
+
+/// The crash window: the link succeeded, and the record never said so.
+///
+/// Publication seals the part, links, and only then is the completion recorded.
+/// A crash in between leaves a published file on disk, a job still marked
+/// Publishing, and a part sealed on disk. Reopening that part is exactly the
+/// state a restart finds.
+///
+/// The reconciliation path settles the ordinary case: if the destination holds
+/// a file of the recorded size and digest, the job is completed without the
+/// part being reopened at all. What this test is about is the case it cannot
+/// settle -- nothing at the destination, because the folder moved after
+/// adoption, or because the link never happened. **Those two are
+/// indistinguishable from here**, and one of them means a delivered file.
+///
+/// So a part that was already sealed when it was opened must not publish and
+/// must not be unsealed. Publishing again would put a second copy somewhere;
+/// unsealing would make the inode a delivered file links to writable again.
+/// The job stops and needs an operator, which is the honest answer to a
+/// question that cannot be decided.
+#[test]
+fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
+    struct RealLinker;
+    impl HandleLinker for RealLinker {
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                    other => StorageError::Io(other),
+                }
+            })
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+        }
+    }
+
+    let directory = Directory::new("publish-crash-window");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let downloads = directory.0.join("downloads");
+    fs::create_dir_all(&downloads).unwrap();
+    let destination = downloads.join("published.bin");
+
+    let store = FileStorage::default().with_linker(Arc::new(RealLinker));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+    part.publish().expect("the first publication succeeds");
+    // The crash: the process ends before the completion is recorded. All that
+    // survives is what is on disk.
+    drop(part);
+
+    // And the destination folder moves, so reconciliation by path finds
+    // nothing and the part is reopened -- the case that cannot be decided.
+    let aside = directory.0.join("downloads-moved-away");
+    fs::rename(&downloads, &aside).unwrap();
+    fs::create_dir(&downloads).unwrap();
+
+    let mut again = store.open(&parts, spec(6)).unwrap();
+    for (range, digest) in &record {
+        again.recover_extent(*range, *digest).unwrap();
+    }
+    again.sync().unwrap();
+    again.verify(None, &record).unwrap();
+    again.adopt_destination(&destination).unwrap();
+
+    assert!(
+        again.publish().is_err(),
+        "a part that was already sealed on disk published a second copy"
+    );
+    drop(again);
+
+    // The seal is still there. This is the assertion that matters: the failure
+    // path must not treat this like a publication that never happened.
+    assert_eq!(
+        fs::read(parts.join("1-1.meta")).unwrap().get(33),
+        Some(&1u8),
+        "the seal was lifted on a part whose bytes may already be delivered"
+    );
+
+    // One copy, where it was published, untouched.
+    assert_eq!(fs::read(aside.join("published.bin")).unwrap(), b"AAAAAA");
+    assert!(
+        fs::read_dir(&downloads).unwrap().next().is_none(),
+        "a second copy was published into the folder that took the name"
+    );
+}
