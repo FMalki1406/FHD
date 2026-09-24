@@ -162,14 +162,23 @@ mod imp {
         Ok(ForeignWriters(foreign))
     }
 
-    /// This process's real user id.
+    /// The user id this process's files are created as.
     ///
-    /// Read from a file we have just created rather than through `getuid`, so
-    /// this crate's one `unsafe` allowance stays where the security descriptor
-    /// work needs it and no libc dependency is added for one integer. The file
-    /// goes in the temporary directory and is removed immediately.
+    /// Read from a file we have just made rather than through `getuid`, so this
+    /// crate's one `unsafe` allowance stays where the security descriptor work
+    /// needs it and no dependency is added for one integer. It is the effective
+    /// (filesystem) id rather than the real one, which is the right one to
+    /// compare against the owner of a directory we would write in.
+    ///
+    /// `create_new` and an explicit mode, because the plain create was
+    /// `O_WRONLY|O_CREAT|O_TRUNC` and followed symlinks in a directory that is
+    /// usually world-writable: a review pointed out that guessing the name gave
+    /// an attacker a way to truncate any file this uid can write. It was never
+    /// an authorization bypass -- a failure here returns `u32::MAX`, which makes
+    /// every directory read as foreign-owned and every caller refuse -- but it
+    /// was a way to destroy somebody else's file, which is enough.
     fn our_uid() -> u32 {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let probe = std::env::temp_dir().join(format!(
             "fhd-uid-{}-{}",
             std::process::id(),
@@ -178,7 +187,11 @@ mod imp {
                 .map(|since| since.as_nanos())
                 .unwrap_or(0)
         ));
-        let uid = std::fs::File::create(&probe)
+        let uid = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
             .and_then(|file| file.metadata())
             .map(|metadata| metadata.uid())
             .unwrap_or(u32::MAX);

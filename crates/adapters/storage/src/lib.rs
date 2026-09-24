@@ -255,19 +255,24 @@ struct FilePart {
 }
 /// The SHA-256 of a whole file, read through a handle the caller opened.
 ///
-/// Used to check the destination after it has been linked. Publication links a
-/// path, and a path is a name rather than the object that was verified: a review
-/// renamed a verified part aside, put its own file at the name, and watched
-/// those bytes get published. Windows happens to refuse renaming a directory
-/// with an open file beneath it, which closed one route there by a property of
-/// NTFS this code never asserts; Unix refuses nothing of the sort.
+/// Used on the staged link, before the destination name exists.
 ///
-/// Reading the destination through one handle, opened once, settles it: if those
-/// bytes hash to what was verified, the file the user is about to have is the
-/// file we meant. It replaces the re-read that used to happen through our own
-/// handle just before linking -- same number of passes over the data, and it
-/// answers the question that matters instead of one we already knew the answer
-/// to.
+/// **And it does not make publication safe.** A joint review measured the
+/// remaining hole: the hash reads a handle, so replacing the staged *name*
+/// while it runs does not disturb it, and the link that follows resolves that
+/// name again. The window is the length of the hash -- O(file size), longer
+/// than the one it replaced -- and a racer that renamed a same-size file over
+/// the staged name mid-hash had its bytes published with `Ok`.
+///
+/// What actually closes it is linking from the verified handle
+/// (`NtSetInformationFile` with `FILE_LINK_INFORMATION` on Windows, `linkat`
+/// through `/proc/self/fd` on Linux), which this crate cannot do: it forbids
+/// `unsafe` and may not depend on `fhd-platform`. That is a port, and the port
+/// is an architectural decision, not a patch. Until it exists, the containment
+/// is the access list on the parts directory -- measured to deny another
+/// account everything -- and on Windows the fact that NTFS will not rename a
+/// directory with an open file beneath it. The second of those is a property of
+/// the filesystem that no line here asserts, and it is false on Unix.
 fn hash_whole(file: &mut File, length: u64) -> Result<[u8; 32], StorageError> {
     file.seek(SeekFrom::Start(0)).map_err(io)?;
     let mut left = length;
@@ -607,9 +612,48 @@ impl SegmentFile for FilePart {
         self.metadata.write_all(&[1]).map_err(io)?;
         self.metadata.sync_all().map_err(io)?;
         self.sealed = true;
-        match fs::hard_link(&self.path, &destination) {
+
+        // Staged inside our own directory before the final name exists.
+        //
+        // Checking after linking to the destination closed the substitution but
+        // opened two other things: the file carried its final name while it was
+        // still being proved, so a user or another program could read bytes
+        // nothing had attested yet; and undoing a bad link assumed the name
+        // still referred to what we linked, which is the assumption that failed
+        // in the first place -- a destination replaced in between would have
+        // been deleted on our way out.
+        //
+        // So the link is made here first, in the directory this engine created
+        // with its own access list, where the adversary can neither read it nor
+        // put something else at the name. It is proved through a handle on that
+        // link, and only then does the destination appear. A failure removes
+        // only this staged name, which is ours.
+        let staged = self.directory.join(format!(
+            "{}-{}.staged",
+            self.spec.job().get(),
+            self.spec.generation().get()
+        ));
+        let _ = fs::remove_file(&staged);
+        fs::hard_link(&self.path, &staged).map_err(|error| {
+            self.poisoned = false;
+            self.sealed = false;
+            io(error)
+        })?;
+        let proved = File::open(&staged)
+            .map_err(io)
+            .and_then(|mut file| hash_whole(&mut file, self.spec.size()));
+        if proved.as_ref() != Ok(&expected) {
+            let _ = fs::remove_file(&staged);
+            self.poisoned = false;
+            self.sealed = false;
+            self.verified = None;
+            return Err(StorageError::Integrity);
+        }
+
+        match fs::hard_link(&staged, &destination) {
             Ok(()) => (),
             Err(error) => {
+                let _ = fs::remove_file(&staged);
                 self.poisoned = false;
                 return Err(match error.kind() {
                     std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
@@ -620,21 +664,9 @@ impl SegmentFile for FilePart {
                 });
             }
         }
-        // The link exists; whether it carries the bytes that were verified is a
-        // separate question, and this is the only moment it can be answered.
-        let mut linked = File::open(&destination).map_err(io)?;
-        let published = hash_whole(&mut linked, self.spec.size());
-        if published.as_ref() != Ok(&expected) {
-            drop(linked);
-            // Undo our own link. It cannot be somebody else's file: `hard_link`
-            // refuses a name that exists, so this path did not a moment ago.
-            let _ = fs::remove_file(&destination);
-            self.poisoned = false;
-            self.sealed = false;
-            self.verified = None;
-            return Err(StorageError::Integrity);
-        }
-        drop(linked);
+        // The staged name has served its purpose; the destination and the part
+        // both name the same inode now.
+        let _ = fs::remove_file(&staged);
         self.file.sync_all().map_err(io)?;
         sync_directory(destination.parent().ok_or(StorageError::InvalidInput)?)?;
         sync_directory(&self.directory)?;
@@ -720,6 +752,180 @@ mod tests {
             !directory.output().exists(),
             "the planted file was left behind at the destination"
         );
+    }
+
+    /// A failed publication never creates the destination, and never removes
+    /// anything that is there.
+    ///
+    /// Proving the link after making it at the destination meant the final name
+    /// existed while its bytes were still unproved, and that undoing it assumed
+    /// the name still referred to what we had linked -- so a destination
+    /// replaced in between would have been deleted on the way out. This asks
+    /// both questions directly: with a swapped part, does the name appear, and
+    /// is a file already sitting at a nearby name still there afterwards.
+    #[test]
+    fn a_failed_publication_leaves_the_destination_alone() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        // Somebody else's file, in the folder the destination lives in.
+        let bystander = directory.output().with_file_name("theirs.bin");
+        fs::write(&bystander, b"not ours").unwrap();
+
+        // The part is swapped at its name after verification.
+        let name = directory.part().join("1-1.part");
+        fs::rename(&name, directory.part().join("moved.bin")).unwrap();
+        fs::write(&name, b"EVIL!!").unwrap();
+
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::Integrity),
+            "a file planted at the part's name was published"
+        );
+        assert!(
+            !directory.output().exists(),
+            "the destination name appeared for a publication that failed"
+        );
+        assert_eq!(
+            fs::read(&bystander).unwrap(),
+            b"not ours",
+            "a failed publication touched a file that was not ours"
+        );
+        // And nothing of ours is left lying about under its own directory.
+        let staged: Vec<_> = fs::read_dir(directory.part())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".staged"))
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "a staged link was left behind: {staged:?}"
+        );
+    }
+
+    /// The destination name appears only after the bytes are proved, and the
+    /// staged link does not survive a success.
+    ///
+    /// A review found the commit that introduced staging left its own claim
+    /// unguarded: reverting to linking straight at the destination, or creating
+    /// the destination name before the proof, both left the suite green. Two of
+    /// the three properties in that commit's title were pinned by nothing.
+    #[test]
+    fn publication_proves_before_it_names_and_leaves_nothing_staged() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        // A staged link has to exist while the proof runs, and it has to be
+        // inside the engine's own directory rather than beside the destination.
+        // Asserted through the failure path, because that is the moment the
+        // staged name is observable: with the part swapped, publication stops
+        // and the destination is never named.
+        let name = directory.part().join("1-1.part");
+        fs::rename(&name, directory.part().join("aside.bin")).unwrap();
+        fs::write(&name, b"EVIL!!").unwrap();
+        assert_eq!(
+            part.publish(&directory.output()),
+            Err(StorageError::Integrity)
+        );
+        assert!(
+            !directory.output().exists(),
+            "the destination was named for bytes that were never proved"
+        );
+
+        // Put the real part back and publish for real.
+        fs::remove_file(&name).unwrap();
+        fs::rename(directory.part().join("aside.bin"), &name).unwrap();
+        let mut part = FileStorage::default()
+            .open(&directory.part(), spec(6))
+            .unwrap();
+        part.recover_extent(range(0, 6), hash(b"abcdef")).unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        part.publish(&directory.output()).unwrap();
+        assert_eq!(fs::read(directory.output()).unwrap(), b"abcdef");
+
+        // A staged link that outlives a success is a second name for the user's
+        // file, in a directory nothing cleans -- so a file they later delete
+        // stays on disk and readable there.
+        let staged: Vec<_> = fs::read_dir(directory.part())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".staged"))
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "a staged link outlived a successful publication: {staged:?}"
+        );
+    }
+
+    /// The store's own lock refuses a second claim on one directory.
+    ///
+    /// A review measured that the process-level test named for this proves the
+    /// *persistence* lock instead: the database claims the state directory
+    /// before `FileStorage::own` is ever reached, so deleting `try_lock` here
+    /// left that test green. This asks the store directly, with nothing in the
+    /// way.
+    #[test]
+    fn a_second_claim_on_one_directory_is_refused() {
+        let directory = Directory::new();
+        let held = FileStorage::own(&directory.part()).expect("the first claim succeeds");
+        assert!(
+            matches!(
+                FileStorage::own(&directory.part()),
+                Err(StorageError::Locked)
+            ),
+            "a second claim on a directory already owned was allowed"
+        );
+        // And it is the holding, not the directory: released, it is claimable
+        // again, so this cannot pass against an `own` that always refuses.
+        drop(held);
+        FileStorage::own(&directory.part()).expect("the directory is claimable once released");
+    }
+
+    /// A part file is readable by its owner and nobody else.
+    ///
+    /// Until now nothing asserted this on any platform: changing `0o600` to
+    /// `0o666` passed the whole suite everywhere and no CI step could have
+    /// noticed.
+    #[cfg(unix)]
+    #[test]
+    fn a_part_file_carries_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+
+        for name in ["1-1.part", "1-1.meta"] {
+            let mode = fs::metadata(directory.part().join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{name} grants group or other something: {:o}",
+                mode & 0o777
+            );
+            assert_ne!(mode & 0o600, 0, "{name} grants its owner nothing");
+        }
     }
 
     /// Bytes changed after they were recorded do not publish.
