@@ -12,7 +12,25 @@ use std::{
     sync::Arc,
 };
 
-const MAGIC: &[u8; 9] = b"FHDPART\0\x01";
+/// The part format, version 2.
+///
+/// Version 1 wrote a single seal byte **before** linking and never wrote it
+/// again -- not even on success. So a `1` in a version-1 part means the union
+/// of three different things: the link never began, it was in flight, or it
+/// returned and the file was delivered. Version 2 reads `1` as "the link never
+/// began", which for two of those three is wrong in the one direction that
+/// matters: it would republish bytes the user already has under a second name.
+///
+/// An independent review reproduced exactly that. There is no way to tell the
+/// two meanings apart inside the byte, so they are told apart by the version:
+/// a version-1 part is refused at open, and its job starts again rather than
+/// being resumed on a record that cannot be read safely.
+///
+/// **That is a real cost** -- unfinished work in a version-1 part is lost --
+/// and it is accepted because nothing has shipped, no build from this
+/// repository is approved for use, and the alternative is a delivered file
+/// being written a second time.
+const MAGIC: &[u8; 9] = b"FHDPART\0\x02";
 const META_LEN: usize = 34;
 const MAX_EXTENTS: usize = 262144;
 const BUFFER: usize = 64 * 1024;
@@ -464,7 +482,29 @@ impl FilePart {
             {
                 return Err(StorageError::Integrity);
             }
-            Publication::from_byte(data[33])
+            let found = Publication::from_byte(data[33]);
+            // A part found sealed and no further is resolved here, once.
+            //
+            // `Sealed` means the link had not begun, so no name leads to these
+            // bytes and no file can be anyone's. Leaving the state on the
+            // handle made "unseal and retry" true only for a part whose bytes
+            // still verify: nothing else unseals, so a part found sealed whose
+            // data had gone bad could never be written again -- the very bug
+            // `unseal` was written to fix, reintroduced for this state. An
+            // independent review reproduced it.
+            //
+            // Deciding it at open costs one write on a path that is already
+            // rare, and afterwards the handle is an ordinary one.
+            if found == Publication::Sealed {
+                metadata.seek(SeekFrom::Start(33)).map_err(io)?;
+                metadata
+                    .write_all(&[Publication::Open.to_byte()])
+                    .map_err(io)?;
+                metadata.sync_all().map_err(io)?;
+                Publication::Open
+            } else {
+                found
+            }
         };
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         Ok(Self {
@@ -563,7 +603,6 @@ impl FilePart {
             .map_err(io)?;
         self.metadata.sync_all().map_err(io)?;
         self.publication = Publication::Open;
-        self.found = Publication::Open;
         Ok(())
     }
 
@@ -856,22 +895,40 @@ impl SegmentFile for FilePart {
         // linking by path, because that is precisely the behaviour being
         // replaced, and a quiet fallback would leave the same hole wearing a
         // new arrangement.
-        let linker = self.linker.clone().ok_or(StorageError::Unsupported);
+        // Resolved before anything is recorded. With no mechanism there is
+        // nothing to attempt, and writing "the link was begun" for a
+        // configuration error would strand a part in the one state this design
+        // refuses to decide -- for a case where no file can possibly exist.
+        // An independent review caught this by instrumenting the writes.
+        let linker = match self.linker.clone() {
+            Some(linker) => linker,
+            None => {
+                self.poisoned = false;
+                self.unseal()?;
+                return Err(StorageError::Unsupported);
+            }
+        };
         // Durable before the attempt, durable after it. A crash between these
         // two is the one case nothing can decide afterwards, and writing them
         // is what keeps every other case decidable: without the first, a crash
         // during the link is indistinguishable from one before it, and every
         // interrupted publication has to be treated as possibly delivered.
         self.mark(Publication::Attempted)?;
-        let linked = match &linker {
-            Ok(linker) => linker.link(&self.file, &folder, &leaf),
-            Err(unsupported) => Err(*unsupported),
-        };
+        let linked = linker.link(&self.file, &folder, leaf.as_os_str());
         if let Err(error) = linked {
             // The linker returned, so the attempt is over and its answer is
             // known: no file was made. That is the state a retry can act on,
             // and it is written before anything else unwinds.
-            self.mark(Publication::Sealed)?;
+            // Recorded before the unwind, so a crash in the gap leaves a part a
+            // retry can act on rather than one nothing can decide.
+            //
+            // Its own failure must not replace the linker's answer: the reason
+            // a publication was refused -- a taken name, a full disk -- is what
+            // an operator acts on, and an I/O error here would hide it. The
+            // part stays as it is and the original error travels.
+            if self.mark(Publication::Sealed).is_err() {
+                return Err(error);
+            }
             self.poisoned = false;
             // Nothing was published, so the seal describes nothing. Lifting it
             // is what keeps a taken name, a full disk or a platform with no
@@ -929,9 +986,6 @@ impl SegmentFile for FilePart {
             // Anything else -- denied, busy, a device that will not open -- is
             // a question that went unanswered, not a file that moved.
             Err(error) => return Ok(unverified(io(error))),
-        };
-        let Ok(linker) = linker else {
-            return Ok(unverified(StorageError::Unsupported));
         };
         match linker.same_object(&self.file, &at_path) {
             Ok(true) => Ok(Published::At(requested)),
@@ -1843,6 +1897,98 @@ mod tests {
         fs::write(&meta, data).expect("the metadata is writable");
     }
 
+    /// A record no build of ours ever wrote is refused, not interpreted.
+    ///
+    /// The bits are set in order, so a byte claiming the link returned without
+    /// having begun is either corruption or someone else writing. Reading it as
+    /// a state would turn either into a silently stranded download. An
+    /// independent review found the guard had no test at all: deleting it left
+    /// the whole suite passing.
+    #[test]
+    fn a_seal_byte_no_build_ever_wrote_is_refused_at_open() {
+        for byte in [0b010u8, 0b100, 0b101, 0b110, 0b1000, 0xFF] {
+            let directory = Directory::new();
+            let store = publishing_store(&directory.part());
+            let mut part = store.create(&directory.part(), spec(6)).unwrap();
+            part.write_at(0, b"AAAAAA").unwrap();
+            part.sync().unwrap();
+            drop(part);
+            let meta = directory.part().join("1-1.meta");
+            let mut data = fs::read(&meta).unwrap();
+            data[33] = byte;
+            fs::write(&meta, data).unwrap();
+            assert!(
+                matches!(
+                    store.open(&directory.part(), spec(6)),
+                    Err(StorageError::Integrity)
+                ),
+                "{byte:#b} opened as a state instead of being refused"
+            );
+        }
+    }
+
+    /// A part written by an older format is refused rather than misread.
+    ///
+    /// Version 1 wrote one seal byte before linking and never again, so its
+    /// `1` covers a link that never began, one in flight, and one that
+    /// delivered the file. Version 2 reads `1` as the first of those. An
+    /// independent review reproduced the consequence: a file already delivered
+    /// by an older build was published a second time under another name.
+    #[test]
+    fn a_part_from_the_previous_format_is_refused() {
+        let directory = Directory::new();
+        let store = publishing_store(&directory.part());
+        let mut part = store.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        drop(part);
+
+        let meta = directory.part().join("1-1.meta");
+        let mut data = fs::read(&meta).unwrap();
+        // The only difference: the version this build no longer reads, and the
+        // seal byte that build would have left behind on a delivered file.
+        data[8] = 1;
+        data[33] = 1;
+        fs::write(&meta, data).unwrap();
+        assert!(
+            matches!(
+                store.open(&directory.part(), spec(6)),
+                Err(StorageError::Integrity)
+            ),
+            "a version 1 part was read as if its seal byte meant what it means now"
+        );
+    }
+
+    /// A part found sealed is writable again, even when its bytes have gone bad.
+    ///
+    /// `Sealed` means no file can exist, so there is nothing to protect: the
+    /// part is an ordinary one again. Before this, the state stayed on the
+    /// handle and only `publish` could lift it -- after a verification that
+    /// corrupt bytes fail. So a part whose data had gone bad could never be
+    /// written again, which is the bug `unseal` exists to prevent, reintroduced
+    /// for this state. Reproduced by an independent review.
+    #[test]
+    fn a_part_found_sealed_can_be_written_again_even_if_its_bytes_went_bad() {
+        let directory = Directory::new();
+        let store = publishing_store(&directory.part());
+        let mut part = store.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        drop(part);
+        crashed_at(&directory, Publication::Sealed);
+        // The bytes go bad while nothing holds the part.
+        fs::write(directory.part().join("1-1.part"), b"EVIL!!").unwrap();
+
+        let mut again = store.open(&directory.part(), spec(6)).unwrap();
+        again
+            .write_at(0, b"AAAAAA")
+            .expect("a part whose link never began can be downloaded again");
+        assert_eq!(
+            fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+            Some(&Publication::Open.to_byte()),
+            "opening a sealed part left the record where it was"
+        );
+    }
     /// A crash before the link began: the file cannot exist, so the job goes on.
     ///
     /// This is the remedy the earlier work was missing. Publication seals,

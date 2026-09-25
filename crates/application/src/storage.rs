@@ -180,6 +180,21 @@ impl std::fmt::Display for Published {
 /// quietly would leave the same hole under a new arrangement. Returning
 /// `Unsupported` makes publication refuse with a reason instead.
 pub trait HandleLinker: Send + Sync {
+    /// Creates `name` in `directory` for the file `file` holds.
+    ///
+    /// **An `Err` means no name was created.** Publication writes that to disk
+    /// and acts on it: a refused link is recorded as "the attempt is over and
+    /// nothing was made", and the part is made writable again on that basis.
+    /// An implementation that can fail after creating the name -- a retry
+    /// wrapper that resends a request, a filesystem that reports an existing
+    /// name for one it just made -- would leave the engine unsealing a file the
+    /// user already has.
+    ///
+    /// The single `NtSetInformationFile` the Windows implementation makes
+    /// satisfies this because its failure is atomic. A second implementation
+    /// must say how it does. An independent security review asked for this to
+    /// be written down, having found the code depending on it and the trait
+    /// silent about it.
     fn link(
         &self,
         file: &std::fs::File,
