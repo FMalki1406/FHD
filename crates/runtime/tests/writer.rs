@@ -114,6 +114,9 @@ impl SegmentFile for FakeFile {
     ) -> Result<[u8; 32], StorageError> {
         Err(StorageError::Unsupported)
     }
+    fn publication(&self) -> fhd_app::storage::Publication {
+        fhd_app::storage::Publication::Open
+    }
     fn adopt_destination(&mut self, _: &Path) -> Result<(), StorageError> {
         Ok(())
     }

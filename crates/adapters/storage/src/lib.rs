@@ -1,7 +1,8 @@
 //! Single-owner positional storage. Blocking methods belong on the writer thread.
 #![forbid(unsafe_code)]
 use fhd_app::storage::{
-    HandleLinker, Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError,
+    HandleLinker, Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore,
+    StorageError,
 };
 use fhd_domain::ByteRange;
 use sha2::{Digest, Sha256};
@@ -192,67 +193,6 @@ struct Destination {
     folder: File,
     leaf: std::ffi::OsString,
     requested: PathBuf,
-}
-
-/// How far publication had got, as the metadata records it durably.
-///
-/// A crash leaves a part behind and the only question that matters is whether
-/// the user already has the file. Until now the record answered "sealed" and
-/// nothing else, so every crash after the seal was the same unanswerable case
-/// and the part was stranded to be safe.
-///
-/// Three bits of the byte that already carried the seal, so no part file
-/// changes size or version. A byte written by an older build reads as
-/// `Sealed`, which is the conservative one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Publication {
-    /// Nothing attempted. The ordinary state of a part being written.
-    Open,
-    /// Sealed, and the link was never begun. **The file cannot exist**, so the
-    /// part may be unsealed and the publication retried.
-    Sealed,
-    /// The link was begun and its outcome was never recorded. The file may or
-    /// may not exist, and nothing on this disk can say which. The part is kept
-    /// exactly as it is.
-    Attempted,
-    /// The link returned successfully. The bytes are the user's file now.
-    Linked,
-}
-
-/// Bit 0: sealed. Bit 1: the link was begun. Bit 2: the link returned.
-///
-/// Set in that order, each made durable before the next step happens, which is
-/// what lets the three cases be told apart afterwards.
-const SEAL_SEALED: u8 = 0b001;
-const SEAL_ATTEMPTED: u8 = 0b010;
-const SEAL_LINKED: u8 = 0b100;
-
-impl Publication {
-    fn from_byte(byte: u8) -> Self {
-        if byte & SEAL_LINKED != 0 {
-            Self::Linked
-        } else if byte & SEAL_ATTEMPTED != 0 {
-            Self::Attempted
-        } else if byte & SEAL_SEALED != 0 {
-            Self::Sealed
-        } else {
-            Self::Open
-        }
-    }
-    /// The byte this state is written as, so a caller inspecting a part file
-    /// can name what it sees instead of comparing numbers.
-    pub fn to_byte(self) -> u8 {
-        match self {
-            Self::Open => 0,
-            Self::Sealed => SEAL_SEALED,
-            Self::Attempted => SEAL_SEALED | SEAL_ATTEMPTED,
-            Self::Linked => SEAL_SEALED | SEAL_ATTEMPTED | SEAL_LINKED,
-        }
-    }
-    /// Whether a part in this state may be written to again.
-    fn writable(self) -> bool {
-        self == Self::Open
-    }
 }
 
 fn identity(spec: PartSpec, publication: Publication) -> [u8; META_LEN] {
@@ -493,12 +433,20 @@ impl FilePart {
             metadata.read_exact(&mut data).map_err(io)?;
             // The identity bytes are compared against a freshly built record
             // whose own state byte is ignored, so any legal state opens.
+            // The version is checked on its own, so a part this build cannot
+            // read safely is not reported as corruption.
+            if data[..8] != MAGIC[..8] {
+                return Err(StorageError::Integrity);
+            }
+            if data[8] != MAGIC[8] {
+                return Err(StorageError::Superseded);
+            }
             if data[..33] != identity(spec, Publication::Open)[..33]
                 || data[33] > Publication::Linked.to_byte()
                 // Bits only ever set in order: a byte claiming the link
                 // returned without having begun was never written by us.
-                || (data[33] & SEAL_LINKED != 0 && data[33] & SEAL_ATTEMPTED == 0)
-                || (data[33] & SEAL_ATTEMPTED != 0 && data[33] & SEAL_SEALED == 0)
+                || (data[33] & Publication::LINKED != 0 && data[33] & Publication::ATTEMPTED == 0)
+                || (data[33] & Publication::ATTEMPTED != 0 && data[33] & Publication::SEALED == 0)
             {
                 return Err(StorageError::Integrity);
             }
@@ -818,6 +766,14 @@ impl SegmentFile for FilePart {
     }
     fn abandon(&mut self) {
         self.cancelled = true;
+    }
+    fn publication(&self) -> Publication {
+        // The state now, which is what a caller asked about. Right after open it
+        // is the state on disk, except that a part sealed and no further has
+        // been resolved to `Open` -- and that is a true statement about the
+        // part, not a loss: the link had not begun, so nothing was at stake.
+        // The refusals rest on `found`, which keeps the stricter memory.
+        self.publication
     }
     fn adopt_destination(&mut self, destination: &Path) -> Result<(), StorageError> {
         let destination = resolve_destination(destination)?;
@@ -2150,10 +2106,50 @@ mod tests {
         assert!(
             matches!(
                 store.open(&directory.part(), spec(6)),
-                Err(StorageError::Integrity)
+                Err(StorageError::Superseded)
             ),
             "a version 1 part was read as if its seal byte meant what it means now"
         );
+    }
+
+    /// An unreadable format and a corrupt one are different answers.
+    ///
+    /// A review pointed out that both used to arrive as `Integrity`, so a
+    /// caller could not tell "these bytes are wrong" from "this record cannot
+    /// be interpreted safely" -- and the right action differs: corruption means
+    /// fetch again, a superseded format means a new generation and leave the
+    /// old part alone.
+    #[test]
+    fn an_unreadable_format_and_a_corrupt_one_are_told_apart() {
+        for (magic, expected, what) in [
+            (
+                b"FHDPART\0\x01",
+                StorageError::Superseded,
+                "an older version",
+            ),
+            (
+                b"XXXXXXX\0\x02",
+                StorageError::Integrity,
+                "a record that is not ours",
+            ),
+        ] {
+            let directory = Directory::new();
+            let store = publishing_store(&directory.part());
+            let mut part = store.create(&directory.part(), spec(6)).unwrap();
+            part.write_at(0, b"AAAAAA").unwrap();
+            part.sync().unwrap();
+            drop(part);
+
+            let meta = directory.part().join("1-1.meta");
+            let mut data = fs::read(&meta).unwrap();
+            data[..9].copy_from_slice(magic);
+            fs::write(&meta, data).unwrap();
+            assert_eq!(
+                store.open(&directory.part(), spec(6)).err(),
+                Some(expected),
+                "{what} was not reported as itself"
+            );
+        }
     }
 
     /// A part found sealed is writable again, even when its bytes have gone bad.

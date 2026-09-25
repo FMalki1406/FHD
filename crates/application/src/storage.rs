@@ -42,6 +42,14 @@ pub enum StorageError {
     Integrity,
     Conflict,
     Unsupported,
+    /// The part on disk was written by a format this build no longer reads.
+    ///
+    /// Separate from `Integrity` because the answer differs. Corruption means
+    /// these bytes are wrong; this means they cannot be interpreted safely --
+    /// the older format's record could not say whether the file had been
+    /// delivered. The job needs a new generation, which is a new part file and
+    /// an object of its own; the old one is left exactly where it is.
+    Superseded,
 }
 impl StorageError {
     pub fn code(self) -> &'static str {
@@ -55,6 +63,7 @@ impl StorageError {
             Self::Unsupported | Self::Io(ErrorKind::Unsupported | ErrorKind::CrossesDevices) => {
                 "STORAGE-UNSUPPORTED"
             }
+            Self::Superseded => "STORAGE-SUPERSEDED",
             Self::Io(ErrorKind::StorageFull) => "STORAGE-FULL",
             Self::Io(ErrorKind::PermissionDenied) => "STORAGE-ACCESS-DENIED",
             Self::Io(ErrorKind::NotFound) => "STORAGE-NOT-FOUND",
@@ -82,6 +91,65 @@ pub enum Occupant {
     OtherSize,
     /// A directory, link or device: never publishable over.
     NotAFile,
+}
+
+/// How far publication had got, as the metadata records it durably.
+///
+/// A crash leaves a part behind and the only question that matters is whether
+/// the user already has the file. Until now the record answered "sealed" and
+/// nothing else, so every crash after the seal was the same unanswerable case
+/// and the part was stranded to be safe.
+///
+/// Three bits of the byte that already carried the seal, so no part file
+/// changes size or version. A byte written by an older build reads as
+/// `Sealed`, which is the conservative one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// Nothing attempted. The ordinary state of a part being written.
+    Open,
+    /// Sealed, and the link was never begun. **The file cannot exist**, so the
+    /// part may be unsealed and the publication retried.
+    Sealed,
+    /// The link was begun and its outcome was never recorded. The file may or
+    /// may not exist, and nothing on this disk can say which. The part is kept
+    /// exactly as it is.
+    Attempted,
+    /// The link returned successfully. The bytes are the user's file now.
+    Linked,
+}
+impl Publication {
+    /// Bit 0: the part was sealed.
+    pub const SEALED: u8 = 0b001;
+    /// Bit 1: the link was begun.
+    pub const ATTEMPTED: u8 = 0b010;
+    /// Bit 2: the link returned.
+    pub const LINKED: u8 = 0b100;
+
+    pub fn from_byte(byte: u8) -> Self {
+        if byte & Self::LINKED != 0 {
+            Self::Linked
+        } else if byte & Self::ATTEMPTED != 0 {
+            Self::Attempted
+        } else if byte & Self::SEALED != 0 {
+            Self::Sealed
+        } else {
+            Self::Open
+        }
+    }
+    /// The byte this state is written as, so a caller inspecting a part file
+    /// can name what it sees instead of comparing numbers.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Sealed => Self::SEALED,
+            Self::Attempted => Self::SEALED | Self::ATTEMPTED,
+            Self::Linked => Self::SEALED | Self::ATTEMPTED | Self::LINKED,
+        }
+    }
+    /// Whether a part in this state may be written to again.
+    pub fn writable(self) -> bool {
+        self == Self::Open
+    }
 }
 
 /// What publication achieved, with the object kept separate from the path, and
@@ -280,6 +348,15 @@ pub trait SegmentFile: Send {
         expected: Option<[u8; 32]>,
         record: &[(ByteRange, [u8; 32])],
     ) -> Result<[u8; 32], StorageError>;
+    /// How far publication had got when this part was opened.
+    ///
+    /// A caller deciding what to do with a job needs this, and until now could
+    /// only infer it from which operations were refused -- `Attempted` opens
+    /// normally and then refuses writing and publishing with `InvalidState`,
+    /// which is indistinguishable from several other reasons. Saying it
+    /// outright is what lets a recovery tell "nothing was ever linked" from
+    /// "nobody can say".
+    fn publication(&self) -> Publication;
     /// Adopts the folder the operator named, as an object rather than a path.
     ///
     /// **This is the moment the destination's identity is decided**, and it is

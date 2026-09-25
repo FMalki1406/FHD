@@ -1,7 +1,9 @@
 //! In-memory transfer ports with the same acceptance rules as the real adapters,
 //! plus fault injection. Deterministic and test-only.
 use fhd_app::{
-    storage::{Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError},
+    storage::{
+        Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore, StorageError,
+    },
     transport::{ByteStream, OriginId, Probe, Transport, TransportError},
     AppError, CommitError, Destinations, DurableExtent, PortFuture, PublishIntent,
     TransferRepository,
@@ -536,6 +538,15 @@ impl SegmentFile for MemoryFile {
     /// the part. This double keeps a path because it has no filesystem to hold
     /// an object in; what it can still carry is the *ordering* -- that nothing
     /// publishes without having adopted first.
+    fn publication(&self) -> Publication {
+        // This double has no metadata file to have crashed part-way through.
+        // A test that needs the other states drives the real adapter.
+        if self.published_once {
+            Publication::Linked
+        } else {
+            Publication::Open
+        }
+    }
     fn adopt_destination(&mut self, destination: &Path) -> Result<(), StorageError> {
         self.destination = Some(destination.to_path_buf());
         Ok(())
