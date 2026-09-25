@@ -1,12 +1,31 @@
 -- The stop-reason check had gone stale, and a reason the engine can produce
 -- could not be written.
 --
--- `job_state.reason` allowed 0..6. `StopReason::Destination` is 7 and has been
--- since it was added, so a job stopped because something already occupies the
--- destination name failed to persist and the run came back
--- `PERSISTENCE-UNAVAILABLE` instead of the reason the operator needed. Found
--- while adding `Unreadable` and `Unconfirmed`, 8 and 9, which would have been
--- the second and third.
+-- Widens the stop-reason check for `Unreadable` and `Unconfirmed`, 8 and 9.
+--
+-- Two earlier versions of this comment claimed more than that, and both were
+-- wrong. The first said the old check `BETWEEN 0 AND 6` had always prevented
+-- storing `StopReason::Destination` (7), so such a job came back
+-- `PERSISTENCE-UNAVAILABLE` instead of its reason. The second, after an
+-- engineering review, narrowed that to databases created before commit 5799bab.
+-- A security review disputed it, and checking settles it:
+--
+--   * 5799bab added `Destination` and widened 003 to `BETWEEN 0 AND 7` in the
+--     same commit, so no build ever had that reason with a narrower check of its
+--     own making.
+--   * A database carrying the pre-5799bab 003 does not quietly keep the narrow
+--     check either: `validate_schema` compares every applied migration against
+--     its recorded checksum, so such a database is refused as `Corrupt` on open
+--     rather than opened with the old CHECK in place.
+--
+-- So no database ever refused to store a reason the engine produced. The only
+-- real defect was the two new codes, and this file is the whole of it.
+--
+-- What does stand from that exchange: editing an applied migration in place --
+-- which 5799bab did to 003 -- is the wrong shape, because the version number
+-- then describes two different schemas. It fails closed here rather than
+-- silently, which is the saving grace and not a licence. Widen a CHECK with a
+-- new file, as this one does.
 --
 -- SQLite cannot widen a CHECK in place, so the table is rebuilt. Everything
 -- else about it is carried across unchanged.

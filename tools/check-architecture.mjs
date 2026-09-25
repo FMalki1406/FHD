@@ -235,6 +235,41 @@ export function checkUnsafePolicy(root) {
   return offenders;
 }
 
+/// Source files git would treat as binary, so no diff of them is ever reviewed.
+///
+/// A raw NUL byte in a `.rs` file makes git call it binary: `git show` prints
+/// `Bin 54933 -> 56189 bytes` and **no diff at all**, and ripgrep skips the file
+/// entirely. One such byte sat in the composition root, written as a literal NUL
+/// inside a byte-string literal instead of `\x00`. Both independent reviews of
+/// this branch found it, from opposite directions: the engineering review because
+/// grep could not search the file, the security review because the commit's
+/// changes to the replacement policy -- the very subject of the review -- were
+/// invisible in the diff. It is the cheapest way to get a change past this
+/// project, so the gate refuses it.
+///
+/// `\x00` in an escape is the same byte to rustc and keeps the file text.
+export function checkReviewableSources(root) {
+  const offenders = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory)) {
+      if (entry === 'target' || entry === '.git') continue;
+      const full = `${directory}/${entry}`;
+      if (statSync(full).isDirectory()) { walk(full); continue; }
+      if (!entry.endsWith('.rs')) continue;
+      const bytes = readFileSync(full);
+      const at = bytes.indexOf(0);
+      if (at === -1) continue;
+      const relative = full.slice(root.length + 1).split('\\').join('/');
+      offenders.push(
+        `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
+        `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
+      );
+    }
+  };
+  walk(`${root}/crates`);
+  return offenders;
+}
+
 /// The policy itself, over one file's text. Exported so it can be tested on
 /// spellings that do not exist in the tree.
 export function unsafeOffendersIn(relative, text) {
@@ -375,7 +410,11 @@ function main(args) {
   const root = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/u, '');
   const unapproved = checkUnsafePolicy(root);
   if (unapproved.length) throw new Error(`Unapproved unsafe allowances:\n${unapproved.join('\n')}`);
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved).`);
+  // A source file git diffs as binary cannot be reviewed at all, which is worse
+  // than any single rule this gate enforces on what the file says.
+  const unreviewable = checkReviewableSources(root);
+  if (unreviewable.length) throw new Error(`Sources no diff would show:\n${unreviewable.join('\n')}`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, every source reviewable as text).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -50,6 +50,34 @@ pub enum StopReason {
     /// outcome to be confirmed.
     Unconfirmed,
 }
+impl StopReason {
+    /// Whether the bytes this job has cannot be continued as they are.
+    ///
+    /// A plain `Resume` is refused for these, and the transition itself enforces
+    /// that. Two answers are possible for one of them and neither for the other,
+    /// which is why `needs_new_representation` exists separately.
+    pub fn blocks_resume(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceChanged | Self::Integrity | Self::Unreadable | Self::Unconfirmed
+        )
+    }
+    /// Whether a new representation is the answer.
+    ///
+    /// True for the reasons where the bytes are unusable and nothing may have
+    /// been delivered, so fetching again into an object of its own is safe.
+    /// **False for `Unconfirmed`**, which blocks a resume without offering a
+    /// replacement: a part left part-way through publication may already be the
+    /// user's file. This is the single source of that policy -- it was
+    /// duplicated in the composition root and the copies had already drifted
+    /// apart by one reason.
+    pub fn needs_new_representation(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceChanged | Self::Integrity | Self::Unreadable
+        )
+    }
+}
 /// Where a stopping job lands once workers, writer lanes and checkpoints drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopTarget {
@@ -572,10 +600,16 @@ impl Job {
                 S::Queued
             }
             (S::NeedsAction, C::Resume) => {
-                if matches!(
-                    self.reason,
-                    Some(StopReason::SourceChanged | StopReason::Integrity)
-                ) {
+                // Reasons a plain `Resume` cannot answer, refused here rather
+                // than in whoever calls in. Continuing the same representation
+                // would only arrive at the same refusal, having cost the origin
+                // another probe -- and for `Unconfirmed` the refusal is the
+                // point: the part may already be the user's file, so there is
+                // no "go on" for it to mean. An independent review found this
+                // list had fallen behind the composition root's copy, which had
+                // `Unreadable` while this one did not; the invariant belongs
+                // here, so the list is here and the caller consults it.
+                if self.reason.is_some_and(|reason| reason.blocks_resume()) {
                     return Err(DomainError::InvalidTransition);
                 }
                 self.reason = None;
@@ -646,6 +680,16 @@ impl Job {
             }
 
             (S::NeedsAction | S::Paused | S::Failed, C::ReplaceRepresentation) => {
+                // A part that may already be the user's file is not replaced,
+                // by this command or any other. Until this guard existed the
+                // only thing standing between an `Unconfirmed` job and a second
+                // copy of a delivered file was which branch the composition root
+                // took; a second caller of this command, now or later, would
+                // have fetched it. Found by a test asserting the pair of
+                // policies the domain publishes, not by reading the code.
+                if self.reason == Some(StopReason::Unconfirmed) {
+                    return Err(DomainError::InvalidTransition);
+                }
                 self.generation = self.generation.next()?;
                 self.segments = None;
                 self.validator = None;
@@ -1133,6 +1177,93 @@ mod tests {
         value.handle(JobCommand::ReplaceRepresentation).unwrap();
         assert_eq!(value.generation().get(), 2);
         assert!(value.segments().is_none());
+    }
+
+    /// Every reason that cannot be resumed is refused by the transition itself,
+    /// and each one either has a replacement or has nothing at all.
+    ///
+    /// The list had been written twice -- here and in the composition root -- and
+    /// an independent review found the copies already disagreed: the root sent
+    /// `Unreadable` down the replacement path while this transition still let a
+    /// plain `Resume` through it, which would have looped the job back to the
+    /// same refusal after a fresh probe to the origin. The invariant belongs to
+    /// the transition, so this asserts it there, for all four.
+    #[test]
+    fn a_reason_that_blocks_a_resume_is_refused_by_the_transition() {
+        for reason in [
+            StopReason::SourceChanged,
+            StopReason::Integrity,
+            StopReason::Unreadable,
+            StopReason::Unconfirmed,
+        ] {
+            let mut value = transferring(10);
+            value
+                .handle(JobCommand::RequireAction { reason })
+                .unwrap_or_else(|error| panic!("{reason:?} could not stop the job: {error:?}"));
+            value.handle(JobCommand::WorkersDrained).unwrap();
+            assert_eq!(value.state(), JobState::NeedsAction, "{reason:?}");
+            assert_eq!(
+                value.handle(JobCommand::Resume).unwrap_err(),
+                DomainError::InvalidTransition,
+                "{reason:?} let a plain resume through"
+            );
+            assert!(reason.blocks_resume(), "{reason:?}");
+
+            // And the replacement is offered for exactly the reasons where
+            // nothing can have been delivered. For the one where something may
+            // have been, the command is refused here too -- not merely left out
+            // of one caller's routing.
+            let replaced = value.handle(JobCommand::ReplaceRepresentation);
+            if reason.needs_new_representation() {
+                replaced.unwrap_or_else(|error| {
+                    panic!("{reason:?} could not take a new representation: {error:?}")
+                });
+                assert_eq!(value.generation().get(), 2, "{reason:?}");
+                assert!(value.segments().is_none(), "{reason:?}");
+            } else {
+                assert_eq!(
+                    reason,
+                    StopReason::Unconfirmed,
+                    "a reason with no replacement other than Unconfirmed"
+                );
+                assert_eq!(
+                    replaced.unwrap_err(),
+                    DomainError::InvalidTransition,
+                    "a part that may already be the user's file was replaced"
+                );
+                assert_eq!(
+                    value.generation().get(),
+                    1,
+                    "a part that may already be the user's file took a new \
+                     generation, which means a second copy was fetched"
+                );
+            }
+        }
+    }
+
+    /// A reason that says nothing about the bytes is still resumable.
+    ///
+    /// The guard above must not become "no job in `NeedsAction` may resume".
+    #[test]
+    fn a_reason_that_says_nothing_about_the_bytes_still_resumes() {
+        for reason in [
+            StopReason::Network,
+            StopReason::Storage,
+            StopReason::Authentication,
+            StopReason::Destination,
+            StopReason::Policy,
+            StopReason::Unknown,
+        ] {
+            let mut value = transferring(10);
+            value.handle(JobCommand::RequireAction { reason }).unwrap();
+            value.handle(JobCommand::WorkersDrained).unwrap();
+            assert!(!reason.blocks_resume(), "{reason:?}");
+            value
+                .handle(JobCommand::Resume)
+                .unwrap_or_else(|error| panic!("{reason:?} could not resume: {error:?}"));
+            assert_eq!(value.reason(), None, "{reason:?} kept its reason");
+            assert_eq!(value.generation().get(), 1, "{reason:?} changed generation");
+        }
     }
 
     #[test]

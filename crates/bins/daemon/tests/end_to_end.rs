@@ -1485,6 +1485,12 @@ fn find(root: &Path, name: &str) -> Option<PathBuf> {
 /// Every recovery test below starts from a real part with real work in it,
 /// because what a restart finds on disk is bytes, and a part built by hand
 /// would only prove the test's own idea of the format.
+///
+/// The `1-1` names assume the first job of a fresh state directory on its first
+/// representation. That holds for these callers -- each opens its own directory
+/// and nothing has changed generation before the pause -- and the `expect` says
+/// so rather than searching for whatever part happens to be there, which would
+/// quietly pass on the wrong file if either assumption ever broke.
 async fn paused_part(
     state: &Directory,
     destination: &Path,
@@ -1623,7 +1629,31 @@ async fn a_part_that_may_be_delivered_is_not_fetched_again() {
     let url = format!("http://127.0.0.1:{}/file", server.port);
     server.quiet(Duration::from_secs(30)).await;
     let before = server.delivered.load(Ordering::Relaxed);
-    // Twice, because the second ask is where a replacement path would fire.
+    // The run that discovers it: the part is opened, the state is read, and the
+    // job stops without publishing.
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the run did not come back");
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "an unconfirmed part did not stop the job: {outcome:?}"
+    );
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Unconfirmed),
+        "the job stopped for some other reason"
+    );
+    drop(engine);
+
+    // And asking again is refused before anything is opened or asked of the
+    // origin. This is where a replacement path would have fired; instead the
+    // operator is handed back the decision, which is the only honest answer
+    // while nothing can establish how the publication ended. Two further asks,
+    // because a refusal that holds once and not twice is not a refusal.
     for attempt in 0..2 {
         let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
             .await
@@ -1633,19 +1663,23 @@ async fn a_part_that_may_be_delivered_is_not_fetched_again() {
             .await
             .expect("the run did not come back");
         assert!(
-            matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
-            "attempt {attempt}: an unconfirmed part did not stop the job: {outcome:?}"
+            matches!(
+                outcome,
+                Err(EngineError::NeedsDecision(Some(StopReason::Unconfirmed)))
+            ),
+            "attempt {attempt}: a resume of an unconfirmed part was not refused: {outcome:?}"
         );
         assert_eq!(
             engine.reason().await.unwrap(),
             Some(StopReason::Unconfirmed),
-            "attempt {attempt}: the job stopped for some other reason"
+            "attempt {attempt}: the refusal did not leave the reason in place"
         );
         drop(engine);
     }
 
-    // Nothing was fetched. The allowance is for the probe, a one-byte ranged
-    // request the server counts like any other delivery; anything approaching
+    // Nothing was fetched. The allowance is for the probe -- a `bytes=0-1`
+    // ranged request, two bytes, which the server counts like any other
+    // delivery rather than the one byte earlier comments claimed; anything approaching
     // the file would be a second copy of what the user may already have.
     server.quiet(Duration::from_secs(30)).await;
     let fetched = server.delivered.load(Ordering::Relaxed) - before;
@@ -1671,14 +1705,95 @@ async fn a_part_that_may_be_delivered_is_not_fetched_again() {
     assert!(!destination.exists(), "an unconfirmed part published");
 }
 
-/// A crash while the job is changing generation leaves the old part alone.
+/// A record this build cannot make sense of is replaced, not repaired.
+///
+/// `Integrity` is the other reason that takes a new generation, and §10 of the
+/// publication contract claimed it on the strength of the code alone -- an
+/// independent review pointed out that no test anywhere exercised it end to end.
+/// It is a different refusal from `Unreadable`: the format is ours, the contents
+/// are not usable. The answer is the same, and now it is measured rather than
+/// asserted in prose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupt_record_is_replaced_by_a_new_generation() {
+    let body = content(256 * 1024);
+    let state = Directory::new("corrupt-record");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
+
+    let (meta, part) = paused_part(&state, &destination, &server, body.len() as u64).await;
+    let mut planted = std::fs::read(&meta).unwrap();
+    // Inside the magic, not the version byte: the same bytes with the version
+    // changed are a format we refuse as superseded, which is the other reason.
+    planted[0] ^= 0xff;
+    std::fs::write(&meta, &planted).unwrap();
+    let held = std::fs::read(&part).unwrap();
+
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await;
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "a corrupt record did not stop the job: {outcome:?}"
+    );
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Integrity),
+        "a corrupt record was reported as something else"
+    );
+    drop(engine);
+
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the resumed run did not come back");
+    let reason = engine.reason().await.unwrap();
+    let generation = engine.generation().await.unwrap();
+    let landed = published_as_declared(outcome, reason, &destination, &body);
+    drop(engine);
+
+    assert_eq!(generation, 2, "a corrupt record was not given a new object");
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        planted,
+        "the corrupt record was rewritten rather than left for inspection"
+    );
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        held,
+        "the old part was written to"
+    );
+    if landed.is_some() {
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+    }
+}
+
+/// The new generation exists beside the old part, and a restart keeps both.
 ///
 /// The replacement moves the record to a new generation and then fetches into a
-/// new part file. Between those two there is a window where the record has
-/// moved and the disk has not. A restart in that window must not touch the part
-/// that could not be read, and must still be able to carry the job forward.
+/// part file of its own. This waits until that file is **on disk**, closes the
+/// state directory with both generations present, reopens from disk and carries
+/// the job to the end -- with the part that could not be read never written to.
+///
+/// **What it does not do**, stated because an earlier version of this test
+/// claimed it: it does not land inside the window between the committed
+/// generation bump and the new part's creation. It first waited on the delivered
+/// byte counter, which an independent review showed is satisfied by the resume's
+/// ranged probe -- two bytes, counted like any other delivery -- strictly before
+/// the generation-2 file exists. So the trigger fired before the transition, the
+/// assertions held with no interruption at all, and the name promised a crash
+/// that a graceful pause never performed. Reaching the real window needs a fault
+/// injected between the bump and `create`, which is not implemented; what is
+/// asserted here is the boundary this test can actually observe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_crash_while_changing_generation_leaves_the_old_part_untouched() {
+async fn the_new_generation_stands_beside_the_old_part_across_a_restart() {
     let body = content(256 * 1024);
     let state = Directory::new("mid-generation");
     let downloads = state.0.join("downloads");
@@ -1705,20 +1820,21 @@ async fn a_crash_while_changing_generation_leaves_the_old_part_untouched() {
     );
     drop(engine);
 
-    // The resume, cut short as soon as the new generation has anything of its
-    // own -- and the whole state directory closed, which is the restart.
+    // The resume, stopped once the new generation's part file is on disk -- the
+    // transition observed directly, rather than inferred from a byte counter
+    // that the probe satisfies before the transition happens.
+    let parts = destination.parent().unwrap().join(".fhd-parts");
     let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
     let (control, receiver) = mpsc::channel(1);
-    let delivered = server.delivered.clone();
-    let mark = delivered.load(Ordering::Relaxed);
+    let watch = parts.clone();
     let stop = async {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while delivered.load(Ordering::Relaxed) <= mark {
+        while find(&watch, "1-2.part").is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the new generation never started fetching"
+                "the new generation's part file never appeared on disk"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1727,7 +1843,13 @@ async fn a_crash_while_changing_generation_leaves_the_old_part_untouched() {
     let (_outcome, ()) = tokio::join!(engine.run(receiver), stop);
     drop(engine);
 
-    // Whatever the interrupted generation reached, the old part is as it was.
+    // Both generations are on disk at once: the new one exists without the old
+    // one having been reused, renamed or removed to make room for it.
+    assert!(
+        find(&parts, "1-2.part").is_some(),
+        "the new generation's part file did not survive the restart"
+    );
+    // And the old part is as it was.
     assert_eq!(
         std::fs::read(&meta).unwrap(),
         planted,
@@ -1763,4 +1885,129 @@ async fn a_crash_while_changing_generation_leaves_the_old_part_untouched() {
         held,
         "the old part was written to"
     );
+}
+
+/// A part whose record cannot be read is not replaced when the job record says
+/// a publication was begun for it.
+///
+/// This is the defect an independent security review found in the first version
+/// of the recovery path, and it is the one that matters most, because it undoes
+/// a fix this project already paid for. The format version is checked before the
+/// publication byte, so a record this build cannot read says **nothing** about
+/// whether the file was delivered. Answering that with "fetch it all again and
+/// publish" is exactly what the version bump to `\x02` was made to stop: the
+/// review that forced the bump had reproduced a file delivered by an older build
+/// being published a second time under another name.
+///
+/// One byte written at offset 8 of the part's record was enough to ask for it.
+/// The witness that survives is the publish intent: recorded before the seal and
+/// before the link, held in the job record rather than in the user's download
+/// folder, and dropped when the generation changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_record_is_not_replaced_when_a_publication_was_begun() {
+    let body = content(256 * 1024);
+    let state = Directory::new("unreadable-with-intent");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    // Occupied, so publication is attempted and refused: the intent is recorded
+    // and the part survives. This is the cheapest way to reach a job that has
+    // begun publishing without finishing it.
+    std::fs::write(&destination, b"someone else's file").unwrap();
+    let server = harness::serve_slowly(body.clone(), 64 * 1024, Duration::from_millis(1));
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the first run did not come back");
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the transfer did not reach publication: {outcome:?}"
+    );
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Destination),
+        "the run stopped before it could record an intent to publish"
+    );
+    drop(engine);
+
+    // The operator frees the name -- so nothing at the destination can answer the
+    // question either, which is the renamed-folder case in miniature.
+    std::fs::remove_file(&destination).unwrap();
+    let parts = downloads.join(".fhd-parts");
+    let meta = find(&parts, "1-1.meta").expect("the part's record is on disk");
+    let part = find(&parts, "1-1.part").expect("the part is on disk");
+    let mut planted = std::fs::read(&meta).unwrap();
+    planted[8] = 1; // The format version an older build wrote.
+    std::fs::write(&meta, &planted).unwrap();
+    let held = std::fs::read(&part).unwrap();
+
+    let before = server.delivered.load(Ordering::Relaxed);
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the run did not come back");
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "an unreadable record with a publication begun did not stop the job: {outcome:?}"
+    );
+    // Not `Unreadable`: that reason is answered by fetching the file again, and
+    // this part may already be the user's.
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Unconfirmed),
+        "a part that may already have been published was reported as replaceable"
+    );
+    let generation = engine.generation().await.unwrap();
+    drop(engine);
+
+    // And asking again is refused, so nothing is fetched and nothing published.
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the second ask did not come back");
+    assert!(
+        matches!(
+            outcome,
+            Err(EngineError::NeedsDecision(Some(StopReason::Unconfirmed)))
+        ),
+        "a second ask was not refused: {outcome:?}"
+    );
+    drop(engine);
+
+    assert_eq!(
+        generation, 1,
+        "a possibly published part took a new generation"
+    );
+    server.quiet(Duration::from_secs(30)).await;
+    let fetched = server.delivered.load(Ordering::Relaxed) - before;
+    assert!(
+        fetched <= 1024,
+        "a possibly published part was fetched again: {fetched} bytes"
+    );
+    assert!(
+        find(&parts, "1-2.part").is_none(),
+        "a possibly published part was replaced by a new generation"
+    );
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        planted,
+        "the record was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        held,
+        "the part was written to"
+    );
+    assert!(!destination.exists(), "a second copy was published");
 }

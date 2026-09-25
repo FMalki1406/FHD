@@ -448,39 +448,86 @@ impl Session<'_> {
             .destinations
             .resolve(self.job.spec().destination())
             .map_err(|_| RunError::Repository)?;
-        let opened =
-            tokio::task::spawn_blocking(move || -> Result<Box<dyn SegmentFile>, StorageError> {
-                let mut file = if extents.is_empty() {
-                    match store.create(&directory, spec) {
-                        Err(StorageError::Conflict) => store.open(&directory, spec),
-                        other => other,
-                    }?
-                } else {
-                    let mut file = store.open(&directory, spec)?;
-                    for extent in extents {
-                        file.recover_extent(extent.range(), extent.digest())?;
+        // The publication state is read first, and carried out even when what
+        // follows fails.
+        //
+        // It used to be read only from a part that opened, recovered every extent
+        // and adopted its destination. A security review showed what that costs:
+        // re-proving the extents hashes the bytes, and a mismatch is
+        // `StorageError::Integrity` -- which the arm below turned into a reason a
+        // resume answers by fetching the file again. So a part that had been
+        // sealed and linked, whose bytes then failed their digests, was replaced
+        // and published a second time. Deciding the state before any byte is
+        // re-proved is what closes that, and it is the same order the review
+        // recommended.
+        type Opened = (
+            Option<Publication>,
+            Result<Box<dyn SegmentFile>, StorageError>,
+        );
+        let (found, opened) = tokio::task::spawn_blocking(move || -> Opened {
+            let file = if extents.is_empty() {
+                match store.create(&directory, spec) {
+                    Err(StorageError::Conflict) => store.open(&directory, spec),
+                    other => other,
+                }
+            } else {
+                store.open(&directory, spec)
+            };
+            // A record that could not be read or interpreted at all. There is no
+            // state to carry, and that absence is itself the thing the caller
+            // needs to know.
+            let mut file = match file {
+                Ok(file) => file,
+                Err(error) => return (None, Err(error)),
+            };
+            let found = file.publication();
+            if !extents.is_empty() {
+                for extent in extents {
+                    if let Err(error) = file.recover_extent(extent.range(), extent.digest()) {
+                        return (Some(found), Err(error));
                     }
-                    file
-                };
-                file.adopt_destination(&destination)?;
-                Ok(file)
-            })
-            .await
-            .map_err(|_| RunError::Writer(WriterError::WorkerFailed))?;
+                }
+            }
+            match file.adopt_destination(&destination) {
+                Ok(()) => (Some(found), Ok(file)),
+                Err(error) => (Some(found), Err(error)),
+            }
+        })
+        .await
+        .map_err(|_| RunError::Writer(WriterError::WorkerFailed))?;
+        // Whether this part may already be the user's file.
+        //
+        // Answered from the state the part carried, which is the finer witness:
+        // it distinguishes a link that never began from one whose outcome is
+        // unknown. Only when no state could be read is the job record consulted
+        // instead -- and that is exactly the case the record is there for.
+        //
+        // Consulting the record *as well* for a part whose state reads `Open` or
+        // `Sealed` was tried and is wrong: an intent exists from the moment
+        // publication is attempted, including attempts that were **refused and
+        // observed to be refused**. A publication blocked by an occupied
+        // destination leaves such an intent, and treating that as unknown would
+        // strand a job whose file demonstrably never landed -- a test of that
+        // case is what caught it. The state byte says `Open` there, and it is
+        // right.
+        let unknown = match found {
+            Some(state) => matches!(state, Publication::Attempted | Publication::Linked),
+            // Asked here rather than for every open, because `dyn SegmentFile`
+            // is not `Sync` and cannot be held across an await -- and because a
+            // record read is not free.
+            None => self.may_be_published().await?,
+        };
         let file = match opened {
-            // A part this run found part-way through publication. Reaching here
-            // at all means the destination did not hold the file -- the
-            // reconciliation above looks there first -- and that is not
-            // evidence it was never delivered: a folder can be renamed. So it
-            // stops with a reason of its own rather than being discovered later
-            // as a generic storage failure, and that reason is the one the
-            // replacement path deliberately does not act on.
-            Ok(file)
-                if matches!(
-                    file.publication(),
-                    Publication::Attempted | Publication::Linked
-                ) =>
-            {
+            // A part this run found part-way through publication, or one whose
+            // record cannot be read while the job record says a publication was
+            // begun for these bytes. Reaching here at all means the destination
+            // did not hold the file -- the reconciliation above looks there
+            // first -- and that is not evidence it was never delivered: a folder
+            // can be renamed. So it stops with a reason of its own rather than
+            // being discovered later as a generic storage failure, and that
+            // reason is the one the replacement path deliberately does not act
+            // on.
+            _ if unknown => {
                 self.storage_failed = true;
                 let command = JobCommand::RequireAction {
                     reason: StopReason::Unconfirmed,
@@ -504,6 +551,22 @@ impl Session<'_> {
                     StorageError::Integrity => StopReason::Integrity,
                     _ => StopReason::Storage,
                 };
+                // Both of those are reasons a resume answers by fetching the file
+                // again, and neither of them says anything about publication --
+                // which is the defect an independent security review found in
+                // the first version of this arm. The version byte is checked
+                // before the publication byte, and a corrupt record is refused
+                // before either, so a part that had been sealed and linked and
+                // whose record then became unreadable arrived here as "replace
+                // it": fetch the whole file again and publish a second copy of
+                // what the user may already hold. One byte written at offset 8 of
+                // the part's record was enough to ask for that, which is the harm
+                // the version bump to `\x02` was made to close.
+                //
+                // That case no longer reaches this arm: with no state to read,
+                // `unknown` above is decided by the job record and stops the job
+                // as `Unconfirmed` before this runs. What is left here is a part
+                // whose state *was* read and says the link never began.
                 let command = JobCommand::RequireAction { reason };
                 if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {
                     self.step(command).await?;
@@ -925,6 +988,32 @@ impl Session<'_> {
                 Ok(SessionEnd::Settled(self.job.state()))
             }
         }
+    }
+
+    /// Whether publication may already have happened for the bytes this job has.
+    ///
+    /// Answered from the publish intent, which is recorded durably **before** the
+    /// seal and before the link, lives in the job record rather than in the
+    /// user's download folder, and is dropped when the generation changes. So an
+    /// intent for the current generation means a publication was begun for these
+    /// bytes and nothing here can say how it ended.
+    ///
+    /// This is deliberately not a question about the part file. The part's record
+    /// sits in a directory beside the user's download folder and its publication
+    /// state is one unauthenticated byte; worse, the record can fail to be read
+    /// at all, and then it says nothing. A witness that survives exactly the
+    /// cases where the part record cannot be trusted is the one worth consulting.
+    ///
+    /// A `true` answer is a refusal to replace, never a licence to unseal.
+    async fn may_be_published(&self) -> Result<bool, RunError> {
+        let intent = self
+            .c
+            .ports
+            .repository
+            .publish_intent(self.job.id())
+            .await
+            .map_err(|_| RunError::Repository)?;
+        Ok(intent.is_some_and(|intent| intent.generation() == self.job.generation()))
     }
 
     /// Records the intent, then renames without replacing. A conflict or a crash is

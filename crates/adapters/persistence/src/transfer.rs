@@ -624,3 +624,49 @@ impl TransferRepository for SqliteRepository {
         Box::pin(async move { self.jobs().await.map_err(app_error) })
     }
 }
+
+/// The reason codec, asserted against itself and against the schema's bound.
+#[cfg(test)]
+mod codes {
+    use super::{reason_code, reason_of, REASONS};
+
+    /// Every reason survives the round trip as itself, and the codes stay inside
+    /// the bound the schema checks.
+    ///
+    /// The encoding is a `match` and the decoding is an index into a list: two
+    /// spellings of one mapping, kept in step by hand. A security review pointed
+    /// out that nothing asserted they agree, and that an insertion into the
+    /// middle of the list would silently remap rows already stored -- whose
+    /// particular harm is the one the newest reason exists to prevent, a stored
+    /// `Unconfirmed` reading back as a reason a resume answers by fetching the
+    /// file again.
+    #[test]
+    fn every_reason_round_trips_and_stays_within_the_schema_bound() {
+        for (index, &reason) in REASONS.iter().enumerate() {
+            let code = reason_code(reason);
+            assert_eq!(
+                code, index as i64,
+                "{reason:?} encodes to {code} but decodes from position {index}"
+            );
+            assert_eq!(
+                reason_of(code).unwrap(),
+                reason,
+                "{reason:?} did not survive the round trip"
+            );
+        }
+        // `migrations/005_stop_reasons.sql` checks `reason BETWEEN 0 AND 9`. A
+        // reason the engine can produce and the schema would refuse fails to
+        // persist, and the operator is told the store is unavailable instead of
+        // why the job stopped -- which is how the need for that migration was
+        // found in the first place.
+        const SCHEMA_BOUND: i64 = 9;
+        let highest = REASONS.iter().copied().map(reason_code).max().unwrap();
+        assert_eq!(
+            highest, SCHEMA_BOUND,
+            "the highest reason code and the schema's CHECK have drifted apart; \
+             add a migration widening it rather than changing this number"
+        );
+        assert!(reason_of(SCHEMA_BOUND + 1).is_err());
+        assert!(reason_of(-1).is_err());
+    }
+}
