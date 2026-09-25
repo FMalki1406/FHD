@@ -1,7 +1,12 @@
 node_modules/
 target/
-target-isolated/
-target-mutation/
+# Build directories for the cross and worktree checks; one pattern rather than a
+# line per experiment, which is how target-cross and target-wt15 came to sit
+# untracked beside a commit.
+target-*/
+# Worktrees checked out inside the repository (a branch's CI run, a comparison
+# against an older head). They are separate checkouts, not content.
+.wt*/
 pr-integration.md
 dist/
 coverage/
