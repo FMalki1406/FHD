@@ -660,7 +660,17 @@ async fn a_publish_reconciled_after_a_crash_leaves_no_part() {
         SessionEnd::Published(Published::At(destination.clone()))
     );
     assert_eq!(std::fs::read(&destination).unwrap(), body);
-    assert_eq!(part_bytes(&state), 0, "reconciled publish left a part");
+    // Beside the destination, which is where parts live. This assertion used to
+    // read the state directory -- `part_bytes(&state)` -- and parts moved out of
+    // there when publication became a link within one folder, so it was
+    // answering zero for a directory nothing writes to. It measured nothing, and
+    // a review found the leak it should have caught: a part kept back after a
+    // publication this run confirmed.
+    assert_eq!(
+        kept_beside(&destination),
+        0,
+        "a reconciled publish left a part beside the file"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

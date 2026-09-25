@@ -104,6 +104,28 @@ enum Failure {
     Panicked,
 }
 
+/// Why a part is being dropped, which decides whether it may be kept.
+///
+/// A review warned that the retention guard would leak, because `drop_part` is
+/// not only the cancel path: a publication reconciled against the destination
+/// releases its part too, and a `Linked` part kept there would leave `.part` and
+/// `.meta` behind on a completed job. Measured rather than assumed: that path
+/// does not reach `drop_part`, because it still holds its writer and releases
+/// through the lane. So the leak is not reachable today -- and the distinction
+/// is made anyway, because "may this be kept?" and "why are we dropping it?" are
+/// different questions and the first has no safe default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartCleanup {
+    /// A job cancelled or settled without the outcome of a publication being
+    /// established. A part whose record says the link was begun is kept: it may
+    /// be a second name for a file the user already has.
+    Unknown,
+    /// Publication was confirmed by this run. The destination holds the file and
+    /// the record says so, so the part's name carries no evidence worth keeping
+    /// and leaving it behind is a leak.
+    Published,
+}
+
 /// The ports one coordinator drives.
 #[derive(Clone)]
 pub struct Ports {
@@ -213,7 +235,7 @@ impl Coordinator {
     /// Drops a job's part through its own handle, for cases with no live writer:
     /// a publish reconciled from the destination, or a cancelled job being settled.
     /// Best effort: an orphan left behind is reported, never fatal.
-    async fn drop_part(&self, job: &Job) {
+    async fn drop_part(&self, job: &Job, why: PartCleanup) {
         let Some((total, _)) = job.plan() else {
             return;
         };
@@ -228,16 +250,27 @@ impl Coordinator {
         let removed = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
             let mut file = store.open(&directory, spec)?;
             // A part whose record says the link was begun is left exactly where
-            // it is. It may be a second name for a file the user already has,
-            // and while removing this name would not take the file away, it
-            // would destroy the only local evidence that publication may have
-            // happened -- which is the input to deciding what actually became of
-            // it. A cancelled job keeps nothing it downloaded; this is not that,
-            // it is a record of something that may have been delivered.
-            if matches!(
-                file.publication(),
-                Publication::Attempted | Publication::Linked
-            ) {
+            // it is -- but only when what became of that link is unknown. It may
+            // be a second name for a file the user already has, and while
+            // removing this name would not take the file away, it would destroy
+            // the only local evidence that publication may have happened, which
+            // is the input to deciding what actually became of it. A cancelled
+            // job keeps nothing it downloaded; this is not that, it is a record
+            // of something that may have been delivered.
+            //
+            // After a publication this run confirmed, there is nothing to keep
+            // evidence of: the answer is known, the file is at the destination,
+            // and the part's name is just a name. Keeping it there was a leak --
+            // `.part` and `.meta` left behind on a completed job -- which a
+            // review caught in the first version of this guard, where the reason
+            // for the cleanup was not passed in and every caller got the
+            // cautious answer.
+            if why == PartCleanup::Unknown
+                && matches!(
+                    file.publication(),
+                    Publication::Attempted | Publication::Linked
+                )
+            {
                 return Ok(false);
             }
             file.abandon();
@@ -290,7 +323,7 @@ impl Coordinator {
             // The part goes, and the record says so afterwards. A cancelled job
             // keeps nothing -- and a part that was published is a second name
             // for a file the user has, which this does not touch.
-            self.drop_part(&job).await;
+            self.drop_part(&job, PartCleanup::Unknown).await;
             step(repository, &mut job, JobCommand::CleanupFinished).await?;
         }
         Ok(Some(job))
@@ -309,7 +342,7 @@ impl Coordinator {
             JobState::Stopping => step(repository, &mut job, JobCommand::WorkersDrained).await?,
             JobState::Cancelling => {
                 // A cancellation interrupted by a crash still keeps nothing.
-                self.drop_part(&job).await;
+                self.drop_part(&job, PartCleanup::Unknown).await;
                 let repository = self.ports.repository.as_ref();
                 step(repository, &mut job, JobCommand::CleanupFinished).await?;
             }
@@ -1024,8 +1057,10 @@ impl Session<'_> {
                 self.step(JobCommand::WorkersDrained).await?;
             }
             JobState::Cancelling => {
-                // Cancelled work keeps nothing: the part goes before the record does.
-                self.release_part(true).await;
+                // Cancelled work keeps nothing it downloaded -- but a part whose
+                // record says a link was begun is not only downloaded work, and
+                // `drop_part` decides that.
+                self.release_part(true, PartCleanup::Unknown).await;
                 self.step(JobCommand::CleanupFinished).await?;
             }
             _ => {}
@@ -1176,8 +1211,10 @@ impl Session<'_> {
                 if size == intent.size() && digest == intent.digest() =>
             {
                 self.step(JobCommand::PublishCommitted).await?;
-                // This handle never published, but the bytes are at the destination.
-                self.release_part(true).await;
+                // This handle never published, but the bytes are at the
+                // destination and the record now says so: the outcome is known,
+                // so the part's name is removed rather than kept as evidence.
+                self.release_part(true, PartCleanup::Published).await;
                 report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
                 return Ok(SessionEnd::Published(Published::At(destination)));
             }
@@ -1219,7 +1256,7 @@ impl Session<'_> {
         match writer.publish(&self.io).await {
             Ok(outcome) => {
                 self.step(JobCommand::PublishCommitted).await?;
-                self.release_part(false).await;
+                self.release_part(false, PartCleanup::Published).await;
                 report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
                 Ok(SessionEnd::Published(outcome))
             }
@@ -1256,11 +1293,11 @@ impl Session<'_> {
     /// Drops the part file: after publication its bytes live under the final name,
     /// and for a cancelled job they are not wanted. Best effort: a part left behind
     /// is recorded, never fatal, and the orphan stays visible to the repository.
-    async fn release_part(&mut self, abandon: bool) {
+    async fn release_part(&mut self, abandon: bool, why: PartCleanup) {
         // The lane owns the file while it lives, so it must do the releasing;
         // only a session without one falls back to a standalone handle.
         let Some(writer) = self.writer.clone() else {
-            self.c.drop_part(&self.job).await;
+            self.c.drop_part(&self.job, why).await;
             return;
         };
         if writer.discard(abandon, &self.io).await.is_err() {

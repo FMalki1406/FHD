@@ -51,6 +51,16 @@ pub enum Command {
     Shutdown,
 }
 
+/// Commands a session's channel refused, waiting with the reply they owe.
+type Deferred = VecDeque<(JobId, Control, Option<oneshot::Sender<Applied>>)>;
+
+/// Answers a caller once, if one is still waiting.
+fn answer(reply: Option<oneshot::Sender<Applied>>, applied: Applied) {
+    if let Some(reply) = reply {
+        let _ = reply.send(applied);
+    }
+}
+
 /// What became of an operator's command, for whoever asked.
 ///
 /// The reply used to be sent on the strength of the channel send, so a command
@@ -161,12 +171,12 @@ impl Scheduler {
         // How each job's last session ended. A session ending is not a job ending:
         // one that stopped to wait out a retry is classified and runs again here.
         let mut last: HashMap<JobId, Result<SessionEnd, RunError>> = HashMap::new();
-        let mut deferred: VecDeque<(JobId, Control)> = VecDeque::new();
+        let mut deferred: Deferred = VecDeque::new();
         let mut used = 0usize;
         let mut open = true;
         let mut stopping = false;
         loop {
-            self.deliver(&mut deferred, &active);
+            self.deliver(&mut deferred, &active).await;
             let mut started = false;
             if !stopping {
                 self.promote_due(&mut queue).await;
@@ -360,17 +370,40 @@ impl Scheduler {
 
     /// Retries controls a full session channel refused earlier. A stop request that
     /// was dropped would leave a job running under a shutdown that claims to stop it.
-    fn deliver(&self, deferred: &mut VecDeque<(JobId, Control)>, active: &HashMap<JobId, Active>) {
+    ///
+    /// The caller's reply travels with the command rather than being sent when it
+    /// was first queued. A review found that a full session channel answered
+    /// `Applied::Yes` immediately and then deferred the command, so a client could
+    /// be told its cancel had been taken while the command was still in this
+    /// queue -- and be told it even when the session ended and the command was
+    /// dropped here. It is answered where it is resolved.
+    async fn deliver(&self, deferred: &mut Deferred, active: &HashMap<JobId, Active>) {
         for _ in 0..deferred.len() {
-            let Some((id, control)) = deferred.pop_front() else {
+            let Some((id, control, reply)) = deferred.pop_front() else {
                 break;
             };
             match active.get(&id) {
                 Some(entry) if entry.control.try_send(control).is_err() => {
-                    deferred.push_back((id, control))
+                    deferred.push_back((id, control, reply));
                 }
-                // The session ended before the command reached it: nothing to stop.
-                _ => {}
+                // Handed over: the session stops itself from here.
+                Some(_) => answer(reply, Applied::Yes),
+                // The session ended before the command reached it. That is not
+                // "nothing to stop" -- the job is now resting in the record, and
+                // that is exactly where a command for a stopped job belongs.
+                None => {
+                    let command = match control {
+                        Control::Pause => JobCommand::Pause,
+                        Control::Cancel => JobCommand::Cancel,
+                    };
+                    match self.coordinator.command_resting(id, command).await {
+                        Ok(Some(_)) => answer(reply, Applied::Yes),
+                        Ok(None) | Err(_) => {
+                            emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                            answer(reply, Applied::No);
+                        }
+                    }
+                }
             }
         }
     }
@@ -381,7 +414,7 @@ impl Scheduler {
         command: Command,
         queue: &mut Queue,
         active: &HashMap<JobId, Active>,
-        deferred: &mut VecDeque<(JobId, Control)>,
+        deferred: &mut Deferred,
     ) -> bool {
         let (id, control, reply) = match command {
             Command::Admit(job) => {
@@ -391,7 +424,7 @@ impl Scheduler {
             Command::Shutdown => {
                 for (id, entry) in active {
                     if entry.control.try_send(Control::Pause).is_err() {
-                        deferred.push_back((*id, Control::Pause));
+                        deferred.push_back((*id, Control::Pause, None));
                     }
                 }
                 return true;
@@ -399,19 +432,16 @@ impl Scheduler {
             Command::Pause(id, reply) => (id, Control::Pause, reply),
             Command::Cancel(id, reply) => (id, Control::Cancel, reply),
         };
-        // Answered exactly once, on every route out of here. A reply the caller
-        // no longer waits for is dropped without ceremony.
-        let answer = |applied: Applied| {
-            if let Some(reply) = reply {
-                let _ = reply.send(applied);
-            }
-        };
         if let Some(entry) = active.get(&id) {
-            // The session owns the job: it stops itself and reports back.
+            // The session owns the job: it stops itself and reports back. If its
+            // channel is full the command waits, and so does the reply -- saying
+            // `Yes` here would be a claim about a command still sitting in a
+            // queue, which is what it used to be.
             if entry.control.try_send(control).is_err() {
-                deferred.push_back((id, control));
+                deferred.push_back((id, control, reply));
+            } else {
+                answer(reply, Applied::Yes);
             }
-            answer(Applied::Yes);
             return false;
         }
         let Some(entry) = queue.remove(id) else {
@@ -431,9 +461,9 @@ impl Scheduler {
                 // true rather than a description of this scheduler's bookkeeping.
                 Ok(None) | Err(_) => {
                     emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
-                    answer(Applied::No);
+                    answer(reply, Applied::No);
                 }
-                Ok(Some(_)) => answer(Applied::Yes),
+                Ok(Some(_)) => answer(reply, Applied::Yes),
             }
             return false;
         };
@@ -443,7 +473,7 @@ impl Scheduler {
         };
         match self.coordinator.command(entry.job, command).await {
             Ok(job) => {
-                answer(Applied::Yes);
+                answer(reply, Applied::Yes);
                 match self.settle(job).await {
                     Ok(job) => queue.take(Entry {
                         job,
@@ -453,7 +483,7 @@ impl Scheduler {
                 }
             }
             Err(error) => {
-                answer(Applied::No);
+                answer(reply, Applied::No);
                 queue.done.push(Outcome::failed(id, error));
             }
         }
