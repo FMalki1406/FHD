@@ -216,6 +216,30 @@ pub const WARNINGS: [&str; 1] = ["DESTINATION-SHARED"];
 /// One per condition, and there is one condition. The bound exists so a decoder
 /// has a limit to enforce rather than a list to trust.
 pub const MAX_WARNINGS: usize = 8;
+
+/// Why a job is waiting for a person, as it crosses this boundary.
+///
+/// Warnings were enumerated here and reasons were not, so a reason was a free
+/// string on a `"v":1` answer: a new one could appear without anything saying
+/// so, and a decoder had nothing to check it against. A review named that as the
+/// gap, and it is the same argument the warnings list already won -- a versioned
+/// boundary carries a known set or it carries whatever a future build invents.
+///
+/// These are the strings the engine's own mapping produces, one per
+/// `StopReason`, and adding a variant there without adding it here fails the
+/// round-trip test rather than shipping an answer nobody declared.
+pub const REASONS: [&str; 10] = [
+    "SOURCE-CHANGED",
+    "AUTHENTICATION",
+    "STORAGE",
+    "INTEGRITY",
+    "NETWORK",
+    "POLICY",
+    "UNKNOWN",
+    "DESTINATION",
+    "UNREADABLE",
+    "UNCONFIRMED",
+];
 impl Checked for Response {
     fn check(&self) -> Result<(), ProtocolError> {
         match self {
@@ -232,6 +256,17 @@ impl Checked for Response {
                 Err(ProtocolError::Invalid)
             }
             Self::Jobs { jobs, .. } if jobs.iter().any(|job| job.job == 0) => {
+                Err(ProtocolError::Invalid)
+            }
+            // A reason nobody declared is refused on both sides, exactly as an
+            // undeclared warning is.
+            Self::Jobs { jobs, .. }
+                if jobs.iter().any(|job| {
+                    job.reason
+                        .as_deref()
+                        .is_some_and(|reason| !REASONS.contains(&reason))
+                }) =>
+            {
                 Err(ProtocolError::Invalid)
             }
             Self::Failed { code } if code.is_empty() || code.len() > 64 => {
@@ -558,6 +593,61 @@ mod tests {
         assert_eq!(decode_response(planted), Err(ProtocolError::Invalid));
         let flooded = br#"{"v":1,"id":1,"body":{"kind":"accepted","job":1,"warnings":["DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED"]}}"#;
         assert_eq!(decode_response(flooded), Err(ProtocolError::Invalid));
+    }
+    /// A reason nobody declared does not cross this boundary, in either
+    /// direction.
+    ///
+    /// Warnings were enumerated here and reasons were not, so a reason was a
+    /// free string on a `"v":1` answer: a future build could introduce one with
+    /// nothing saying so, and a decoder had nothing to check it against.
+    /// Encoding is ours; decoding is where somebody else's bytes arrive, so both
+    /// are asserted.
+    #[test]
+    fn stop_reasons_outside_the_declared_set_are_refused_on_both_sides() {
+        let summary = |reason: Option<&str>| JobSummary {
+            job: 1,
+            state: "NeedsAction".into(),
+            reason: reason.map(str::to_owned),
+            durable_bytes: 0,
+            total: None,
+        };
+
+        // Every declared reason goes through, and so does no reason at all.
+        for declared in REASONS {
+            let answer = Response::Jobs {
+                jobs: vec![summary(Some(declared))],
+                next: None,
+            };
+            assert!(
+                encode_response(1, &answer).is_ok(),
+                "a declared reason was refused: {declared}"
+            );
+        }
+        let none = Response::Jobs {
+            jobs: vec![summary(None)],
+            next: None,
+        };
+        assert!(encode_response(1, &none).is_ok());
+
+        // One nobody declared does not.
+        let invented = Response::Jobs {
+            jobs: vec![summary(Some("MADE-UP"))],
+            next: None,
+        };
+        assert_eq!(encode_response(1, &invented), Err(ProtocolError::Invalid));
+
+        // And a peer that sends one anyway does not get it past the decoder. The
+        // planted value carries an escape sequence that would clear a terminal
+        // if it were ever printed, written as a JSON escape so the frame is well
+        // formed and the refusal is about the reason rather than the syntax.
+        let planted = br#"{"v":1,"id":1,"body":{"kind":"jobs","jobs":[{"job":1,"state":"NeedsAction","reason":"\u001b[2J","durable_bytes":0,"total":null}],"next":null}}"#;
+        assert_eq!(decode_response(planted), Err(ProtocolError::Invalid));
+
+        let declared = br#"{"v":1,"id":1,"body":{"kind":"jobs","jobs":[{"job":1,"state":"NeedsAction","reason":"UNCONFIRMED","durable_bytes":0,"total":null}],"next":null}}"#;
+        assert!(
+            decode_response(declared).is_ok(),
+            "a declared reason did not survive the wire"
+        );
     }
     #[test]
     fn frames_survive_being_split_and_joined_by_the_stream() {

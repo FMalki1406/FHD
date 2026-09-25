@@ -1369,4 +1369,49 @@ mod told {
             "STOPPED-RERUN-WITH-RESUME"
         );
     }
+
+    /// Every reason this engine can report is one the protocol declares, and
+    /// every reason the protocol declares is one this engine can report.
+    ///
+    /// Warnings crossing the socket were enumerated in `fhd_protocol`; reasons
+    /// were not, so a reason was a free string on a versioned answer and a
+    /// decoder had nothing to check it against. A review named that as the gap.
+    /// The two lists live in different crates -- the protocol cannot see
+    /// `StopReason`, and should not -- so this is what holds them together.
+    #[test]
+    fn every_reason_the_engine_reports_is_one_the_protocol_declares() {
+        let reported: Vec<&str> = REASONS_HERE.iter().map(super::stop_reason).collect();
+        for reason in &reported {
+            assert!(
+                fhd_protocol::REASONS.contains(reason),
+                "the engine reports {reason}, which the protocol does not declare"
+            );
+        }
+        for declared in fhd_protocol::REASONS {
+            assert!(
+                reported.contains(&declared),
+                "the protocol declares {declared}, which no reason produces"
+            );
+        }
+        assert_eq!(
+            reported.len(),
+            fhd_protocol::REASONS.len(),
+            "one of the two lists has a duplicate"
+        );
+    }
+
+    /// Every variant, listed once. Adding one to the domain without adding it
+    /// here leaves the count wrong and the test above says so.
+    const REASONS_HERE: [StopReason; 10] = [
+        StopReason::SourceChanged,
+        StopReason::Authentication,
+        StopReason::Storage,
+        StopReason::Integrity,
+        StopReason::Network,
+        StopReason::Policy,
+        StopReason::Unknown,
+        StopReason::Destination,
+        StopReason::Unreadable,
+        StopReason::Unconfirmed,
+    ];
 }
