@@ -243,7 +243,13 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
             for warning in &warnings {
                 // The service decided this; the client says it, so adding a
                 // download through the service warns like adding one directly.
-                eprintln!("{warning}");
+                //
+                // Through `printable`, like every other field that came off the
+                // wire. Decoding already refuses anything outside the closed
+                // set, so this cannot fire today -- it is here because the day
+                // one of these two is relaxed, the other should still be the
+                // thing standing between a terminal and whatever arrived.
+                eprintln!("{}", printable(warning));
                 if warning == "DESTINATION-SHARED" {
                     eprintln!(
                         "  other accounts on this machine can change files in this folder. \n                         the download is protected while it runs; the finished file is not."

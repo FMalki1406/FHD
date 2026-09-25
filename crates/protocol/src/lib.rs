@@ -200,10 +200,34 @@ impl Checked for Request {
         }
     }
 }
+/// The warning codes an answer may carry.
+///
+/// A closed set, checked when the answer is decoded. `Failed` has always
+/// carried a code rather than a message, for the reason its own comment gives;
+/// warnings arrived later as a bare `Vec<String>` with nothing bounding them,
+/// and the client printed each one straight to a terminal. The service only
+/// ever produces the codes below, so nothing legitimate is lost by saying so --
+/// and an answer that carries anything else is refused where every other
+/// malformed answer is.
+pub const WARNINGS: [&str; 1] = ["DESTINATION-SHARED"];
+
+/// The most warnings one answer may carry.
+///
+/// One per condition, and there is one condition. The bound exists so a decoder
+/// has a limit to enforce rather than a list to trust.
+pub const MAX_WARNINGS: usize = 8;
 impl Checked for Response {
     fn check(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Accepted { job, .. } if *job == 0 => Err(ProtocolError::Invalid),
+            Self::Accepted { warnings, .. } if warnings.len() > MAX_WARNINGS => {
+                Err(ProtocolError::Invalid)
+            }
+            Self::Accepted { warnings, .. }
+                if warnings.iter().any(|one| !WARNINGS.contains(&one.as_str())) =>
+            {
+                Err(ProtocolError::Invalid)
+            }
             Self::Jobs { jobs, .. } if jobs.len() > MAX_JOBS_PER_PAGE => {
                 Err(ProtocolError::Invalid)
             }

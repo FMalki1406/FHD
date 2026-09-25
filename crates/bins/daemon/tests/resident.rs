@@ -79,7 +79,22 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     let body = content(2 * 1024 * 1024 + 91);
     let (port, _) = serve_file(body.clone(), 0);
     let state = Directory::new("resident");
-    let destination = state.0.join("over-ipc.bin");
+    // The download lands in its own folder, and that folder is opened to other
+    // accounts on purpose, so the answer carries a warning and the assertion
+    // below is about delivery rather than two empty lists agreeing.
+    //
+    // Its own folder, not the test root: sharing the root made an ancestor of
+    // the engine's state directory renameable by others and the engine refused
+    // to open at all, with SwappableStatePath -- correctly. The warning is
+    // about where a download lands; refusing to keep a job record under a path
+    // strangers can move is a different rule, and this test is not about it.
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("over-ipc.bin");
+    assert!(
+        open_to_others(&downloads),
+        "the folder could not be shared, so the warning would have nothing to say"
+    );
     let address = endpoint("add");
 
     let serving = Resident::open(settings(&state))
@@ -120,17 +135,22 @@ async fn work_given_over_the_socket_is_fetched_published_and_remembered() {
     // the one the direct path would make for the same folder, which is what
     //  is.
     let folder = destination.parent().expect("the destination has a folder");
+    // Non-empty, because the folder was opened to other accounts above. The
+    // earlier version of this compared the service's verdict with the direct
+    // path's, and on a private folder both are empty -- which proves the two
+    // agree and nothing about a warning reaching anyone. This is the delivery.
+    assert_eq!(
+        warnings,
+        vec!["DESTINATION-SHARED".to_string()],
+        "the warning for a shared folder did not reach the client"
+    );
+    // And it is still the same verdict the direct path would reach, so the two
+    // cannot drift apart.
     assert_eq!(
         warnings,
         fhd_daemon::shared_destination_warnings(folder),
         "the service reached a different verdict than the direct path"
     );
-    for warning in &warnings {
-        assert_eq!(
-            *warning, "DESTINATION-SHARED",
-            "an unknown warning code reached the client"
-        );
-    }
 
     // The state this job settles in, which is not the same on every platform.
     //
@@ -356,4 +376,63 @@ async fn destinations_the_engine_will_not_write_to_are_refused_at_admission() {
     assert!(!state.engine().join("state-wal").exists());
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(60), engine).await;
+}
+
+/// A folder other accounts can write produces the warning; a private one does
+/// not.
+///
+/// The review of 7dc810a: the delivery test compared the service's verdict with
+/// the direct path's, and on a private folder both are empty -- so it proved
+/// the two agree, not that a warning ever reaches anyone. This makes a folder
+/// that is genuinely shared and checks the decision on it, so the delivery test
+/// below has something to deliver.
+///
+/// Shared means what each platform means by it: mode bits on Unix, an access
+/// list entry for Authenticated Users on Windows. Both are what an operator
+/// would actually have on a data volume, not a contrivance.
+#[test]
+fn a_folder_others_can_write_is_the_one_that_warns() {
+    let directory = Directory::new("warned");
+    let private = directory.0.join("private");
+    std::fs::create_dir(&private).unwrap();
+    assert_eq!(
+        fhd_daemon::shared_destination_warnings(&private),
+        Vec::<String>::new(),
+        "a folder this account made alone was reported as shared"
+    );
+
+    let shared = directory.0.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    assert!(
+        open_to_others(&shared),
+        "the folder could not be shared, so this test would prove nothing"
+    );
+    assert_eq!(
+        fhd_daemon::shared_destination_warnings(&shared),
+        vec!["DESTINATION-SHARED".to_string()],
+        "a folder other accounts can write was not reported"
+    );
+}
+
+/// Grants every account on the machine write access to `folder`.
+///
+/// Returns false when the platform would not do it, so a caller can say the
+/// test proved nothing rather than pass on a folder that was never shared.
+fn open_to_others(folder: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o777)).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        // S-1-5-11 is Authenticated Users, which is what a data volume grants
+        // by default; (M) is Modify.
+        std::process::Command::new("icacls")
+            .arg(folder)
+            .args(["/grant", "*S-1-5-11:(OI)(CI)(M)"])
+            .output()
+            .map(|done| done.status.success())
+            .unwrap_or(false)
+    }
 }
