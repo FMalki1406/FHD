@@ -321,7 +321,15 @@ impl Slow {
             let idle = self.in_flight.load(Ordering::Relaxed) == 0;
             let seen = self.delivered.load(Ordering::Relaxed);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if idle && self.delivered.load(Ordering::Relaxed) == seen {
+            // Asked again at the moment of deciding, not only before waiting.
+            // A connection accepted during the wait left the first reading
+            // stale, and the barrier returned on it with one live after all --
+            // demonstrated in the review of 2f5cb33. Quiet before and quiet
+            // after, with nothing delivered in between.
+            if idle
+                && self.in_flight.load(Ordering::Relaxed) == 0
+                && self.delivered.load(Ordering::Relaxed) == seen
+            {
                 return;
             }
             assert!(

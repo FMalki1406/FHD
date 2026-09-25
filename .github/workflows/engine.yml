@@ -161,6 +161,11 @@ jobs:
       # what runs.
       - name: Test engine library
         run: cargo +1.98.1 test -p fhd-daemon --locked --lib
+      # The test harness measuring itself. Its barrier decides which run a byte
+      # count belongs to, and it has been wrong twice about the span it covers
+      # -- silently, because the suites that rely on it cannot see it fail.
+      - name: Test the measurement barrier
+        run: cargo +1.98.1 test -p fhd-daemon --locked --test barrier
       - name: Test engine end to end
         run: cargo +1.98.1 test -p fhd-daemon --locked --test end_to_end
       - name: Test engine over its socket
