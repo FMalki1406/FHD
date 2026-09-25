@@ -172,13 +172,74 @@ struct Destination {
     requested: PathBuf,
 }
 
-fn identity(spec: PartSpec, sealed: bool) -> [u8; META_LEN] {
+/// How far publication had got, as the metadata records it durably.
+///
+/// A crash leaves a part behind and the only question that matters is whether
+/// the user already has the file. Until now the record answered "sealed" and
+/// nothing else, so every crash after the seal was the same unanswerable case
+/// and the part was stranded to be safe.
+///
+/// Three bits of the byte that already carried the seal, so no part file
+/// changes size or version. A byte written by an older build reads as
+/// `Sealed`, which is the conservative one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// Nothing attempted. The ordinary state of a part being written.
+    Open,
+    /// Sealed, and the link was never begun. **The file cannot exist**, so the
+    /// part may be unsealed and the publication retried.
+    Sealed,
+    /// The link was begun and its outcome was never recorded. The file may or
+    /// may not exist, and nothing on this disk can say which. The part is kept
+    /// exactly as it is.
+    Attempted,
+    /// The link returned successfully. The bytes are the user's file now.
+    Linked,
+}
+
+/// Bit 0: sealed. Bit 1: the link was begun. Bit 2: the link returned.
+///
+/// Set in that order, each made durable before the next step happens, which is
+/// what lets the three cases be told apart afterwards.
+const SEAL_SEALED: u8 = 0b001;
+const SEAL_ATTEMPTED: u8 = 0b010;
+const SEAL_LINKED: u8 = 0b100;
+
+impl Publication {
+    fn from_byte(byte: u8) -> Self {
+        if byte & SEAL_LINKED != 0 {
+            Self::Linked
+        } else if byte & SEAL_ATTEMPTED != 0 {
+            Self::Attempted
+        } else if byte & SEAL_SEALED != 0 {
+            Self::Sealed
+        } else {
+            Self::Open
+        }
+    }
+    /// The byte this state is written as, so a caller inspecting a part file
+    /// can name what it sees instead of comparing numbers.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Sealed => SEAL_SEALED,
+            Self::Attempted => SEAL_SEALED | SEAL_ATTEMPTED,
+            Self::Linked => SEAL_SEALED | SEAL_ATTEMPTED | SEAL_LINKED,
+        }
+    }
+    /// Whether a part in this state may be written to again.
+    fn writable(self) -> bool {
+        self == Self::Open
+    }
+}
+
+fn identity(spec: PartSpec, publication: Publication) -> [u8; META_LEN] {
     let mut data = [0; META_LEN];
     data[..9].copy_from_slice(MAGIC);
     data[9..17].copy_from_slice(&spec.job().get().to_le_bytes());
     data[17..25].copy_from_slice(&spec.generation().get().to_le_bytes());
     data[25..33].copy_from_slice(&spec.size().to_le_bytes());
-    data[33] = u8::from(sealed);
+    data[33] = publication.to_byte();
     data
 }
 /// Holds the part directory against a second engine for as long as it lives, and
@@ -301,7 +362,7 @@ struct FilePart {
     protected: Vec<ByteRange>,
     synchronized: bool,
     verified: Option<[u8; 32]>,
-    sealed: bool,
+    publication: Publication,
     /// The seal was already on disk when this handle opened it.
     ///
     /// Publication seals, links, then the completion is recorded. A crash
@@ -313,7 +374,8 @@ struct FilePart {
     ///
     /// So this flag is "publication may already have happened", and it forbids
     /// both publishing again and lifting the seal.
-    sealed_on_open: bool,
+    /// The state this part was found in when it was opened.
+    found: Publication,
     published: bool,
     cancelled: bool,
     poisoned: bool,
@@ -377,10 +439,12 @@ impl FilePart {
         let sealed = if create {
             file.set_len(spec.size()).map_err(io)?;
             file.sync_all().map_err(io)?;
-            metadata.write_all(&identity(spec, false)).map_err(io)?;
+            metadata
+                .write_all(&identity(spec, Publication::Open))
+                .map_err(io)?;
             metadata.sync_all().map_err(io)?;
             sync_directory(&directory)?;
-            false
+            Publication::Open
         } else {
             if metadata.metadata().map_err(io)?.len() != META_LEN as u64
                 || file.metadata().map_err(io)?.len() != spec.size()
@@ -389,15 +453,23 @@ impl FilePart {
             }
             let mut data = [0; META_LEN];
             metadata.read_exact(&mut data).map_err(io)?;
-            if data[..33] != identity(spec, false)[..33] || data[33] > 1 {
+            // The identity bytes are compared against a freshly built record
+            // whose own state byte is ignored, so any legal state opens.
+            if data[..33] != identity(spec, Publication::Open)[..33]
+                || data[33] > Publication::Linked.to_byte()
+                // Bits only ever set in order: a byte claiming the link
+                // returned without having begun was never written by us.
+                || (data[33] & SEAL_LINKED != 0 && data[33] & SEAL_ATTEMPTED == 0)
+                || (data[33] & SEAL_ATTEMPTED != 0 && data[33] & SEAL_SEALED == 0)
+            {
                 return Err(StorageError::Integrity);
             }
-            data[33] == 1
+            Publication::from_byte(data[33])
         };
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         Ok(Self {
             linker,
-            sealed_on_open: sealed,
+            found: sealed,
             destination: None,
             file,
             metadata,
@@ -408,7 +480,7 @@ impl FilePart {
             protected: vec![],
             synchronized: create,
             verified: None,
-            sealed,
+            publication: sealed,
             published: false,
             cancelled: false,
             poisoned: false,
@@ -478,16 +550,32 @@ impl FilePart {
     /// `InvalidState` for ever -- a part that was genuinely corrupt could never
     /// be re-downloaded.
     fn unseal(&mut self) -> Result<(), StorageError> {
-        // Never a seal this handle did not set. A seal found on disk means
-        // publication may already have happened, and the inode a published file
-        // links to must not become writable again on the strength of a guess.
-        if self.sealed_on_open {
+        // A part whose link was begun may be the user's file. Nothing on this
+        // disk can say whether it is, so it is not made writable on a guess.
+        // One that was only sealed cannot be: the link had not started, so no
+        // name can lead to these bytes, and lifting the seal is safe.
+        if matches!(self.found, Publication::Attempted | Publication::Linked) {
             return Err(StorageError::InvalidState);
         }
         self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
-        self.metadata.write_all(&[0]).map_err(io)?;
+        self.metadata
+            .write_all(&[Publication::Open.to_byte()])
+            .map_err(io)?;
         self.metadata.sync_all().map_err(io)?;
-        self.sealed = false;
+        self.publication = Publication::Open;
+        self.found = Publication::Open;
+        Ok(())
+    }
+
+    /// Records how far publication has got, durably, before going further.
+    ///
+    /// Each step is on disk before the next one happens, which is what makes
+    /// the state after a crash mean something rather than being a guess.
+    fn mark(&mut self, state: Publication) -> Result<(), StorageError> {
+        self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
+        self.metadata.write_all(&[state.to_byte()]).map_err(io)?;
+        self.metadata.sync_all().map_err(io)?;
+        self.publication = state;
         Ok(())
     }
 
@@ -511,7 +599,7 @@ impl SegmentFile for FilePart {
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
         self.healthy()?;
-        if self.sealed {
+        if !self.publication.writable() {
             return Err(StorageError::InvalidState);
         }
         if bytes.is_empty() {
@@ -691,11 +779,13 @@ impl SegmentFile for FilePart {
         if self.published {
             return Err(StorageError::InvalidState);
         }
-        // Found sealed on disk: this part reached the point of publication in
-        // an earlier run and nothing here can say whether the file was made.
-        // Publishing again would risk a second copy; the answer is a job that
-        // stops and needs an operator, which is what refusing produces.
-        if self.sealed_on_open {
+        // A part found part-way through publication. Which way depends on how
+        // far the record says it got, and that is the whole point of recording
+        // it: `Sealed` means the link never began, so no file can exist and a
+        // retry is safe. `Attempted` and `Linked` are refused -- the first
+        // because nothing can say whether the file was made, the second because
+        // it was.
+        if matches!(self.found, Publication::Attempted | Publication::Linked) {
             return Err(StorageError::InvalidState);
         }
         let expected = self.verified.ok_or(StorageError::InvalidState)?;
@@ -740,7 +830,7 @@ impl SegmentFile for FilePart {
             // the only way out. The seal is lifted before the seal is even
             // written here, so nothing to undo -- kept explicit so a later
             // reordering does not silently strand the job.
-            if self.sealed {
+            if self.publication != Publication::Open {
                 self.unseal()?;
             }
             return Err(StorageError::Integrity);
@@ -748,10 +838,7 @@ impl SegmentFile for FilePart {
         // Freeze the generation durably BEFORE a second pathname can expose its
         // inode. A reopened part can never modify a published hard-link target.
         self.poisoned = true;
-        self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
-        self.metadata.write_all(&[1]).map_err(io)?;
-        self.metadata.sync_all().map_err(io)?;
-        self.sealed = true;
+        self.mark(Publication::Sealed)?;
 
         // The name is made from the handle whose bytes were proved, inside the
         // folder handle opened above.
@@ -770,11 +857,21 @@ impl SegmentFile for FilePart {
         // replaced, and a quiet fallback would leave the same hole wearing a
         // new arrangement.
         let linker = self.linker.clone().ok_or(StorageError::Unsupported);
+        // Durable before the attempt, durable after it. A crash between these
+        // two is the one case nothing can decide afterwards, and writing them
+        // is what keeps every other case decidable: without the first, a crash
+        // during the link is indistinguishable from one before it, and every
+        // interrupted publication has to be treated as possibly delivered.
+        self.mark(Publication::Attempted)?;
         let linked = match &linker {
             Ok(linker) => linker.link(&self.file, &folder, &leaf),
             Err(unsupported) => Err(*unsupported),
         };
         if let Err(error) = linked {
+            // The linker returned, so the attempt is over and its answer is
+            // known: no file was made. That is the state a retry can act on,
+            // and it is written before anything else unwinds.
+            self.mark(Publication::Sealed)?;
             self.poisoned = false;
             // Nothing was published, so the seal describes nothing. Lifting it
             // is what keeps a taken name, a full disk or a platform with no
@@ -789,6 +886,7 @@ impl SegmentFile for FilePart {
             // copies of it would be worse than one rebase.
             return Err(error);
         }
+        self.mark(Publication::Linked)?;
         self.file.sync_all().map_err(io)?;
         // Through the handle, not the path: syncing `destination.parent()` would
         // reopen the name and could flush a directory the file is not in. Only
@@ -1582,10 +1680,12 @@ mod tests {
         drop(part);
 
         // The seal is the evidence. It must survive the second failure.
+        // The record says the link returned, which is stronger than "sealed":
+        // it names the state rather than only proving the seal survived.
         assert_eq!(
             fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
-            Some(&1u8),
-            "a later failure lifted the seal on a delivered object"
+            Some(&Publication::Linked.to_byte()),
+            "a later failure disturbed the record of a delivered object"
         );
         let mut reopened = publishing_store(&directory.part())
             .open(&directory.part(), spec(6))
@@ -1652,8 +1752,8 @@ mod tests {
 
         assert_eq!(
             fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
-            Some(&1u8),
-            "the retry's failure lifted the seal on a delivered object"
+            Some(&Publication::Linked.to_byte()),
+            "the retry's failure disturbed the record of a delivered object"
         );
         let mut third = publishing_store(&directory.part())
             .open(&directory.part(), spec(6))
@@ -1666,6 +1766,181 @@ mod tests {
         assert_eq!(fs::read(&elsewhere).unwrap(), b"AAAAAA");
     }
 
+    /// Reads the record at the one moment that decides everything afterwards.
+    ///
+    /// The linker is called between `Attempted` being made durable and the
+    /// outcome being written, so a double standing here sees exactly what a
+    /// crash at this instant would leave on disk. Setting the byte by hand, as
+    /// the tests below do, cannot show that the live sequence writes it --
+    /// mutation testing said so: removing the pre-link write left those tests
+    /// passing, and this one fails.
+    struct WatchTheRecord {
+        meta: PathBuf,
+        seen: Arc<std::sync::Mutex<Option<u8>>>,
+    }
+    impl HandleLinker for WatchTheRecord {
+        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
+            let byte = fs::read(&self.meta)
+                .ok()
+                .and_then(|data| data.get(33).copied());
+            *self.seen.lock().unwrap() = byte;
+            Err(StorageError::Unsupported)
+        }
+        fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+    }
+
+    /// The record says the link has begun before the link is begun.
+    ///
+    /// Without this the whole scheme is decoration: if the attempt is not on
+    /// disk first, a crash during the link is indistinguishable from one
+    /// before it, and every interrupted publication has to be treated as
+    /// possibly delivered -- which is the stranding this work exists to end.
+    #[test]
+    fn the_attempt_is_on_disk_before_the_linker_is_called() {
+        let directory = Directory::new();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let store = FileStorage::default().with_linker(Arc::new(WatchTheRecord {
+            meta: directory.part().join("1-1.meta"),
+            seen: seen.clone(),
+        }));
+        let mut part = store.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        assert!(publish_to(part.as_mut(), &directory.output()).is_err());
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(Publication::Attempted.to_byte()),
+            "the record did not say the link had begun when it began"
+        );
+        drop(part);
+        // And a linker that answered leaves nothing undecidable behind. The
+        // attempt is over and its answer was "no file", so the part goes back
+        // to being an ordinary one: writable, retryable, nothing to be careful
+        // about. `Sealed` is written first and lives only for the instant
+        // between -- it is what a crash in that gap would leave, which is why
+        // it is written at all.
+        assert_eq!(
+            fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+            Some(&Publication::Open.to_byte()),
+            "a linker that answered left the part stranded"
+        );
+    }
+    /// Writes the state a crash would have left, then reopens as a restart does.
+    ///
+    /// The disk is set up directly rather than through an interrupted run,
+    /// because interrupting one needs a hook in the code being tested, and a
+    /// hook is a place a production build can stop at. What a restart sees is
+    /// the bytes; these are the bytes.
+    fn crashed_at(directory: &Directory, state: Publication) {
+        let meta = directory.part().join("1-1.meta");
+        let mut data = fs::read(&meta).expect("the metadata is there");
+        data[33] = state.to_byte();
+        fs::write(&meta, data).expect("the metadata is writable");
+    }
+
+    /// A crash before the link began: the file cannot exist, so the job goes on.
+    ///
+    /// This is the remedy the earlier work was missing. Publication seals,
+    /// links, then records the outcome, and every crash after the seal used to
+    /// be the same unanswerable case -- the part was stranded to be safe, and a
+    /// download that had finished could never be delivered.
+    ///
+    /// The seal now says how far it got. `Sealed` means the link had not
+    /// begun, so no name can lead to these bytes and there is nothing to be
+    /// careful about. The bytes are still proved, so the retry publishes
+    /// without fetching anything again.
+    #[test]
+    fn a_crash_before_the_link_began_publishes_on_the_next_run() {
+        let directory = Directory::new();
+        let store = publishing_store(&directory.part());
+        let mut part = store.create(&directory.part(), spec(6)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+        drop(part);
+        crashed_at(&directory, Publication::Sealed);
+
+        // A bystander in the same folder, so "nothing else was touched" is
+        // asserted rather than assumed.
+        let bystander = directory.output().with_file_name("theirs.bin");
+        fs::write(&bystander, b"not ours").unwrap();
+
+        let mut again = store.open(&directory.part(), spec(6)).unwrap();
+        for (range, digest) in &record {
+            again.recover_extent(*range, *digest).unwrap();
+        }
+        again.sync().unwrap();
+        again.verify(None, &record).unwrap();
+        publish_to(again.as_mut(), &directory.output())
+            .expect("a part whose link never began can still be published");
+        assert_eq!(fs::read(directory.output()).unwrap(), b"AAAAAA");
+        assert_eq!(fs::read(&bystander).unwrap(), b"not ours");
+    }
+
+    /// A crash while the link was in flight, and one after it returned.
+    ///
+    /// Neither may be retried and neither may be made writable: the first
+    /// because nothing on this disk can say whether the user has the file, the
+    /// second because they do. The job stops and needs an operator, which is
+    /// the honest answer to a question that cannot be decided here.
+    #[test]
+    fn a_crash_during_or_after_the_link_neither_retries_nor_reopens() {
+        for state in [Publication::Attempted, Publication::Linked] {
+            let directory = Directory::new();
+            let store = publishing_store(&directory.part());
+            let mut part = store.create(&directory.part(), spec(6)).unwrap();
+            part.write_at(0, b"AAAAAA").unwrap();
+            part.sync().unwrap();
+            let record = attested(part.as_mut());
+            part.verify(None, &record).unwrap();
+            drop(part);
+            crashed_at(&directory, state);
+
+            let bystander = directory.output().with_file_name("theirs.bin");
+            fs::write(&bystander, b"not ours").unwrap();
+
+            let mut again = store.open(&directory.part(), spec(6)).unwrap();
+            assert_eq!(
+                again.write_at(0, b"MUTATE"),
+                Err(StorageError::InvalidState),
+                "{state:?}: a part that may be the user's file was reopened writable"
+            );
+            for (range, digest) in &record {
+                again.recover_extent(*range, *digest).unwrap();
+            }
+            again.sync().unwrap();
+            again.verify(None, &record).unwrap();
+            assert_eq!(
+                publish_to(again.as_mut(), &directory.output()),
+                Err(StorageError::InvalidState),
+                "{state:?}: publication was retried on an undecidable outcome"
+            );
+            drop(again);
+
+            // The record is untouched, the bytes are untouched, and so is every
+            // file that was never ours.
+            assert_eq!(
+                fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+                Some(&state.to_byte()),
+                "{state:?}: the refusal rewrote the record it refused on"
+            );
+            assert_eq!(
+                fs::read(directory.part().join("1-1.part")).unwrap(),
+                b"AAAAAA"
+            );
+            assert_eq!(fs::read(&bystander).unwrap(), b"not ours");
+            assert!(
+                !directory.output().exists(),
+                "{state:?}: a refusal published"
+            );
+        }
+    }
     #[test]
     fn empty_file_is_a_valid_complete_transfer_without_nonempty_extents() {
         let directory = Directory::new();

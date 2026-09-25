@@ -875,8 +875,8 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
     let meta = fs::read(parts.join("1-1.meta")).unwrap();
     assert_eq!(
         meta.get(33),
-        Some(&1u8),
-        "asking twice lifted the seal on a part whose bytes were delivered"
+        Some(&fhd_storage::Publication::Linked.to_byte()),
+        "asking twice disturbed the record of a part whose bytes were delivered"
     );
 
     // And the delivered file is untouched, with no second copy anywhere.
@@ -973,8 +973,8 @@ fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
     // path must not treat this like a publication that never happened.
     assert_eq!(
         fs::read(parts.join("1-1.meta")).unwrap().get(33),
-        Some(&1u8),
-        "the seal was lifted on a part whose bytes may already be delivered"
+        Some(&fhd_storage::Publication::Linked.to_byte()),
+        "the record changed on a part whose bytes may already be delivered"
     );
 
     // One copy, where it was published, untouched.
