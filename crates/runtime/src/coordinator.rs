@@ -8,7 +8,9 @@ use crate::{
     CancellationToken,
 };
 use fhd_app::{
-    storage::{Occupant, PartSpec, Published, SegmentFile, SegmentStore, StorageError},
+    storage::{
+        Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore, StorageError,
+    },
     transport::{OriginId, Transport, TransportError},
     CommitError, Destinations, DurableExtent, PortFuture, PublishIntent, TransferRepository,
 };
@@ -466,6 +468,30 @@ impl Session<'_> {
             .await
             .map_err(|_| RunError::Writer(WriterError::WorkerFailed))?;
         let file = match opened {
+            // A part this run found part-way through publication. Reaching here
+            // at all means the destination did not hold the file -- the
+            // reconciliation above looks there first -- and that is not
+            // evidence it was never delivered: a folder can be renamed. So it
+            // stops with a reason of its own rather than being discovered later
+            // as a generic storage failure, and that reason is the one the
+            // replacement path deliberately does not act on.
+            Ok(file)
+                if matches!(
+                    file.publication(),
+                    Publication::Attempted | Publication::Linked
+                ) =>
+            {
+                self.storage_failed = true;
+                let command = JobCommand::RequireAction {
+                    reason: StopReason::Unconfirmed,
+                };
+                if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {
+                    self.step(command).await?;
+                } else {
+                    self.stop_with(command).await?;
+                }
+                return Ok(());
+            }
             Ok(file) => file,
             Err(error) => {
                 self.storage_failed = true;

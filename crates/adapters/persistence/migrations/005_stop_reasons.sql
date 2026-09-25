@@ -5,7 +5,8 @@
 -- since it was added, so a job stopped because something already occupies the
 -- destination name failed to persist and the run came back
 -- `PERSISTENCE-UNAVAILABLE` instead of the reason the operator needed. Found
--- while adding `Unreadable`, which is 8 and would have been the second.
+-- while adding `Unreadable` and `Unconfirmed`, 8 and 9, which would have been
+-- the second and third.
 --
 -- SQLite cannot widen a CHECK in place, so the table is rebuilt. Everything
 -- else about it is carried across unchanged.
@@ -13,7 +14,7 @@ CREATE TABLE job_state_next (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 12),
     generation INTEGER NOT NULL CHECK(generation > 0),
-    reason INTEGER CHECK(reason IS NULL OR reason BETWEEN 0 AND 8),
+    reason INTEGER CHECK(reason IS NULL OR reason BETWEEN 0 AND 9),
     retry_at INTEGER CHECK(retry_at IS NULL OR retry_at >= 0),
     stop_kind INTEGER CHECK(stop_kind IS NULL OR stop_kind BETWEEN 0 AND 5),
     stop_value INTEGER CHECK(stop_value IS NULL OR stop_value >= 0),
