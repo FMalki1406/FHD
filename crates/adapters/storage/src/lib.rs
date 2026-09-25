@@ -23,8 +23,12 @@ use std::{
 ///
 /// An independent review reproduced exactly that. There is no way to tell the
 /// two meanings apart inside the byte, so they are told apart by the version:
-/// a version-1 part is refused at open, and its job starts again rather than
-/// being resumed on a record that cannot be read safely.
+/// a version-1 part is refused at open rather than resumed on a record that
+/// cannot be read safely.
+///
+/// **Refusing is all that is implemented.** Starting the job again under a new
+/// generation is not, and the part is left where it is. Saying otherwise here
+/// would describe a recovery that does not exist.
 ///
 /// **That is a real cost** -- unfinished work in a version-1 part is lost --
 /// and it is accepted because nothing has shipped, no build from this
@@ -363,13 +367,22 @@ impl SegmentStore for FileStorage {
 enum Fault {
     PartialWrite(usize),
     Sync,
-    /// Fail the nth recording of publication state, counting from zero.
+    /// Fail the nth recording of publication state before the byte is written.
     ///
     /// Publication writes three: the seal, the attempt, and the outcome. Which
     /// one fails changes what a later run finds, and the third is the only one
     /// that can turn a known answer into an undecidable record -- so a test has
-    /// to be able to name it rather than fail whichever comes first.
+    /// to be able to name it rather than fail whichever comes first. Unsealing
+    /// records through the same path, so it can be named too.
     Mark(u8),
+    /// Fail the nth recording **after** its byte is written, at the sync.
+    ///
+    /// A different failure with a different consequence: the byte may be in the
+    /// page cache and reach the disk anyway, or it may not, so a later run can
+    /// legitimately see either value. What must not vary is this run's own
+    /// behaviour -- it has to treat the state as unrecorded and refuse
+    /// accordingly, rather than act on a write it could not make durable.
+    MarkSync(u8),
 }
 struct FilePart {
     /// How this part becomes a name at publication. `None` means nothing
@@ -604,13 +617,9 @@ impl FilePart {
         if matches!(self.found, Publication::Attempted | Publication::Linked) {
             return Err(StorageError::InvalidState);
         }
-        self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
-        self.metadata
-            .write_all(&[Publication::Open.to_byte()])
-            .map_err(io)?;
-        self.metadata.sync_all().map_err(io)?;
-        self.publication = Publication::Open;
-        Ok(())
+        // Through the same recorder as every other state, so there is one
+        // write path to reason about and one to inject faults into.
+        self.mark(Publication::Open)
     }
 
     /// Records how far publication has got, durably, before going further.
@@ -618,6 +627,11 @@ impl FilePart {
     /// Each step is on disk before the next one happens, which is what makes
     /// the state after a crash mean something rather than being a guess.
     fn mark(&mut self, state: Publication) -> Result<(), StorageError> {
+        // Decided on entry. Counting down and then testing the counter in the
+        // same call fires one call early, which is how the first version of
+        // this failed the attempt rather than the outcome it was aimed at.
+        #[cfg(test)]
+        let fail_sync = matches!(self.fault, Some(Fault::MarkSync(0)));
         #[cfg(test)]
         match self.fault {
             Some(Fault::Mark(0)) => {
@@ -625,10 +639,21 @@ impl FilePart {
                 return Err(StorageError::Io(std::io::ErrorKind::Other));
             }
             Some(Fault::Mark(remaining)) => self.fault = Some(Fault::Mark(remaining - 1)),
+            Some(Fault::MarkSync(remaining)) if remaining > 0 => {
+                self.fault = Some(Fault::MarkSync(remaining - 1));
+            }
             _ => {}
         }
         self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
         self.metadata.write_all(&[state.to_byte()]).map_err(io)?;
+        #[cfg(test)]
+        if fail_sync {
+            self.fault = None;
+            // The byte is written and not durable. The state is not adopted in
+            // memory either, so this handle goes on refusing whatever the
+            // unrecorded state would have permitted.
+            return Err(StorageError::Io(std::io::ErrorKind::Other));
+        }
         self.metadata.sync_all().map_err(io)?;
         self.publication = state;
         Ok(())
@@ -920,7 +945,7 @@ impl SegmentFile for FilePart {
             Some(linker) => linker,
             None => {
                 self.poisoned = false;
-                self.unseal()?;
+                let _ = self.unseal();
                 return Err(StorageError::Unsupported);
             }
         };
@@ -950,7 +975,14 @@ impl SegmentFile for FilePart {
             // is what keeps a taken name, a full disk or a platform with no
             // mechanism a job the operator can retry rather than one that can
             // never move again.
-            self.unseal()?;
+            //
+            // Its own failure does not replace the linker's answer either. A
+            // part left sealed is conservative and a later run can still read
+            // it; what an operator acts on is why the publication was refused,
+            // and an I/O error from the unseal hides that. Found by injecting a
+            // sync failure here, after a review pointed out this case had no
+            // test.
+            let _ = self.unseal();
             // The bytes are sound; only the name was refused -- taken, a full
             // disk, or no mechanism here. Nothing needs downloading again.
             //
@@ -1990,6 +2022,76 @@ mod tests {
             !directory.output().exists(),
             "a refused publication published"
         );
+    }
+
+    /// The sync fails after the byte is written, and after the unseal.
+    ///
+    /// Two failures the earlier test did not reach, and a review was right that
+    /// calling that one "complete" was wider than the evidence.
+    ///
+    /// A failed sync is not a failed write: the byte is in the page cache and
+    /// may reach the disk anyway, so a later run can legitimately see either
+    /// value. What must not vary is **this run's** behaviour -- it has to treat
+    /// the state as unrecorded, keep the reason the publication was refused,
+    /// and go on refusing writes on the handle it still holds.
+    ///
+    /// That last part is checked **before** the handle is dropped, which the
+    /// earlier test never did: it only looked at what a reopened part does.
+    #[test]
+    fn a_sync_that_fails_after_the_byte_still_refuses_on_the_live_handle() {
+        // Index 2 is the record after the linker answers; index 3 is the
+        // unseal that follows it, which records through the same path.
+        for (which, name) in [(2u8, "the outcome"), (3, "the unseal")] {
+            let directory = Directory::new();
+            let linker: Arc<dyn HandleLinker> = Arc::new(NoMechanism);
+            let mut part =
+                FilePart::open_inner(&directory.part(), spec(6), true, None, Some(linker.clone()))
+                    .unwrap();
+            part.write_at(0, b"AAAAAA").unwrap();
+            part.sync().unwrap();
+            let record = attested(&mut part);
+            part.verify(None, &record).unwrap();
+
+            let bystander = directory.output().with_file_name("theirs.bin");
+            fs::write(&bystander, b"not ours").unwrap();
+
+            part.fault = Some(Fault::MarkSync(which));
+            assert_eq!(
+                publish_to(&mut part, &directory.output()),
+                Err(StorageError::Unsupported),
+                "{name}: a durability failure replaced the reason the link was refused"
+            );
+
+            // The live handle, before it is dropped. A state that could not be
+            // made durable was not adopted, so nothing it would have permitted
+            // is permitted.
+            assert_eq!(
+                part.write_at(0, b"MUTATE"),
+                Err(StorageError::InvalidState),
+                "{name}: the handle accepted a write on a state it could not record"
+            );
+            drop(part);
+
+            // The bytes and every file that was never ours are untouched,
+            // whichever way the unsynced byte fell.
+            assert_eq!(
+                fs::read(directory.part().join("1-1.part")).unwrap(),
+                b"AAAAAA"
+            );
+            assert_eq!(fs::read(&bystander).unwrap(), b"not ours");
+            assert!(
+                !directory.output().exists(),
+                "{name}: a refused publication published"
+            );
+
+            // And a later run is held to whatever the record actually says --
+            // never to less than the conservative reading.
+            let found = fs::read(directory.part().join("1-1.meta")).unwrap()[33];
+            assert!(
+                matches!(found, 0 | 1 | 3),
+                "{name}: the record ended on a value that means the link returned: {found:#b}"
+            );
+        }
     }
 
     /// A record no build of ours ever wrote is refused, not interpreted.
