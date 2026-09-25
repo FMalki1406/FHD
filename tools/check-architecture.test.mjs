@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
-  attributesIn, checkArchitecture, checkTestCoverage, unsafeOffendersIn, withoutComments,
+  attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
+  unsafeOffendersIn, withoutComments,
 } from './check-architecture.mjs';
 
 function metadata(graph) {
@@ -281,4 +285,59 @@ test('unsafe gate is not talked past with a comment inside the attribute', () =>
   assert.equal(withoutComments('a /* b */ c'), 'a   c');
   assert.equal(withoutComments('a // b\nc'), 'a  \nc');
   assert.equal(withoutComments('allow/*x*/(unsafe_code)'), 'allow (unsafe_code)');
+});
+
+// A raw NUL makes git diff a file as binary, so nothing in it is ever reviewed.
+// This is the one check in the gate that had no test, while the commit adding it
+// said it had been "tested against a planted one" -- true of a manual check, not
+// of anything that would fail again. Both re-reviews said the same, and one of
+// them showed the scope was narrower than the comment claimed: `crates` only,
+// `.rs` only, so the gate's own source and the migrations' CHECK constraints
+// were unprotected.
+test('refuses a raw NUL in any reviewable source, whatever the tree or extension', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'fhd-gate-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const plant = (relative, bytes) => {
+    const full = join(root, relative);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, bytes);
+    return full;
+  };
+
+  // Clean to begin with, including a file whose NUL is written as an escape.
+  plant('crates/a/src/lib.rs', 'fn main() { let _ = b"x\\x00y"; }\n');
+  plant('tools/gate.mjs', 'export const x = 1;\n');
+  assert.deepEqual(checkReviewableSources(root), []);
+
+  // Every tree the gate walks, and extensions beyond Rust: a CHECK constraint
+  // hidden in a migration is as unreviewable as a hidden policy in Rust.
+  for (const relative of [
+    'crates/a/src/lib.rs',
+    'crates/adapters/persistence/migrations/005_x.sql',
+    'tools/gate.mjs',
+    '.github/workflows/engine.yml',
+  ]) {
+    plant(relative, Buffer.from(`ab\u0000cd`, 'binary'));
+    const offenders = checkReviewableSources(root);
+    assert.equal(offenders.length, 1, relative);
+    assert.match(offenders[0], /raw NUL byte at offset 2/u);
+    assert.ok(offenders[0].startsWith(relative), `${offenders[0]} should name ${relative}`);
+    // Restored, so each iteration tests exactly one planted file.
+    plant(relative, 'clean\n');
+  }
+
+  // A directory the gate must not walk into, and a file type it does not judge.
+  plant('crates/a/target/debug/build.rs', Buffer.from('a\u0000b', 'binary'));
+  plant('crates/a/fixture.bin', Buffer.from('a\u0000b', 'binary'));
+  assert.deepEqual(checkReviewableSources(root), []);
+
+  // A dangling symlink must be skipped, not throw and fail the gate with an
+  // error about nothing. Creating one needs privileges on Windows, so the
+  // assertion runs only where the link could actually be made.
+  try {
+    symlinkSync(join(root, 'crates/a/missing.rs'), join(root, 'crates/a/dangling.rs'));
+  } catch {
+    return;
+  }
+  assert.deepEqual(checkReviewableSources(root), []);
 });

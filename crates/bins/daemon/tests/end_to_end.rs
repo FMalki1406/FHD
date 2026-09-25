@@ -2011,3 +2011,141 @@ async fn an_unreadable_record_is_not_replaced_when_a_publication_was_begun() {
     );
     assert!(!destination.exists(), "a second copy was published");
 }
+
+/// Corrupt bytes on a part that may already be delivered are still not replaced.
+///
+/// The other half of the same guard, and it was not covered: a re-review proved
+/// it by moving the `Integrity` error ahead of the publication check, at which
+/// point **the entire suite still passed** while a part whose record says the
+/// link was begun became replaceable -- fetched again and published a second
+/// time. Re-proving the durable extents hashes the bytes, so a part that reached
+/// publication and then suffered a bad sector arrives exactly here.
+///
+/// `Integrity` is the right answer when the link never began, which
+/// `a_corrupt_record_is_replaced_by_a_new_generation` covers. It is the wrong
+/// answer once the record says a publication was begun, and this is that case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_bytes_on_a_part_that_may_be_delivered_are_not_replaced() {
+    let body = content(256 * 1024);
+    let state = Directory::new("unconfirmed-corrupt");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
+
+    // A completed transfer whose publication was refused: every byte is durable
+    // and committed with a digest, which is what makes re-proving the extents
+    // run at all. A pause does not do -- it may commit nothing, and then the
+    // corruption below is never looked at. That is not a hypothetical: the first
+    // version of this test was built on a pause, passed under the very mutation
+    // it was written to catch, and was measuring the plain `Attempted` path that
+    // another test already covers.
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+    std::fs::write(&destination, b"someone else's file").unwrap();
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the first run did not come back");
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the transfer did not reach publication: {outcome:?}"
+    );
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Destination),
+        "the run stopped before every byte was durable"
+    );
+    assert_eq!(
+        engine.durable_bytes().await.unwrap(),
+        body.len() as u64,
+        "not every byte was committed, so no extent would be re-proved"
+    );
+    drop(engine);
+    std::fs::remove_file(&destination).unwrap();
+
+    let parts = downloads.join(".fhd-parts");
+    let meta = find(&parts, "1-1.meta").expect("the part's record is on disk");
+    let part = find(&parts, "1-1.part").expect("the part is on disk");
+    // Sealed and the link begun, as a crash inside publication leaves it.
+    let mut planted = std::fs::read(&meta).unwrap();
+    planted[33] = 0b011;
+    std::fs::write(&meta, &planted).unwrap();
+    // And the bytes no longer match the digest committed for them, so re-proving
+    // the extents fails before the destination is ever adopted.
+    let mut bytes = std::fs::read(&part).unwrap();
+    bytes[32] ^= 0xff;
+    std::fs::write(&part, &bytes).unwrap();
+
+    server.quiet(Duration::from_secs(30)).await;
+    let before = server.delivered.load(Ordering::Relaxed);
+
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        // A regression here does not return a wrong reason -- it takes a new
+        // generation and fetches the whole file again, so it shows up as this
+        // run not coming back rather than as the assertion below.
+        .expect("the run did not come back; a replacement path would refetch here");
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the job did not stop: {outcome:?}"
+    );
+    // Not `Integrity`: that reason is answered by fetching the file again.
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Unconfirmed),
+        "corrupt bytes on a possibly delivered part were reported as replaceable"
+    );
+    let generation = engine.generation().await.unwrap();
+    drop(engine);
+
+    // And a further ask is refused rather than answered with a second copy.
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the second ask did not come back");
+    assert!(
+        matches!(
+            outcome,
+            Err(EngineError::NeedsDecision(Some(StopReason::Unconfirmed)))
+        ),
+        "a second ask was not refused: {outcome:?}"
+    );
+    drop(engine);
+
+    assert_eq!(
+        generation, 1,
+        "a possibly delivered part took a new generation"
+    );
+    server.quiet(Duration::from_secs(30)).await;
+    let fetched = server.delivered.load(Ordering::Relaxed) - before;
+    assert!(
+        fetched <= 1024,
+        "a possibly delivered part was fetched again: {fetched} bytes"
+    );
+    let parts = destination.parent().unwrap().join(".fhd-parts");
+    assert!(
+        find(&parts, "1-2.part").is_none(),
+        "a possibly delivered part was replaced by a new generation"
+    );
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        planted,
+        "the record was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        bytes,
+        "the part was written to"
+    );
+    assert!(!destination.exists(), "a second copy was published");
+}

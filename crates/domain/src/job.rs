@@ -56,11 +56,22 @@ impl StopReason {
     /// A plain `Resume` is refused for these, and the transition itself enforces
     /// that. Two answers are possible for one of them and neither for the other,
     /// which is why `needs_new_representation` exists separately.
+    /// Written as an exhaustive match, not `matches!`, deliberately. With
+    /// `matches!` a new variant answers `false` here and `false` below, so it
+    /// silently becomes "resume it, do not replace it" -- and for a policy whose
+    /// whole purpose is never to fetch a second copy of a delivered file, the
+    /// right failure is a build that stops until someone decides. An engineering
+    /// review pointed this out while both lists still happened to be complete.
     pub fn blocks_resume(&self) -> bool {
-        matches!(
-            self,
-            Self::SourceChanged | Self::Integrity | Self::Unreadable | Self::Unconfirmed
-        )
+        match self {
+            Self::SourceChanged | Self::Integrity | Self::Unreadable | Self::Unconfirmed => true,
+            Self::Authentication
+            | Self::Storage
+            | Self::Network
+            | Self::Policy
+            | Self::Unknown
+            | Self::Destination => false,
+        }
     }
     /// Whether a new representation is the answer.
     ///
@@ -72,10 +83,19 @@ impl StopReason {
     /// duplicated in the composition root and the copies had already drifted
     /// apart by one reason.
     pub fn needs_new_representation(&self) -> bool {
-        matches!(
-            self,
-            Self::SourceChanged | Self::Integrity | Self::Unreadable
-        )
+        match self {
+            Self::SourceChanged | Self::Integrity | Self::Unreadable => true,
+            // `Unconfirmed` blocks a resume without offering a replacement; the
+            // rest block nothing. Both groups answer `false`, and they are kept
+            // apart here so the next variant has to join one of them by name.
+            Self::Unconfirmed => false,
+            Self::Authentication
+            | Self::Storage
+            | Self::Network
+            | Self::Policy
+            | Self::Unknown
+            | Self::Destination => false,
+        }
     }
 }
 /// Where a stopping job lands once workers, writer lanes and checkpoints drain.
@@ -1258,6 +1278,16 @@ mod tests {
             value.handle(JobCommand::RequireAction { reason }).unwrap();
             value.handle(JobCommand::WorkersDrained).unwrap();
             assert!(!reason.blocks_resume(), "{reason:?}");
+            // The composition root tests `needs_new_representation` first and
+            // `blocks_resume` second, which is correct only while the first set
+            // is contained in the second. If that ever broke, a perfectly
+            // resumable reason would be sent down the replacement path: a new
+            // generation, segments cleared, a partial download thrown away and
+            // fetched again. Nothing else asserts the containment.
+            assert!(
+                !reason.needs_new_representation(),
+                "{reason:?} is resumable yet asks for a new representation"
+            );
             value
                 .handle(JobCommand::Resume)
                 .unwrap_or_else(|error| panic!("{reason:?} could not resume: {error:?}"));

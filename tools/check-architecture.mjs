@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -248,26 +248,49 @@ export function checkUnsafePolicy(root) {
 /// project, so the gate refuses it.
 ///
 /// `\x00` in an escape is the same byte to rustc and keeps the file text.
-export function checkReviewableSources(root) {
+///
+/// The first version of this check walked `crates` and looked only at `.rs`.
+/// Both re-reviews made the same point about that: the hiding place is not the
+/// Rust code, it is any tracked text file. A NUL in a migration's `.sql` hides a
+/// changed `CHECK` constraint, one in a workflow hides a changed CI step, and
+/// one in this file hides the gate's own rules. So the scan covers the source
+/// trees that make up the product and the extensions that carry logic.
+export const REVIEWABLE = ['.rs', '.sql', '.mjs', '.js', '.ts', '.toml', '.yml', '.yaml', '.md'];
+export function checkReviewableSources(root, trees = ['crates', 'tools', '.github']) {
   const offenders = [];
-  const walk = (directory) => {
-    for (const entry of readdirSync(directory)) {
-      if (entry === 'target' || entry === '.git') continue;
-      const full = `${directory}/${entry}`;
-      if (statSync(full).isDirectory()) { walk(full); continue; }
-      if (!entry.endsWith('.rs')) continue;
+  for (const tree of trees) {
+    const base = `${root}/${tree}`;
+    if (!existsSync(base)) continue;
+    walkSources(base, (full) => {
       const bytes = readFileSync(full);
       const at = bytes.indexOf(0);
-      if (at === -1) continue;
+      if (at === -1) return;
       const relative = full.slice(root.length + 1).split('\\').join('/');
       offenders.push(
         `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
         `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
       );
-    }
-  };
-  walk(`${root}/crates`);
+    });
+  }
   return offenders;
+}
+
+/// Walks a tree, handing each reviewable file to `visit`.
+///
+/// Shared rather than copied: this traversal existed twice, verbatim, and the
+/// second copy is how the NUL check came to cover a narrower tree than the
+/// comment above it claimed. A dangling symlink is skipped rather than allowed
+/// to throw, which would fail the gate with an error about nothing.
+export function walkSources(directory, visit) {
+  for (const entry of readdirSync(directory)) {
+    if (entry === 'target' || entry === '.git' || entry === 'node_modules') continue;
+    const full = `${directory}/${entry}`;
+    let stat;
+    try { stat = statSync(full); } catch { continue; }
+    if (stat.isDirectory()) { walkSources(full, visit); continue; }
+    if (!REVIEWABLE.some((extension) => entry.endsWith(extension))) continue;
+    visit(full);
+  }
 }
 
 /// The policy itself, over one file's text. Exported so it can be tested on

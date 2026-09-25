@@ -510,12 +510,37 @@ impl Session<'_> {
         // strand a job whose file demonstrably never landed -- a test of that
         // case is what caught it. The state byte says `Open` there, and it is
         // right.
+        // The reason this open would otherwise carry, decided here because
+        // whether the second witness is worth consulting depends on it.
+        let refusal = opened.as_ref().err().map(|error| match error {
+            // A record this build cannot interpret. Not corruption of the
+            // downloaded bytes, and not a failure of the storage itself: the
+            // part is intact and unreadable, and nothing may be retried on it.
+            StorageError::Superseded => StopReason::Unreadable,
+            StorageError::Integrity => StopReason::Integrity,
+            _ => StopReason::Storage,
+        });
         let unknown = match found {
             Some(state) => matches!(state, Publication::Attempted | Publication::Linked),
+            // No state was read. The job record is consulted only where the
+            // reason would otherwise be answered by **fetching the file again**,
+            // which is the only answer that can deliver a second copy.
+            //
+            // An earlier version asked it for every storage error, and an
+            // engineering review showed the cost: a transient sharing violation
+            // on Windows -- a virus scanner, a preview pane, a backup agent --
+            // turned a resumable `Storage` stop into `Unconfirmed` for a job
+            // whose own record would have said the link never began. `Storage`
+            // is never replaced, so it needs no second witness; asking anyway
+            // only moved resumable jobs into a state with no way out.
+            //
             // Asked here rather than for every open, because `dyn SegmentFile`
             // is not `Sync` and cannot be held across an await -- and because a
             // record read is not free.
-            None => self.may_be_published().await?,
+            None => {
+                refusal.is_some_and(|reason| reason.needs_new_representation())
+                    && self.may_be_published().await?
+            }
         };
         let file = match opened {
             // A part this run found part-way through publication, or one whose
@@ -529,6 +554,17 @@ impl Session<'_> {
             // on.
             _ if unknown => {
                 self.storage_failed = true;
+                // This arm matches `_`, so it also catches a failed open whose
+                // part had already said `Attempted`. Stopping conservatively is
+                // right, but the storage error that actually happened would
+                // otherwise vanish, leaving a failing disk indistinguishable
+                // from an unresolved publication. It is reported, not used.
+                if refusal.is_some() {
+                    emit(
+                        Event::new(Code::StorageFailed)
+                            .for_job(self.job.id().get(), self.job.generation().get()),
+                    );
+                }
                 let command = JobCommand::RequireAction {
                     reason: StopReason::Unconfirmed,
                 };
@@ -540,18 +576,10 @@ impl Session<'_> {
                 return Ok(());
             }
             Ok(file) => file,
-            Err(error) => {
+            Err(_) => {
                 self.storage_failed = true;
-                let reason = match error {
-                    // A record this build cannot interpret. Not corruption of
-                    // the downloaded bytes, and not a failure of the storage
-                    // itself: the part is intact and unreadable, and nothing
-                    // may be retried on it.
-                    StorageError::Superseded => StopReason::Unreadable,
-                    StorageError::Integrity => StopReason::Integrity,
-                    _ => StopReason::Storage,
-                };
-                // Both of those are reasons a resume answers by fetching the file
+                let reason = refusal.unwrap_or(StopReason::Storage);
+                // Two of those are reasons a resume answers by fetching the file
                 // again, and neither of them says anything about publication --
                 // which is the defect an independent security review found in
                 // the first version of this arm. The version byte is checked

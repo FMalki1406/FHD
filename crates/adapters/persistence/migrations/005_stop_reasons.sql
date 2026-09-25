@@ -21,11 +21,17 @@
 -- So no database ever refused to store a reason the engine produced. The only
 -- real defect was the two new codes, and this file is the whole of it.
 --
--- What does stand from that exchange: editing an applied migration in place --
--- which 5799bab did to 003 -- is the wrong shape, because the version number
--- then describes two different schemas. It fails closed here rather than
--- silently, which is the saving grace and not a licence. Widen a CHECK with a
--- new file, as this one does.
+-- And the "lesson" the second version of this comment kept was itself false, in
+-- the same way, one level down. It said 5799bab had edited an applied migration
+-- in place. `git show --name-status 5799bab` says `A` -- it *added* 003, a new
+-- file that rebuilt `job_state` to widen the CHECK, which is exactly the
+-- practice this comment goes on to prescribe. The narrow `BETWEEN 0 AND 6` was
+-- 002's, superseded by 003 the moment `Destination` existed.
+--
+-- So nothing survives that objection except the shape this file already has:
+-- widen a CHECK with a new migration, never by editing one that has shipped.
+-- Three wrong versions of a five-line comment is the actual lesson -- a claim
+-- about history is worth exactly the command that checks it.
 --
 -- SQLite cannot widen a CHECK in place, so the table is rebuilt. Everything
 -- else about it is carried across unchanged.
