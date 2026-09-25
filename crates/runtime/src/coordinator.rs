@@ -329,6 +329,74 @@ impl Coordinator {
         Ok(Some(job))
     }
 
+    /// Answers, for a job stopped as `Unconfirmed`, whether the file is there.
+    ///
+    /// This is the one thing that could resolve that state and had no
+    /// implementation: the contract said so, and said the operator's only exit
+    /// was to cancel. The engine cannot decide it alone -- a destination that
+    /// does not hold the file is not evidence it never did, because a folder can
+    /// be renamed -- but it can decide it in the direction where evidence
+    /// exists. If the destination holds a file of the recorded size whose digest
+    /// is the recorded digest, then publication happened, and the job is
+    /// completed on that evidence rather than left unknown for ever.
+    ///
+    /// The comparison is the same one a crash during `Publishing` already
+    /// reconciles against, on the same intent, and it claims exactly what it
+    /// proves: a content match, not an inode match. What it does not do is
+    /// conclude anything from an absent or different file -- that stays unknown,
+    /// which is the whole reason this state exists -- so `Ok(false)` means "not
+    /// resolved", never "not delivered".
+    pub async fn resolve_unconfirmed(&self, id: fhd_domain::JobId) -> Result<bool, RunError> {
+        let repository = self.ports.repository.as_ref();
+        let jobs = repository
+            .load_jobs()
+            .await
+            .map_err(|_| RunError::Repository)?;
+        let Some(mut job) = jobs.into_iter().find(|job| job.id() == id) else {
+            return Ok(false);
+        };
+        if job.state() != JobState::NeedsAction || job.reason() != Some(StopReason::Unconfirmed) {
+            return Ok(false);
+        }
+        let Some(intent) = repository
+            .publish_intent(id)
+            .await
+            .map_err(|_| RunError::Repository)?
+            .filter(|intent| intent.generation() == job.generation())
+        else {
+            // No intent of this generation: nothing recorded what would have
+            // been published, so there is nothing to compare against.
+            return Ok(false);
+        };
+        let destination = self
+            .ports
+            .destinations
+            .resolve(job.spec().destination())
+            .map_err(|_| RunError::Repository)?;
+        let store = self.ports.store.clone();
+        let path = destination.clone();
+        let size = intent.size();
+        let found = tokio::task::spawn_blocking(move || store.inspect(&path, size))
+            .await
+            .map_err(|_| RunError::Writer(WriterError::WorkerFailed))?
+            .map_err(RunError::Storage)?;
+        match found {
+            Some(Occupant::File { size, digest })
+                if size == intent.size() && digest == intent.digest() =>
+            {
+                // The evidence the state was waiting for. The job completes, and
+                // the part is removed: with the outcome established it is a name
+                // and no longer a record of something that may have happened.
+                step(repository, &mut job, JobCommand::PublishCommitted).await?;
+                self.drop_part(&job, PartCleanup::Published).await;
+                Ok(true)
+            }
+            // A file of another size, another content, or none at all. None of
+            // those is evidence against delivery, so the state stands.
+            _ => Ok(false),
+        }
+    }
+
     /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.
     pub async fn recover(&self, mut job: Job) -> Result<Job, RunError> {
         let repository = self.ports.repository.as_ref();

@@ -64,6 +64,17 @@ pub enum Request {
     Cancel {
         job: u64,
     },
+    /// Asks whether the file a job was unsure about is at its destination.
+    ///
+    /// For a job stopped as `UNCONFIRMED` only: it was left part-way through
+    /// publication with nothing recording how that ended, so no other command
+    /// can move it. The engine compares the destination against what it recorded
+    /// it was about to publish; a match completes the job. Nothing else does --
+    /// an absent or different file leaves the job exactly as it was, because a
+    /// destination that does not hold the file is not evidence it never did.
+    Confirm {
+        job: u64,
+    },
     /// Stop accepting work and let running jobs stop durably.
     Shutdown,
 }
@@ -108,6 +119,7 @@ impl std::fmt::Debug for Request {
             Self::Pause { job } => f.debug_struct("Pause").field("job", job).finish(),
             Self::Resume { job } => f.debug_struct("Resume").field("job", job).finish(),
             Self::Cancel { job } => f.debug_struct("Cancel").field("job", job).finish(),
+            Self::Confirm { job } => f.debug_struct("Confirm").field("job", job).finish(),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -185,7 +197,10 @@ impl Checked for Request {
                 }
             }
             // Zero is never a job: the domain refuses it, so the wire does too.
-            Self::Pause { job } | Self::Resume { job } | Self::Cancel { job } => {
+            Self::Pause { job }
+            | Self::Resume { job }
+            | Self::Cancel { job }
+            | Self::Confirm { job } => {
                 if *job == 0 {
                     Err(ProtocolError::Invalid)
                 } else {

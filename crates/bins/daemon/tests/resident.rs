@@ -757,3 +757,172 @@ async fn an_unconfirmed_job_is_cancelled_over_the_socket_and_keeps_its_part() {
         "cancelling created the destination it was unsure about"
     );
 }
+
+/// Evidence at the destination resolves an unconfirmed job; its absence does not.
+///
+/// This is the procedure Â§10 recorded as missing -- the one thing that could end
+/// that state, leaving cancel as the only exit. The engine cannot decide it
+/// alone in both directions, and does not pretend to: a destination holding a
+/// file whose size and digest are the ones recorded is proof the publication
+/// happened, while a destination holding nothing proves nothing at all, because
+/// a folder can be renamed.
+///
+/// So both directions are asserted here, and the second matters more: asking
+/// with the file absent must leave the job exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_file_at_the_destination_resolves_an_unconfirmed_job_and_nothing_else_does() {
+    let body = content(256 * 1024);
+    let (port, _) = serve_file(body.clone(), 0);
+    let state = Directory::new("confirm");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    std::fs::write(&destination, b"someone else's file").unwrap();
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // Every byte durable and an intent recorded, then the link recorded as begun
+    // and the name freed: a crash inside publication, with the destination
+    // unable to answer for it.
+    let one_shot = EngineConfig {
+        destination: destination.clone(),
+        ..settings(&state)
+    };
+    let engine = Engine::open(one_shot.clone(), &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let _ = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the first run did not come back");
+    assert_eq!(engine.durable_bytes().await.unwrap(), body.len() as u64);
+    drop(engine);
+
+    let parts = downloads.join(".fhd-parts");
+    let meta = find(&parts, "1-1.meta").expect("the part's record is on disk");
+    let part = find(&parts, "1-1.part").expect("the part is on disk");
+    let mut planted = std::fs::read(&meta).unwrap();
+    planted[33] = 0b011;
+    std::fs::write(&meta, &planted).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+
+    let engine = Engine::open(
+        EngineConfig {
+            intent: Intent::Resume,
+            ..one_shot.clone()
+        },
+        &url,
+    )
+    .await
+    .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let _ = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the run did not come back");
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(fhd_domain::StopReason::Unconfirmed)
+    );
+    drop(engine);
+
+    let address = endpoint("confirm");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+    let listed = ask(&mut client, 1, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list: {listed:?}");
+    };
+    let job = jobs.first().expect("the job is in the record").job;
+
+    // Nothing is at the destination, so nothing is resolved -- and the job is
+    // left exactly as it was rather than being declared either way.
+    let absent = ask(&mut client, 2, &Request::Confirm { job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&absent, Response::Failed { code } if code == "UNCONFIRMED-NOT-AT-DESTINATION"),
+        "an absent file was treated as an answer: {absent:?}"
+    );
+    let listed = ask(&mut client, 3, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list");
+    };
+    let unchanged = jobs.first().expect("the job is still there").clone();
+    assert_eq!(unchanged.state, "NeedsAction");
+    assert_eq!(unchanged.reason.as_deref(), Some("UNCONFIRMED"));
+    assert!(
+        part.exists(),
+        "a question that resolved nothing removed the part"
+    );
+
+    // A file that is not ours is not an answer either: same size would still be
+    // the wrong bytes, and this one is neither.
+    std::fs::write(&destination, b"not the download").unwrap();
+    let wrong = ask(&mut client, 4, &Request::Confirm { job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&wrong, Response::Failed { code } if code == "UNCONFIRMED-NOT-AT-DESTINATION"),
+        "a different file was treated as ours: {wrong:?}"
+    );
+
+    // And the file itself, which is the evidence the state was waiting for.
+    std::fs::write(&destination, &body).unwrap();
+    let confirmed = ask(&mut client, 5, &Request::Confirm { job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(confirmed, Response::Done),
+        "the file at the destination did not resolve the job: {confirmed:?}"
+    );
+
+    let _ = stop.send(());
+    let _ = running.await;
+
+    // The record says so after a restart, and the part is gone: with the outcome
+    // established it was a name, not evidence.
+    let address = endpoint("confirm-again");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+    let listed = ask(&mut client, 1, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list");
+    };
+    let after = jobs
+        .first()
+        .expect("the job is still in the record")
+        .clone();
+    assert_eq!(
+        after.state, "Completed",
+        "the resolution did not survive the restart"
+    );
+    assert_eq!(after.reason, None, "a completed job kept a reason");
+    let _ = stop.send(());
+    let _ = running.await;
+
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        body,
+        "the file was touched by the question about it"
+    );
+    assert!(!part.exists(), "a resolved job kept its part");
+}

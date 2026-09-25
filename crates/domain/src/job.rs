@@ -672,6 +672,25 @@ impl Job {
             }
             (S::Verifying, C::VerificationPassed) => S::Publishing,
             (S::Publishing, C::PublishCommitted) => S::Completed,
+            // The one state that was waiting for exactly this answer.
+            //
+            // A job stopped as `Unconfirmed` was left part-way through
+            // publication with nothing saying how it ended, and no command could
+            // move it: resume refused, replacement refused, only cancel. That is
+            // right while the outcome is unknown, and wrong once it is known.
+            // The evidence is the destination holding a file whose size and
+            // digest are the ones the publish intent recorded -- the same
+            // comparison a crash during `Publishing` is reconciled against.
+            //
+            // Guarded on the reason, so this is not a way for any stopped job to
+            // reach `Completed`: only the one whose reason says a publication
+            // was begun and never resolved.
+            (S::NeedsAction, C::PublishCommitted)
+                if self.reason == Some(StopReason::Unconfirmed) =>
+            {
+                self.reason = None;
+                S::Completed
+            }
 
             (
                 S::Queued
@@ -1258,6 +1277,56 @@ mod tests {
                      generation, which means a second copy was fetched"
                 );
             }
+        }
+    }
+
+    /// Evidence completes an unconfirmed job, and nothing else does.
+    ///
+    /// The state exists because nothing on disk says how a publication ended.
+    /// When something finally does -- the destination holding the file the
+    /// intent recorded -- the job is finished rather than left unknown for ever.
+    /// The guard is what keeps that from becoming a way for any stopped job to
+    /// declare itself complete.
+    #[test]
+    fn only_an_unconfirmed_job_is_completed_by_evidence_of_publication() {
+        let mut value = transferring(10);
+        value
+            .handle(JobCommand::RequireAction {
+                reason: StopReason::Unconfirmed,
+            })
+            .unwrap();
+        value.handle(JobCommand::WorkersDrained).unwrap();
+        assert_eq!(value.state(), JobState::NeedsAction);
+        value.handle(JobCommand::PublishCommitted).unwrap();
+        assert_eq!(value.state(), JobState::Completed);
+        assert_eq!(
+            value.reason(),
+            None,
+            "a completed job kept the reason it was waiting on"
+        );
+
+        // Every other reason a job rests under is refused, including the ones
+        // that also block a resume: they say nothing about a publication.
+        for reason in [
+            StopReason::Network,
+            StopReason::Storage,
+            StopReason::Destination,
+            StopReason::Integrity,
+            StopReason::Unreadable,
+            StopReason::SourceChanged,
+            StopReason::Authentication,
+            StopReason::Policy,
+            StopReason::Unknown,
+        ] {
+            let mut value = transferring(10);
+            value.handle(JobCommand::RequireAction { reason }).unwrap();
+            value.handle(JobCommand::WorkersDrained).unwrap();
+            assert_eq!(
+                value.handle(JobCommand::PublishCommitted).unwrap_err(),
+                DomainError::InvalidTransition,
+                "{reason:?} was completed by a command meant for another state"
+            );
+            assert_eq!(value.state(), JobState::NeedsAction, "{reason:?}");
         }
     }
 

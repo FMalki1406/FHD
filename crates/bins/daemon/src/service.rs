@@ -62,6 +62,8 @@ pub struct Service {
     transport: Arc<HttpTransport>,
     destinations: Arc<Registry>,
     commands: mpsc::Sender<Command>,
+    /// For work that belongs to a stopped job, which the scheduler does not own.
+    coordinator: Arc<Coordinator>,
     config: EngineConfig,
     /// The engine's own tree and the allowed root, as the filesystem itself names
     /// them: a destination cannot be admitted by spelling one of them differently.
@@ -136,7 +138,7 @@ impl Resident {
             .with_governor(governor.clone()),
         );
         let scheduler = Scheduler::new(
-            coordinator,
+            coordinator.clone(),
             governor,
             SchedulerConfig {
                 max_active: config.max_active,
@@ -166,6 +168,7 @@ impl Resident {
             transport: transport.clone(),
             destinations: destinations.clone(),
             commands,
+            coordinator,
             config,
             canonical_state,
             canonical_root,
@@ -566,6 +569,34 @@ impl Handler for Service {
                     code: crate::code(&error),
                 },
             },
+            // Asked of the record directly rather than through the scheduler: the
+            // job is stopped, so nothing is running it, and this changes no
+            // scheduling -- it establishes a fact and lets the transition follow.
+            Request::Confirm { job } => {
+                let Ok(id) = JobId::new(job) else {
+                    return Response::Failed {
+                        code: "ENGINE-INVALID-INPUT".into(),
+                    };
+                };
+                match self
+                    .coordinator
+                    .resolve_unconfirmed(id)
+                    .await
+                    .map_err(EngineError::Run)
+                {
+                    Ok(true) => Response::Done,
+                    // Not resolved: no such job, a different state, or a
+                    // destination that does not hold the file. None of those is
+                    // evidence the file was never delivered, so the job is left
+                    // exactly as it was and the operator is told nothing changed.
+                    Ok(false) => Response::Failed {
+                        code: "UNCONFIRMED-NOT-AT-DESTINATION".into(),
+                    },
+                    Err(error) => Response::Failed {
+                        code: crate::code(&error),
+                    },
+                }
+            }
             Request::Pause { job } | Request::Resume { job } | Request::Cancel { job } => {
                 let Ok(id) = JobId::new(job) else {
                     return Response::Failed {
