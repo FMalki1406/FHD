@@ -12,6 +12,15 @@
 //! and before the destination exists, and it receives the handle that was
 //! proved. A linker that takes the source name away and then delegates to the
 //! real mechanism reproduces the attack exactly, with no timing in the answer.
+// Every test here measures the Windows publication mechanism, so the whole file
+// is Windows-only. It says so once, at the crate root, rather than on each item.
+//
+// Without it, the four tests were gated and the helpers beside them were not,
+// so on Linux and macOS this file compiled to a struct nobody constructs and
+// functions nobody calls -- dead_code under `-D warnings`, which is what turns
+// `Check Rust warnings` red on both runners.
+#![cfg(windows)]
+
 mod harness;
 
 use fhd_app::storage::{HandleLinker, PartSpec, SegmentFile, SegmentStore, StorageError};
