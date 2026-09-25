@@ -1109,3 +1109,71 @@ fn a_second_engine_process_on_one_state_directory_is_refused() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// The operator can reach the one question that resolves an unconfirmed job.
+///
+/// The engine grew `Confirm` and the protocol declared it, but a capability the
+/// client cannot spell is not an exit the operator has -- and that state having
+/// no reachable exit was the whole objection to it. So this asks the program,
+/// not the library: the command exists, it is spelled with one job like its
+/// neighbours, and naming two is refused before anything is sent.
+#[test]
+fn the_client_can_ask_whether_a_file_reached_its_destination() {
+    let state = Directory::new("process-confirm");
+
+    // Two jobs in one command is refused, exactly as `cancel 3 7` is: the
+    // operator must not be told "done" about a job the command never touched.
+    let (code, out, err) = run(
+        &[
+            &state.engine().to_string_lossy(),
+            "--client",
+            "confirm",
+            "3",
+            "7",
+        ],
+        "",
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "a second job was swallowed.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(err.contains("usage:"), "stderr was: {err}");
+
+    // A job number that is not one is refused before any connection is made.
+    let (code, _, err) = run(
+        &[
+            &state.engine().to_string_lossy(),
+            "--client",
+            "confirm",
+            "not-a-job",
+        ],
+        "",
+    );
+    assert_eq!(code, Some(1), "stderr was: {err}");
+    assert!(err.contains("ENGINE-INVALID-INPUT"), "stderr was: {err}");
+
+    // And the command is known: with nothing serving this directory it fails on
+    // the connection rather than on the word, which is what tells the two apart.
+    let (code, _, err) = run(
+        &[
+            &state.engine().to_string_lossy(),
+            "--client",
+            "confirm",
+            "1",
+        ],
+        "",
+    );
+    assert_eq!(code, Some(1), "stderr was: {err}");
+    assert!(
+        !err.contains("usage:"),
+        "the client does not know the command: {err}"
+    );
+
+    // The usage text says so too, since that is where an operator looks.
+    let (_, _, err) = run(&[&state.engine().to_string_lossy(), "--client"], "");
+    assert!(
+        err.contains("confirm <job>"),
+        "the usage does not mention the command: {err}"
+    );
+}

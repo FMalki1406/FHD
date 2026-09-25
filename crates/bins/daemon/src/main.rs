@@ -23,7 +23,8 @@ fn usage() -> &'static str {
      downloads may land only under DIR)\n\
      or:    fhd-engine <state-directory> --client <command>   where command is \
      add <destination-file> [--sensitive] [--allow-http] (URL on stdin), list,      pause <job>, \
-     cancel <job>, or stop"
+     cancel <job>, confirm <job> (asks whether the file a job stopped as \
+     UNCONFIRMED is at its destination), or stop"
 }
 
 /// What the command line asked for: the engine's settings, whether links are to be
@@ -206,7 +207,12 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
             refuse_extra(args);
             Request::List { after: None }
         }
-        "pause" | "cancel" => {
+        // `confirm` is here rather than on its own because it takes exactly what
+        // these take -- one job -- and is refused the same way. What it asks is
+        // different: whether the file a job was left unsure about is at its
+        // destination. Without it the state has no operator-reachable exit but
+        // cancel, which was the whole objection to it.
+        "pause" | "cancel" | "confirm" => {
             let Some(job) = args.next().and_then(|job| job.parse::<u64>().ok()) else {
                 fail("ENGINE-INVALID-INPUT")
             };
@@ -214,10 +220,10 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
             // "done" and exit zero, leaving the operator believing both were
             // cancelled -- and this refusal happens before anything is sent.
             refuse_extra(args);
-            if command == "pause" {
-                Request::Pause { job }
-            } else {
-                Request::Cancel { job }
+            match command.as_str() {
+                "pause" => Request::Pause { job },
+                "confirm" => Request::Confirm { job },
+                _ => Request::Cancel { job },
             }
         }
         "stop" => {
