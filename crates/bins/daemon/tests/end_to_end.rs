@@ -1294,3 +1294,80 @@ async fn a_platform_without_a_mechanism_refuses_to_publish_and_keeps_the_bytes()
         "the downloaded bytes were discarded when publication was refused"
     );
 }
+
+/// A connection that has been accepted but has not finished asking must hold
+/// the barrier shut.
+///
+/// The review of 7dc810a found `quiet` returning while such a connection was
+/// pending, and demonstrated that it then delivered bytes -- which the next
+/// measurement was charged for. The count rose only once the request had been
+/// read, so a client still sending its headers was invisible.
+///
+/// No engine here: this is the harness measuring itself, because a barrier that
+/// reports quiet while work is inbound makes every byte count downstream of it
+/// untrustworthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_half_sent_request_keeps_the_barrier_shut() {
+    use std::io::Write;
+
+    let body = content(256 * 1024);
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
+    let address = format!("127.0.0.1:{}", server.port);
+
+    // Nothing has connected: the barrier passes at once.
+    server.quiet(Duration::from_secs(10)).await;
+
+    // Connect and send a request that is deliberately incomplete -- no blank
+    // line, so `read_request` is still waiting.
+    let mut half = std::net::TcpStream::connect(&address).expect("the server accepts");
+    half.write_all(b"GET /file HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("the header goes out");
+    half.flush().unwrap();
+
+    // Accepted, so it counts -- even though the server cannot know yet what it
+    // wants. This is the assertion the old counter could not make.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.in_flight.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never counted a connection it had accepted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // And the barrier refuses to call this quiet. A short bound, because what
+    // is being checked is that it does not return, not how long it waits.
+    let waited = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.quiet(Duration::from_secs(30)),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "the barrier reported quiet while a request was still arriving"
+    );
+
+    // Finish the request, and read the answer. Reading matters: this server
+    // delivers slowly, and a client that never drains fills the socket and
+    // blocks the handler -- which is a stuck test, not a measurement.
+    half.write_all(b"\r\n").expect("the request completes");
+    half.flush().unwrap();
+    let drained = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = half.read_to_end(&mut sink);
+        sink.len()
+    });
+
+    server.quiet(Duration::from_secs(30)).await;
+    assert_eq!(
+        server.in_flight.load(Ordering::Relaxed),
+        0,
+        "the barrier returned with a response still being written"
+    );
+    let read_back = drained.join().expect("the reader finishes");
+    assert!(
+        read_back > body.len(),
+        "the connection was counted but never served, so this proved nothing"
+    );
+}

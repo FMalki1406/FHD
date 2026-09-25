@@ -358,13 +358,22 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
                 faults.clone(),
                 busy.clone(),
             );
+            // Counted from acceptance, not from the request being complete.
+            //
+            // It used to rise after `read_request` returned, which left a
+            // connection that had been accepted but had not finished sending
+            // its headers invisible: `quiet` could return while one was
+            // pending, and the bytes it went on to deliver were charged to
+            // whatever the caller measured next. Review of 7dc810a demonstrated
+            // exactly that. The guard is made here and moved into the handler,
+            // so the count falls however the handler leaves -- and also if the
+            // thread never starts.
+            busy.fetch_add(1, Ordering::Relaxed);
+            let leaving = Leaving(busy.clone());
             std::thread::spawn(move || {
+                let _leaving = leaving;
                 let request = read_request(&mut stream);
                 counter.fetch_add(1, Ordering::Relaxed);
-                // Counted down however this handler leaves, so a caller can
-                // tell when the connection has finished rather than guess.
-                busy.fetch_add(1, Ordering::Relaxed);
-                let _leaving = Leaving(busy.clone());
                 let range = request
                     .lines()
                     .find_map(|line| line.strip_prefix("range: bytes="))
