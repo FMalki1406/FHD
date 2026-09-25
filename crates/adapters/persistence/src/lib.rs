@@ -18,11 +18,12 @@ use std::{
 mod references;
 mod transfer;
 
-const MIGRATIONS: [&str; 4] = [
+const MIGRATIONS: [&str; 5] = [
     include_str!("../migrations/001_admission.sql"),
     include_str!("../migrations/002_transfer_state.sql"),
     include_str!("../migrations/003_publish_intents.sql"),
     include_str!("../migrations/004_references.sql"),
+    include_str!("../migrations/005_stop_reasons.sql"),
 ];
 const LATEST: i64 = MIGRATIONS.len() as i64;
 const APPLICATION_ID: i64 = 1_179_141_169;

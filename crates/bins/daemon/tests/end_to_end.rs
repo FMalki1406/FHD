@@ -1371,3 +1371,111 @@ async fn a_half_sent_request_keeps_the_barrier_shut() {
         "the connection was counted but never served, so this proved nothing"
     );
 }
+
+/// A part this build cannot read stops the job by name, and is left alone.
+///
+/// The whole point of separating this from corruption is that the answer
+/// differs: corrupt bytes are fetched again, a record that cannot be
+/// interpreted is not touched at all and the job continues under a new
+/// representation. A stop reason nobody can tell apart from the others cannot
+/// carry that difference to whoever acts on it.
+///
+/// The old record is written by hand rather than produced by an older build,
+/// because the point is what a restart finds on disk, and that is bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_this_build_cannot_read_stops_the_job_and_is_left_untouched() {
+    let body = content(512 * 1024);
+    let state = Directory::new("unreadable");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    // One source for both runs: a different link is a different job, and the
+    // second run would never open the part the first one left.
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(2));
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+
+    // A pause leaves a part on disk with work in it.
+    let engine = Engine::open(config(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (control, receiver) = mpsc::channel(1);
+    let delivered = server.delivered.clone();
+    let quarter = body.len() as u64 / 4;
+    let pause = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while delivered.load(Ordering::Relaxed) < quarter {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transfer never started"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let _ = control.send(Control::Pause).await;
+    };
+    let (outcome, ()) = tokio::join!(engine.run(receiver), pause);
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::Paused))),
+        "the run did not pause: {outcome:?}"
+    );
+    drop(engine);
+
+    // The record is rewritten as an older format would have left it, and a
+    // bystander sits beside it so "left alone" is asserted rather than assumed.
+    let parts = destination.parent().unwrap().join(".fhd-parts");
+    let meta = find(&parts, "1-1.meta").expect("the part's record is on disk");
+    let part = find(&parts, "1-1.part").expect("the part is on disk");
+    let before_record = std::fs::read(&meta).unwrap();
+    let before_bytes = std::fs::read(&part).unwrap();
+    let mut planted = before_record.clone();
+    planted[8] = 1;
+    std::fs::write(&meta, &planted).unwrap();
+    let bystander = downloads.join("theirs.bin");
+    std::fs::write(&bystander, b"not ours").unwrap();
+
+    // A later run finds it and stops, naming the one thing that is true.
+    let engine = Engine::open(resuming(&state, destination.clone(), 2), &url)
+        .await
+        .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = engine.run(receiver).await;
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "an unreadable part did not stop the job: {outcome:?}"
+    );
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(StopReason::Unreadable),
+        "an unreadable part was reported as something else"
+    );
+    drop(engine);
+
+    // Nothing was retried on it, rewritten, or removed -- and no file that was
+    // never ours was touched.
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        planted,
+        "the record was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        before_bytes,
+        "the part was written to"
+    );
+    assert_eq!(std::fs::read(&bystander).unwrap(), b"not ours");
+    assert!(!destination.exists(), "an unreadable part published");
+}
+
+/// The first file of this name anywhere under `root`.
+fn find(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|it| it == name) {
+            return Some(path);
+        }
+    }
+    None
+}

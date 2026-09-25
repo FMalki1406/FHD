@@ -469,10 +469,14 @@ impl Session<'_> {
             Ok(file) => file,
             Err(error) => {
                 self.storage_failed = true;
-                let reason = if error == StorageError::Integrity {
-                    StopReason::Integrity
-                } else {
-                    StopReason::Storage
+                let reason = match error {
+                    // A record this build cannot interpret. Not corruption of
+                    // the downloaded bytes, and not a failure of the storage
+                    // itself: the part is intact and unreadable, and nothing
+                    // may be retried on it.
+                    StorageError::Superseded => StopReason::Unreadable,
+                    StorageError::Integrity => StopReason::Integrity,
+                    _ => StopReason::Storage,
                 };
                 let command = JobCommand::RequireAction { reason };
                 if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {

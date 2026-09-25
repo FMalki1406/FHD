@@ -39,6 +39,17 @@ pub enum StorageError {
     Bounds,
     Locked,
     Io(ErrorKind),
+    /// Something that had to agree does not.
+    ///
+    /// **Not only the downloaded bytes.** It also covers a record whose
+    /// identity does not match the job and generation asked for, and a seal
+    /// state no build ever wrote. So it is never on its own a licence to lift a
+    /// seal or write over the same part: the thing that is wrong may be the
+    /// record that says whether the file was delivered.
+    ///
+    /// Publication lifts the seal on exactly one integrity failure -- the
+    /// bytes it has just re-read through its own verified handle -- and that is
+    /// scoped to the check it made, not to this code in general.
     Integrity,
     Conflict,
     Unsupported,
@@ -100,9 +111,16 @@ pub enum Occupant {
 /// nothing else, so every crash after the seal was the same unanswerable case
 /// and the part was stranded to be safe.
 ///
-/// Three bits of the byte that already carried the seal, so no part file
-/// changes size or version. A byte written by an older build reads as
-/// `Sealed`, which is the conservative one.
+/// Three bits of the byte that already carried the seal.
+///
+/// **A part written by an older format is refused, not read.** This sentence
+/// used to say such a byte reads as `Sealed`, "the conservative one", and that
+/// was wrong twice over: the older format wrote its seal byte before linking
+/// and never again, so its `1` also means a file that was delivered -- and
+/// reading it as `Sealed` would permit unsealing the user's own file. The
+/// format version carries the difference now, and the claim came back once
+/// already when this type moved, which is why it is stated here rather than
+/// only where the version is checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Publication {
     /// Nothing attempted. The ordinary state of a part being written.
@@ -348,14 +366,20 @@ pub trait SegmentFile: Send {
         expected: Option<[u8; 32]>,
         record: &[(ByteRange, [u8; 32])],
     ) -> Result<[u8; 32], StorageError>;
-    /// How far publication had got when this part was opened.
+    /// The last publication state this handle adopted.
     ///
-    /// A caller deciding what to do with a job needs this, and until now could
-    /// only infer it from which operations were refused -- `Attempted` opens
+    /// **Not a read of the disk.** A state is adopted only after it has been
+    /// made durable, so this is at worst behind what is on disk and never ahead
+    /// of it -- but after a failed sync the byte may have reached the disk
+    /// anyway while the handle went on without it. A caller that needs to know
+    /// what a later run will find must read the part again, not ask this.
+    ///
+    /// What it is for: deciding what to do with a job. `Attempted` opens
     /// normally and then refuses writing and publishing with `InvalidState`,
-    /// which is indistinguishable from several other reasons. Saying it
-    /// outright is what lets a recovery tell "nothing was ever linked" from
-    /// "nobody can say".
+    /// which is indistinguishable from several other reasons, so a caller could
+    /// only infer the state from which operations failed. Saying it outright is
+    /// what lets a recovery tell "nothing was ever linked" from "nobody can
+    /// say".
     fn publication(&self) -> Publication;
     /// Adopts the folder the operator named, as an object rather than a path.
     ///

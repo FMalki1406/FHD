@@ -24,7 +24,7 @@ const STATES: [JobState; 13] = [
     JobState::Completed,
     JobState::Cancelled,
 ];
-const REASONS: [StopReason; 8] = [
+const REASONS: [StopReason; 9] = [
     StopReason::SourceChanged,
     StopReason::Authentication,
     StopReason::Storage,
@@ -33,6 +33,7 @@ const REASONS: [StopReason; 8] = [
     StopReason::Policy,
     StopReason::Unknown,
     StopReason::Destination,
+    StopReason::Unreadable,
 ];
 fn state_code(state: JobState) -> i64 {
     match state {
@@ -69,6 +70,7 @@ fn reason_code(reason: StopReason) -> i64 {
         StopReason::Policy => 5,
         StopReason::Unknown => 6,
         StopReason::Destination => 7,
+        StopReason::Unreadable => 8,
     }
 }
 fn reason_of(code: i64) -> Result<StopReason> {

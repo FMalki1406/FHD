@@ -862,10 +862,15 @@ impl SegmentFile for FilePart {
             || self.hash(0, self.spec.size())? != expected
         {
             self.verified = None;
-            // Corrupt data: it has to be replaceable, because a re-download is
-            // the only way out. The seal is lifted before the seal is even
-            // written here, so nothing to undo -- kept explicit so a later
-            // reordering does not silently strand the job.
+            // Corrupt data -- specifically these bytes, re-read a moment ago
+            // through the handle this publication verified. That is the only
+            // integrity failure this branch speaks for: a record whose identity
+            // or seal state is wrong never reaches here, it is refused at open.
+            //
+            // It has to be replaceable, because a re-download is the only way
+            // out. The seal is lifted before the seal is even written here, so
+            // nothing to undo -- kept explicit so a later reordering does not
+            // silently strand the job.
             if self.publication != Publication::Open {
                 self.unseal()?;
             }

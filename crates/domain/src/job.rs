@@ -31,6 +31,15 @@ pub enum StopReason {
     Unknown,
     /// Something else already occupies the destination name.
     Destination,
+    /// The part on disk cannot be read by this build, or was left part-way
+    /// through publication with no record of how it ended.
+    ///
+    /// Distinct from `Integrity` and `Storage` because the answer is
+    /// different: these bytes are not to be retried, unsealed or written over.
+    /// The job continues under a new representation -- a new generation, a new
+    /// part file, an object of its own -- and the part that cannot be read is
+    /// left exactly where it is.
+    Unreadable,
 }
 /// Where a stopping job lands once workers, writer lanes and checkpoints drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
