@@ -363,6 +363,13 @@ impl SegmentStore for FileStorage {
 enum Fault {
     PartialWrite(usize),
     Sync,
+    /// Fail the nth recording of publication state, counting from zero.
+    ///
+    /// Publication writes three: the seal, the attempt, and the outcome. Which
+    /// one fails changes what a later run finds, and the third is the only one
+    /// that can turn a known answer into an undecidable record -- so a test has
+    /// to be able to name it rather than fail whichever comes first.
+    Mark(u8),
 }
 struct FilePart {
     /// How this part becomes a name at publication. `None` means nothing
@@ -611,6 +618,15 @@ impl FilePart {
     /// Each step is on disk before the next one happens, which is what makes
     /// the state after a crash mean something rather than being a guess.
     fn mark(&mut self, state: Publication) -> Result<(), StorageError> {
+        #[cfg(test)]
+        match self.fault {
+            Some(Fault::Mark(0)) => {
+                self.fault = None;
+                return Err(StorageError::Io(std::io::ErrorKind::Other));
+            }
+            Some(Fault::Mark(remaining)) => self.fault = Some(Fault::Mark(remaining - 1)),
+            _ => {}
+        }
         self.metadata.seek(SeekFrom::Start(33)).map_err(io)?;
         self.metadata.write_all(&[state.to_byte()]).map_err(io)?;
         self.metadata.sync_all().map_err(io)?;
@@ -1895,6 +1911,85 @@ mod tests {
         let mut data = fs::read(&meta).expect("the metadata is there");
         data[33] = state.to_byte();
         fs::write(&meta, data).expect("the metadata is writable");
+    }
+
+    /// The state write after a refused link fails, and nothing is lost by it.
+    ///
+    /// The one write whose failure can turn a known answer into an undecidable
+    /// record: the linker has already said no name was made, and if that cannot
+    /// be written the part stays at `Attempted` and no later run can tell. Two
+    /// things must still hold, and an independent review pointed out that
+    /// neither had a test.
+    ///
+    /// The operator must be told **why the publication was refused** -- a taken
+    /// name, a full disk -- not that a metadata write failed. That reason is
+    /// what they act on, and replacing it with an I/O error hides it.
+    ///
+    /// And the conservative record must survive the reopen: refused for
+    /// writing, refused for publishing, bytes untouched, and every file that
+    /// was never ours left alone.
+    #[test]
+    fn a_failed_state_write_after_a_refused_link_keeps_the_reason_and_the_bytes() {
+        let directory = Directory::new();
+        // Built directly rather than through the store, because the fault
+        // field is on the part and the store hands back a boxed trait object.
+        let linker: Arc<dyn HandleLinker> = Arc::new(NoMechanism);
+        let mut part =
+            FilePart::open_inner(&directory.part(), spec(6), true, None, Some(linker.clone()))
+                .unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(&mut part);
+        part.verify(None, &record).unwrap();
+
+        let bystander = directory.output().with_file_name("theirs.bin");
+        fs::write(&bystander, b"not ours").unwrap();
+
+        // The third recording is the one after the linker answers: seal,
+        // attempt, outcome. Failing an earlier one would test something else.
+        part.fault = Some(Fault::Mark(2));
+        assert_eq!(
+            publish_to(&mut part, &directory.output()),
+            Err(StorageError::Unsupported),
+            "the metadata failure replaced the reason the publication was refused"
+        );
+        drop(part);
+
+        // Conservative on disk, because the answer could not be recorded.
+        assert_eq!(
+            fs::read(directory.part().join("1-1.meta")).unwrap().get(33),
+            Some(&Publication::Attempted.to_byte()),
+            "a state write that failed left something other than the attempt"
+        );
+
+        let mut again =
+            FilePart::open_inner(&directory.part(), spec(6), false, None, Some(linker)).unwrap();
+        assert_eq!(
+            again.write_at(0, b"MUTATE"),
+            Err(StorageError::InvalidState),
+            "a part whose outcome is unknown was reopened writable"
+        );
+        for (range, digest) in &record {
+            again.recover_extent(*range, *digest).unwrap();
+        }
+        again.sync().unwrap();
+        again.verify(None, &record).unwrap();
+        assert_eq!(
+            publish_to(&mut again, &directory.output()),
+            Err(StorageError::InvalidState),
+            "publication was retried on an outcome nothing can decide"
+        );
+        drop(again);
+
+        assert_eq!(
+            fs::read(directory.part().join("1-1.part")).unwrap(),
+            b"AAAAAA"
+        );
+        assert_eq!(fs::read(&bystander).unwrap(), b"not ours");
+        assert!(
+            !directory.output().exists(),
+            "a refused publication published"
+        );
     }
 
     /// A record no build of ours ever wrote is refused, not interpreted.
