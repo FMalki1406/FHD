@@ -400,7 +400,15 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
     let resumed = Engine::open(resuming(&state, destination.clone(), 2), &url)
         .await
         .unwrap();
+    // A bounded barrier before the measurement. `delivered` counts every byte
+    // this server ever sent, and connections from before the pause are still
+    // draining when the resume starts -- CI billed the resume 32769 bytes more
+    // than the whole file, which is two chunks and a probe left over from the
+    // first run. Waiting for the server to go quiet makes what follows belong
+    // to this run; widening the allowance would only have hidden the overlap.
+    server.quiet(Duration::from_secs(30)).await;
     let before = server.delivered.load(Ordering::Relaxed);
+    let broken_before = server.broken.load(Ordering::Relaxed);
     let (_control, receiver) = mpsc::channel(1);
     let outcome = tokio::time::timeout(Duration::from_secs(120), resumed.run(receiver))
         .await
@@ -419,13 +427,17 @@ async fn pause_stops_the_run_and_a_later_run_finishes_it() {
     // number here rather than a saving this engine does not make at this
     // granularity. The upper bound allows for the probe, a one-byte ranged
     // request the server counts like any other delivery.
+    server.quiet(Duration::from_secs(30)).await;
     let refetched = server.delivered.load(Ordering::Relaxed) - before;
+    // The resume's own broken responses, not the whole run's. Pausing abandons
+    // connections on purpose, so the first run's count is expected to be
+    // non-zero and says nothing about this one.
+    let broken = server.broken.load(Ordering::Relaxed) - broken_before;
     assert!(
         refetched >= body.len() as u64 - kept && refetched <= body.len() as u64 + 1024,
         "the resume fetched {refetched} bytes with {kept} committed, out of {}; \
-         the server failed to finish {} responses",
-        body.len(),
-        server.broken.load(Ordering::Relaxed)
+         the server failed to finish {broken} responses during the resume",
+        body.len()
     );
 
     if landed.is_none() {

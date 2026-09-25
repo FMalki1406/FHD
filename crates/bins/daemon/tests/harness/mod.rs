@@ -277,6 +277,16 @@ pub fn serve(body: Vec<u8>, failures: usize) -> (u16, Arc<AtomicU64>) {
 /// Slow rather than blocking: an earlier version held the body open until the
 /// test released it, and hung. A server that always makes progress cannot
 /// deadlock with the client no matter how the pause lands.
+/// Decrements the in-flight count however its handler leaves -- returning
+/// early on a broken pipe included, since a count that only falls on the happy
+/// path is worse than none.
+struct Leaving(Arc<AtomicU64>);
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct Slow {
     pub port: u16,
     pub requests: Arc<AtomicU64>,
@@ -288,6 +298,41 @@ pub struct Slow {
     /// gave up or the server did. A test server that fails silently turns its
     /// own faults into the engine's.
     pub broken: Arc<AtomicU64>,
+    /// Responses being written right now.
+    ///
+    /// `delivered` counts every byte this server ever sent, across every run of
+    /// the engine that used it. A caller measuring one run has to know when the
+    /// previous one's connections have actually finished, or their last chunks
+    /// are charged to the run being measured -- which is what happened: a
+    /// resume was billed 32769 bytes more than the file, two chunks and a probe
+    /// left over from before a pause. `quiet` is how a caller waits for that.
+    pub in_flight: Arc<AtomicU64>,
+}
+
+impl Slow {
+    /// Waits, bounded, until nothing is being written and nothing more arrives.
+    ///
+    /// The bound is the point: an unbounded wait would hide a server that never
+    /// settles, and raising a byte allowance to cover the overlap would hide
+    /// the overlap. This makes the measurement that follows belong to one run.
+    pub async fn quiet(&self, within: std::time::Duration) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let idle = self.in_flight.load(Ordering::Relaxed) == 0;
+            let seen = self.delivered.load(Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if idle && self.delivered.load(Ordering::Relaxed) == seen {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server never went quiet: {} responses still being written, \
+                 {} bytes delivered",
+                self.in_flight.load(Ordering::Relaxed),
+                self.delivered.load(Ordering::Relaxed)
+            );
+        }
+    }
 }
 
 pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> Slow {
@@ -296,15 +341,30 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
     let requests = Arc::new(AtomicU64::new(0));
     let delivered = Arc::new(AtomicU64::new(0));
     let broken = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicU64::new(0));
     let body = Arc::new(body);
-    let (counter, bytes, faults) = (requests.clone(), delivered.clone(), broken.clone());
+    let (counter, bytes, faults, busy) = (
+        requests.clone(),
+        delivered.clone(),
+        broken.clone(),
+        in_flight.clone(),
+    );
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
-            let (body, counter, bytes, faults) =
-                (body.clone(), counter.clone(), bytes.clone(), faults.clone());
+            let (body, counter, bytes, faults, busy) = (
+                body.clone(),
+                counter.clone(),
+                bytes.clone(),
+                faults.clone(),
+                busy.clone(),
+            );
             std::thread::spawn(move || {
                 let request = read_request(&mut stream);
                 counter.fetch_add(1, Ordering::Relaxed);
+                // Counted down however this handler leaves, so a caller can
+                // tell when the connection has finished rather than guess.
+                busy.fetch_add(1, Ordering::Relaxed);
+                let _leaving = Leaving(busy.clone());
                 let range = request
                     .lines()
                     .find_map(|line| line.strip_prefix("range: bytes="))
@@ -353,6 +413,7 @@ pub fn serve_slowly(body: Vec<u8>, chunk: usize, pause: std::time::Duration) -> 
         requests,
         delivered,
         broken,
+        in_flight,
     }
 }
 
