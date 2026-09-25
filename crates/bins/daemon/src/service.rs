@@ -312,6 +312,24 @@ impl Service {
             .await
             .map_err(EngineError::Admission)?
         {
+            // Settled first, and for every job, whatever else is true of it.
+            //
+            // The scheduler recovers a job it is given, and this loop only ever
+            // gave it `Queued | RetryWait` -- so a job a crash left `Probing`,
+            // `Transferring`, `Stopping` or `Cancelling` was handed to nobody
+            // and nothing moved it. It was not running, would never run, and was
+            // not resting either: it simply sat in a state that means work is
+            // under way. A test asked the service what it had after a crash
+            // mid-transfer and was told "Transferring", which is how this was
+            // found. The one-shot path has always settled these on the way in;
+            // this is the same call, in the place the service loads jobs.
+            //
+            // A job that cannot be settled is left rather than failing the whole
+            // startup: one unreadable part must not keep the engine shut.
+            let job = match self.coordinator.recover(job).await {
+                Ok(job) => job,
+                Err(_) => continue,
+            };
             let Some(reference) = sources.get(&job.spec().source()) else {
                 continue;
             };

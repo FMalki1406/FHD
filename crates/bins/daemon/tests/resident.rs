@@ -1011,3 +1011,91 @@ async fn a_job_this_question_cannot_resolve_is_told_apart_from_an_absent_file() 
     let _ = stop.send(());
     let _ = running.await;
 }
+
+/// A job a crash left mid-transfer is settled when the service opens again.
+///
+/// The one-shot path settles one: `prepare` recovers every job it loads. The
+/// service restores only `Queued` and `RetryWait` into the scheduler, and the
+/// scheduler is the only thing that recovers -- so a job the record still shows
+/// as `Transferring` is handed to nobody, and nothing moves it. It is not
+/// running, it will not run, and it is not resting either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_a_crash_left_mid_transfer_is_settled_when_the_service_opens() {
+    let body = content(4 * 1024 * 1024);
+    let state = Directory::new("resident-crash");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    // Slow enough that dropping the run lands in the middle of it.
+    let server = harness::serve_slowly(body.clone(), 16 * 1024, Duration::from_millis(5));
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+
+    let engine = Engine::open(
+        EngineConfig {
+            destination: destination.clone(),
+            ..settings(&state)
+        },
+        &url,
+    )
+    .await
+    .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    {
+        let run = engine.run(receiver);
+        tokio::pin!(run);
+        // Let it get properly under way, then stop driving the future -- which is
+        // what a process dying looks like to the record.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            tokio::select! {
+                _ = &mut run => panic!("the run finished before it could be interrupted"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if server.delivered.load(Ordering::Relaxed) > 64 * 1024 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transfer never got under way"
+            );
+        }
+        // Leaving this scope is what drops the future. Dropping `run` would
+        // drop only the pin, which is a borrow of it rather than the thing
+        // holding the session -- and that distinction is the whole
+        // interruption, so it is spelled out rather than written as a `drop`
+        // that reads like one and is not.
+    }
+    drop(engine);
+
+    // The service opens on the same directory and is asked what it has.
+    let address = endpoint("resident-crash");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+    let listed = ask(&mut client, 1, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list: {listed:?}");
+    };
+    let found = jobs.first().expect("the job is in the record").clone();
+    let _ = stop.send(());
+    let _ = running.await;
+
+    // Anything that rests is an answer. `Transferring` is not one: nothing is
+    // transferring, and nothing will.
+    assert!(
+        matches!(
+            found.state.as_str(),
+            "Paused" | "NeedsAction" | "Queued" | "Failed" | "Verifying" | "Completed"
+        ),
+        "a job a crash left mid-transfer was not settled by the service: {found:?}"
+    );
+}
