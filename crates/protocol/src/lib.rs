@@ -503,6 +503,62 @@ mod tests {
         assert_eq!(decode_request(frame), Err(ProtocolError::Invalid));
     }
 
+    /// A warning code nobody declared, and more warnings than an answer may
+    /// carry, are both refused -- on the way out and on the way in.
+    ///
+    /// The set exists because the client prints these, and an answer that can
+    /// carry arbitrary text is an answer that can carry whatever a peer likes.
+    /// The service only ever produces the declared codes, so what this pins is
+    /// the boundary rather than the service: a decoder that trusts the sender
+    /// is not a boundary.
+    #[test]
+    fn warning_codes_outside_the_declared_set_are_refused_on_both_sides() {
+        let unknown = Response::Accepted {
+            job: 1,
+            warnings: vec!["MADE-UP".to_owned()],
+        };
+        assert_eq!(encode_response(1, &unknown), Err(ProtocolError::Invalid));
+
+        let too_many = Response::Accepted {
+            job: 1,
+            warnings: vec![WARNINGS[0].to_owned(); MAX_WARNINGS + 1],
+        };
+        assert_eq!(encode_response(1, &too_many), Err(ProtocolError::Invalid));
+
+        // What the service does produce still goes through, empty or not.
+        for warnings in [Vec::new(), vec![WARNINGS[0].to_owned()]] {
+            let accepted = Response::Accepted { job: 1, warnings };
+            assert!(
+                encode_response(1, &accepted).is_ok(),
+                "a declared answer was refused: {accepted:?}"
+            );
+        }
+        // Decoding takes the body rather than the framed bytes, which is why
+        // this is spelled out rather than round-tripped through `encode`.
+        let plain = br#"{"v":1,"id":1,"body":{"kind":"accepted","job":1,"warnings":["DESTINATION-SHARED"]}}"#;
+        assert_eq!(
+            decode_response(plain),
+            Ok((
+                1,
+                Response::Accepted {
+                    job: 1,
+                    warnings: vec!["DESTINATION-SHARED".to_owned()],
+                }
+            ))
+        );
+
+        // And a peer that sends one anyway does not get it past the decoder.
+        // Encoding is ours; decoding is where someone else's bytes arrive.
+        // A code nobody declared, carrying an escape sequence that would clear
+        // a terminal if it were ever printed. Written as a JSON escape, so the
+        // frame itself is well formed and the refusal is about the code rather
+        // than about the syntax.
+        let planted =
+            br#"{"v":1,"id":1,"body":{"kind":"accepted","job":1,"warnings":["\u001b[2J"]}}"#;
+        assert_eq!(decode_response(planted), Err(ProtocolError::Invalid));
+        let flooded = br#"{"v":1,"id":1,"body":{"kind":"accepted","job":1,"warnings":["DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED","DESTINATION-SHARED"]}}"#;
+        assert_eq!(decode_response(flooded), Err(ProtocolError::Invalid));
+    }
     #[test]
     fn frames_survive_being_split_and_joined_by_the_stream() {
         let first = encode_request(1, &Request::Shutdown).unwrap();
