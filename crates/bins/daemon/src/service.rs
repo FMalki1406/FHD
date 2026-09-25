@@ -15,14 +15,14 @@ use fhd_runtime::{
     buffers::BufferPool,
     coordinator::{Coordinator, CoordinatorConfig, Ports},
     origin::{OriginGovernor, OriginLimits},
-    scheduler::{Command, Scheduler, SchedulerConfig},
+    scheduler::{Applied, Command, Scheduler, SchedulerConfig},
 };
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Destinations learned as jobs are admitted, rather than fixed at startup.
 struct Registry(Mutex<HashMap<DestinationRef, PathBuf>>, String);
@@ -572,8 +572,16 @@ impl Handler for Service {
                         code: "ENGINE-INVALID-INPUT".into(),
                     };
                 };
+                // The reply waits for the scheduler's answer rather than for the
+                // send to succeed. It used to be the send: a command the
+                // scheduler then dropped was reported to the client as done, so
+                // `Pause` and `Cancel` on any stopped job said they had worked
+                // and had not. `Done` now means the job's transition was applied,
+                // or -- for a job a session is running -- that the session was
+                // handed the command and stops in its own time.
+                let (reply, applied) = oneshot::channel();
                 let command = match request {
-                    Request::Cancel { .. } => Command::Cancel(id),
+                    Request::Cancel { .. } => Command::Cancel(id, Some(reply)),
                     // Resume is not a scheduler command: a stopped job is released
                     // by the operator, which this build does not do over IPC yet.
                     Request::Resume { .. } => {
@@ -581,10 +589,22 @@ impl Handler for Service {
                             code: "ENGINE-UNSUPPORTED".into(),
                         }
                     }
-                    _ => Command::Pause(id),
+                    _ => Command::Pause(id, Some(reply)),
                 };
-                match self.commands.send(command).await {
-                    Ok(()) => Response::Done,
+                if self.commands.send(command).await.is_err() {
+                    return Response::Failed {
+                        code: "ENGINE-STOPPING".into(),
+                    };
+                }
+                match applied.await {
+                    Ok(Applied::Yes) => Response::Done,
+                    // No such job, or a state that refuses the command.
+                    Ok(Applied::No) => Response::Failed {
+                        code: "ENGINE-INVALID-INPUT".into(),
+                    },
+                    // The scheduler went away before answering, so what became
+                    // of the command is genuinely unknown -- and saying so is
+                    // the point of this whole path.
                     Err(_) => Response::Failed {
                         code: "ENGINE-STOPPING".into(),
                     },

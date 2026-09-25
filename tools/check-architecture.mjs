@@ -221,17 +221,11 @@ function permitsUnsafe(text) {
 
 export function checkUnsafePolicy(root) {
   const offenders = [];
-  const walk = (directory) => {
-    for (const entry of readdirSync(directory)) {
-      if (entry === 'target' || entry === '.git') continue;
-      const full = `${directory}/${entry}`;
-      if (statSync(full).isDirectory()) { walk(full); continue; }
-      if (!entry.endsWith('.rs')) continue;
-      const relative = full.slice(root.length + 1).split('\\').join('/');
-      offenders.push(...unsafeOffendersIn(relative, readFileSync(full, 'utf8')));
-    }
-  };
-  walk(`${root}/crates`);
+  walkSources(`${root}/crates`, (full) => {
+    if (!full.endsWith('.rs')) return;
+    const relative = full.slice(root.length + 1).split('\\').join('/');
+    offenders.push(...unsafeOffendersIn(relative, readFileSync(full, 'utf8')));
+  });
   return offenders;
 }
 
@@ -437,7 +431,10 @@ function main(args) {
   // than any single rule this gate enforces on what the file says.
   const unreviewable = checkReviewableSources(root);
   if (unreviewable.length) throw new Error(`Sources no diff would show:\n${unreviewable.join('\n')}`);
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, every source reviewable as text).`);
+  // Says what was scanned, not "every source". A review pointed out that the
+  // previous wording claimed more than the walk covers, which is the same kind
+  // of overclaim this gate exists to make expensive.
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes in crates/tools/.github sources).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

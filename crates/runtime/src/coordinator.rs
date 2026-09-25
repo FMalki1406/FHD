@@ -225,15 +225,75 @@ impl Coordinator {
             emit(Event::new(Code::StorageFailed).for_job(job.id().get(), job.generation().get()));
             return;
         };
-        let removed = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+        let removed = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
             let mut file = store.open(&directory, spec)?;
+            // A part whose record says the link was begun is left exactly where
+            // it is. It may be a second name for a file the user already has,
+            // and while removing this name would not take the file away, it
+            // would destroy the only local evidence that publication may have
+            // happened -- which is the input to deciding what actually became of
+            // it. A cancelled job keeps nothing it downloaded; this is not that,
+            // it is a record of something that may have been delivered.
+            if matches!(
+                file.publication(),
+                Publication::Attempted | Publication::Linked
+            ) {
+                return Ok(false);
+            }
             file.abandon();
-            file.discard()
+            file.discard()?;
+            Ok(true)
         })
         .await;
-        if !matches!(removed, Ok(Ok(()))) {
-            emit(Event::new(Code::StorageFailed).for_job(job.id().get(), job.generation().get()));
+        match removed {
+            Ok(Ok(true)) => {}
+            // Kept on purpose. Reported, because a part left behind after a
+            // cancel is something the operator should be able to find out about.
+            Ok(Ok(false)) => {
+                emit(
+                    Event::new(Code::PartRetained).for_job(job.id().get(), job.generation().get()),
+                );
+            }
+            _ => emit(
+                Event::new(Code::StorageFailed).for_job(job.id().get(), job.generation().get()),
+            ),
         }
+    }
+
+    /// Applies an operator's command to a job no session is running.
+    ///
+    /// The scheduler owns what it is running and what is waiting in its queue. A
+    /// job that stopped for a reason is in neither: it rests in the record. The
+    /// command for such a job was being dropped -- reported as `CommandIgnored`
+    /// while the client was told it had been done -- which is how `Unconfirmed`
+    /// came to be a state with no way out, and `Pause`/`Cancel` came to be
+    /// silently ignored for every stopped job.
+    ///
+    /// `Ok(None)` means no such job, which is the caller's to report. A cancel
+    /// carries through its cleanup here, exactly as recovery does after a crash,
+    /// because nothing else will come along to finish it.
+    pub async fn command_resting(
+        &self,
+        id: fhd_domain::JobId,
+        command: JobCommand,
+    ) -> Result<Option<Job>, RunError> {
+        let repository = self.ports.repository.as_ref();
+        let jobs = repository
+            .load_jobs()
+            .await
+            .map_err(|_| RunError::Repository)?;
+        let Some(mut job) = jobs.into_iter().find(|job| job.id() == id) else {
+            return Ok(None);
+        };
+        step(repository, &mut job, command).await?;
+        if job.state() == JobState::Cancelling {
+            // The part goes, and the record says so afterwards. A cancelled job
+            // keeps nothing -- and a part that was published is a second name
+            // for a file the user has, which this does not touch.
+            self.drop_part(&job).await;
+            step(repository, &mut job, JobCommand::CleanupFinished).await?;
+        }
+        Ok(Some(job))
     }
 
     /// Settles a job restored after a crash (§5.2): nothing is resumed implicitly.

@@ -70,8 +70,13 @@ pub enum Code {
     PolicyRejected,
     /// A command arrived for a job nobody here owns; it changed nothing.
     CommandIgnored,
+    /// A cancelled job's part was kept rather than removed, because its record
+    /// says a publication was begun for it. Removing the name would not take the
+    /// user's file away, but it would destroy the only local evidence that the
+    /// file may have been delivered.
+    PartRetained,
 }
-const CODE_COUNT: usize = 15;
+const CODE_COUNT: usize = 16;
 impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -90,6 +95,7 @@ impl Code {
             Self::BufferPressure => "BUFFER-PRESSURE",
             Self::PolicyRejected => "POLICY-REJECTED",
             Self::CommandIgnored => "CMD-IGNORED",
+            Self::PartRetained => "PART-RETAINED",
         }
     }
 }

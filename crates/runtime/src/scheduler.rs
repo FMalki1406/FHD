@@ -15,7 +15,10 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
 };
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
@@ -42,10 +45,28 @@ pub enum Command {
     /// A job admitted while the scheduler is already running: a resident engine
     /// takes work as it arrives, not only what it started with.
     Admit(Box<Job>),
-    Pause(JobId),
-    Cancel(JobId),
+    Pause(JobId, Option<oneshot::Sender<Applied>>),
+    Cancel(JobId, Option<oneshot::Sender<Applied>>),
     /// Pauses what is running and returns; queued work is handed back untouched.
     Shutdown,
+}
+
+/// What became of an operator's command, for whoever asked.
+///
+/// The reply used to be sent on the strength of the channel send, so a command
+/// this scheduler dropped was reported to the client as having been carried out.
+/// Nothing could tell an ignored command from a done one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Handed to the session that is running the job, which stops itself, or
+    /// applied to a job this scheduler was holding or found resting in the
+    /// record. The job's own transition is recorded either way.
+    ///
+    /// For a running job this means accepted rather than finished: the session
+    /// stops in its own time, and the record is what says when.
+    Yes,
+    /// No such job, or a command its state refuses.
+    No,
 }
 
 /// How one job left the scheduler, with the job as it now stands.
@@ -362,7 +383,7 @@ impl Scheduler {
         active: &HashMap<JobId, Active>,
         deferred: &mut VecDeque<(JobId, Control)>,
     ) -> bool {
-        let (id, control) = match command {
+        let (id, control, reply) = match command {
             Command::Admit(job) => {
                 self.enqueue(queue, *job);
                 return false;
@@ -375,19 +396,45 @@ impl Scheduler {
                 }
                 return true;
             }
-            Command::Pause(id) => (id, Control::Pause),
-            Command::Cancel(id) => (id, Control::Cancel),
+            Command::Pause(id, reply) => (id, Control::Pause, reply),
+            Command::Cancel(id, reply) => (id, Control::Cancel, reply),
+        };
+        // Answered exactly once, on every route out of here. A reply the caller
+        // no longer waits for is dropped without ceremony.
+        let answer = |applied: Applied| {
+            if let Some(reply) = reply {
+                let _ = reply.send(applied);
+            }
         };
         if let Some(entry) = active.get(&id) {
             // The session owns the job: it stops itself and reports back.
             if entry.control.try_send(control).is_err() {
                 deferred.push_back((id, control));
             }
+            answer(Applied::Yes);
             return false;
         }
         let Some(entry) = queue.remove(id) else {
-            // Nobody here owns this job: say so rather than drop it silently.
-            emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+            // Nobody here is running or holding this job -- but that does not
+            // mean it does not exist. A job that stopped for a reason rests in
+            // the record and is in neither place, and this arm used to report
+            // `CommandIgnored` and return, while the client that asked was told
+            // `Done`. So every `Pause`/`Cancel` for a stopped job did nothing
+            // and said it had worked, which is also what left a job stopped as
+            // `Unconfirmed` with no reachable way out.
+            let command = match control {
+                Control::Pause => JobCommand::Pause,
+                Control::Cancel => JobCommand::Cancel,
+            };
+            match self.coordinator.command_resting(id, command).await {
+                // No such job, or a command its state refuses: now the report is
+                // true rather than a description of this scheduler's bookkeeping.
+                Ok(None) | Err(_) => {
+                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                    answer(Applied::No);
+                }
+                Ok(Some(_)) => answer(Applied::Yes),
+            }
             return false;
         };
         let command = match control {
@@ -395,14 +442,20 @@ impl Scheduler {
             Control::Cancel => JobCommand::Cancel,
         };
         match self.coordinator.command(entry.job, command).await {
-            Ok(job) => match self.settle(job).await {
-                Ok(job) => queue.take(Entry {
-                    job,
-                    origin: entry.origin,
-                }),
-                Err((id, error)) => queue.done.push(Outcome::failed(id, error)),
-            },
-            Err(error) => queue.done.push(Outcome::failed(id, error)),
+            Ok(job) => {
+                answer(Applied::Yes);
+                match self.settle(job).await {
+                    Ok(job) => queue.take(Entry {
+                        job,
+                        origin: entry.origin,
+                    }),
+                    Err((id, error)) => queue.done.push(Outcome::failed(id, error)),
+                }
+            }
+            Err(error) => {
+                answer(Applied::No);
+                queue.done.push(Outcome::failed(id, error));
+            }
         }
         false
     }

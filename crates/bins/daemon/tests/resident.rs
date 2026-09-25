@@ -2,7 +2,7 @@
 //! and what it was told survives it going away.
 mod harness;
 
-use fhd_daemon::{EngineConfig, EngineError, Intent, Resident};
+use fhd_daemon::{Engine, EngineConfig, EngineError, Intent, Resident};
 use fhd_ipc::{ask, connect, Endpoint};
 use fhd_protocol::{AddRequest, Request, Response};
 use harness::{
@@ -12,6 +12,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 fn settings(state: &Directory) -> EngineConfig {
     EngineConfig {
@@ -435,4 +436,324 @@ fn open_to_others(folder: &std::path::Path) -> bool {
             .map(|done| done.status.success())
             .unwrap_or(false)
     }
+}
+
+/// A job that stopped for a reason can still be cancelled, and a job that does
+/// not exist is refused rather than reported as done.
+///
+/// Both halves were broken, and an independent review found them while looking
+/// at something else. The scheduler owns what it is running and what waits in
+/// its queue; a stopped job is in neither, so its command was dropped with
+/// `CommandIgnored` -- while the client was told `Done`, because the reply was
+/// sent on the strength of the channel send rather than the execution. So every
+/// `Pause`/`Cancel` for a stopped job did nothing and said it had worked.
+///
+/// That is also what made `Unconfirmed` a state with no way out: resume is
+/// refused by design, replacement is refused by design, and cancel -- the exit
+/// the contract named -- never arrived. `NeedsAction` is the state all of those
+/// rest in, and this reaches it the cheapest way there is, by occupying the
+/// destination name. What it proves is the path, which `Unconfirmed` shares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_job_can_be_cancelled_and_an_unknown_one_is_refused() {
+    let body = content(256 * 1024);
+    let (port, _) = serve_file(body.clone(), 0);
+    let state = Directory::new("cancel-resting");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("taken.bin");
+    // Something else already holds the name, so the transfer finishes and the
+    // publication is refused: the job comes to rest in `NeedsAction`.
+    std::fs::write(&destination, b"someone else's file").unwrap();
+    let address = endpoint("cancel");
+
+    let serving = Resident::open(settings(&state))
+        .await
+        .unwrap()
+        .bind(address.clone())
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let engine = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+
+    let mut client = connect(&address).await.unwrap();
+    let url = format!("http://127.0.0.1:{port}/file");
+    let accepted = ask(
+        &mut client,
+        1,
+        &add(url.clone(), &destination, expected_digest(&body)),
+    )
+    .await
+    .unwrap();
+    let Response::Accepted { job, .. } = accepted else {
+        panic!("the engine refused the request: {accepted:?}");
+    };
+
+    // Wait for it to come to rest, bounded: an unbounded wait here would turn a
+    // job that never stopped into a test that never ends.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let resting = loop {
+        let listed = ask(&mut client, 2, &Request::List { after: None })
+            .await
+            .unwrap();
+        let Response::Jobs { jobs, .. } = listed else {
+            panic!("the engine refused to list: {listed:?}");
+        };
+        let found = jobs
+            .iter()
+            .find(|summary| summary.job == job)
+            .expect("the job it just accepted is not in the list")
+            .clone();
+        if found.state == "NeedsAction" {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job never came to rest: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        resting.reason.as_deref(),
+        Some("DESTINATION"),
+        "the job rested for some other reason"
+    );
+
+    // A job nobody has: refused, not reported as done.
+    let unknown = ask(&mut client, 3, &Request::Cancel { job: job + 4242 })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&unknown, Response::Failed { code } if code == "ENGINE-INVALID-INPUT"),
+        "a command for a job that does not exist was not refused: {unknown:?}"
+    );
+
+    // And the stopped job takes the command.
+    let cancelled = ask(&mut client, 4, &Request::Cancel { job }).await.unwrap();
+    assert!(
+        matches!(cancelled, Response::Done),
+        "the engine refused to cancel a stopped job: {cancelled:?}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let listed = ask(&mut client, 5, &Request::List { after: None })
+            .await
+            .unwrap();
+        let Response::Jobs { jobs, .. } = listed else {
+            panic!("the engine refused to list: {listed:?}");
+        };
+        let found = jobs
+            .iter()
+            .find(|summary| summary.job == job)
+            .expect("the job disappeared from the list")
+            .clone();
+        if found.state == "Cancelled" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancel was accepted and never carried out: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = stop.send(());
+    let _ = engine.await;
+
+    // The file that was never ours is still exactly what it was, and the
+    // cancelled job kept nothing.
+    assert_eq!(std::fs::read(&destination).unwrap(), b"someone else's file");
+    let parts = downloads.join(".fhd-parts");
+    let mut left = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&parts) {
+        for entry in entries.flatten() {
+            if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                left.extend(inner.flatten().map(|it| it.file_name()));
+            }
+        }
+    }
+    assert!(
+        left.is_empty(),
+        "a cancelled job left parts behind: {left:?}"
+    );
+}
+
+/// The first file of this name anywhere under `root`.
+fn find(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|it| it == name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// A job stopped as `Unconfirmed` is cancelled over the socket, the answer says
+/// what happened, it survives a restart -- and the part it may have delivered is
+/// kept, not deleted.
+///
+/// This is the acceptance criterion as the review wrote it, and each clause is a
+/// separate assertion: the command is applied to the stored job and its
+/// transition recorded; the reply is not `Done` until the scheduler has answered;
+/// the job store is compared after reopening; and a sealed part that may belong
+/// to a delivered file is not touched.
+///
+/// `Unconfirmed` is reached the way a crash inside publication leaves it: every
+/// byte durable, the link recorded as begun, and the destination name free again
+/// -- which is the renamed-folder case, where the destination cannot answer
+/// whether the file was ever delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconfirmed_job_is_cancelled_over_the_socket_and_keeps_its_part() {
+    let body = content(256 * 1024);
+    let (port, _) = serve_file(body.clone(), 0);
+    let state = Directory::new("cancel-unconfirmed");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    std::fs::write(&destination, b"someone else's file").unwrap();
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // Transfer everything, then have publication refused: all bytes durable and
+    // an intent recorded, which is the state a publication crash starts from.
+    let one_shot = EngineConfig {
+        destination: destination.clone(),
+        ..settings(&state)
+    };
+    let engine = Engine::open(one_shot.clone(), &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the first run did not come back");
+    assert!(outcome.is_ok(), "the transfer failed: {outcome:?}");
+    assert_eq!(engine.durable_bytes().await.unwrap(), body.len() as u64);
+    drop(engine);
+
+    // The link recorded as begun, and the name free again.
+    let parts = downloads.join(".fhd-parts");
+    let meta = find(&parts, "1-1.meta").expect("the part's record is on disk");
+    let part = find(&parts, "1-1.part").expect("the part is on disk");
+    let mut planted = std::fs::read(&meta).unwrap();
+    planted[33] = 0b011;
+    std::fs::write(&meta, &planted).unwrap();
+    let held = std::fs::read(&part).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+
+    // One run to reach the state itself, so the record says `Unconfirmed`
+    // rather than the test asserting it into existence.
+    let engine = Engine::open(
+        EngineConfig {
+            intent: Intent::Resume,
+            ..one_shot.clone()
+        },
+        &url,
+    )
+    .await
+    .unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let _ = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the run did not come back");
+    assert_eq!(
+        engine.reason().await.unwrap(),
+        Some(fhd_domain::StopReason::Unconfirmed),
+        "the job did not reach the state this test is about"
+    );
+    drop(engine);
+
+    // Now the service, on the same state directory.
+    let address = endpoint("unconfirmed");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+
+    let listed = ask(&mut client, 1, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list: {listed:?}");
+    };
+    let before = jobs.first().expect("the job is in the record").clone();
+    assert_eq!(before.state, "NeedsAction");
+    assert_eq!(
+        before.reason.as_deref(),
+        Some("UNCONFIRMED"),
+        "the service reports the state differently from the engine"
+    );
+
+    let cancelled = ask(&mut client, 2, &Request::Cancel { job: before.job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(cancelled, Response::Done),
+        "cancelling a job stopped as unconfirmed was refused: {cancelled:?}"
+    );
+
+    let _ = stop.send(());
+    let _ = running.await;
+
+    // The record after a restart, which is what "recorded" has to mean.
+    let address = endpoint("unconfirmed-again");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+    let listed = ask(&mut client, 1, &Request::List { after: None })
+        .await
+        .unwrap();
+    let Response::Jobs { jobs, .. } = listed else {
+        panic!("the engine refused to list: {listed:?}");
+    };
+    let after = jobs
+        .first()
+        .expect("the job is still in the record")
+        .clone();
+    assert_eq!(
+        after.state, "Cancelled",
+        "the cancel was answered and did not survive the restart"
+    );
+    let _ = stop.send(());
+    let _ = running.await;
+
+    // And the part is still there, whole. A cancelled job keeps nothing it
+    // downloaded -- but this part's record says a link was begun, so it may be a
+    // second name for a file the user already has, and removing it would destroy
+    // the only local evidence of that. It is kept on purpose, and that is the
+    // outcome the review asked to see stated plainly rather than assumed.
+    assert_eq!(
+        std::fs::read(&part).unwrap(),
+        held,
+        "a part that may have been delivered was written to"
+    );
+    assert_eq!(
+        std::fs::read(&meta).unwrap(),
+        planted,
+        "the record of a part that may have been delivered was rewritten"
+    );
+    assert!(
+        !destination.exists(),
+        "cancelling created the destination it was unsure about"
+    );
 }

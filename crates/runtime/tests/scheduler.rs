@@ -318,7 +318,7 @@ async fn a_queued_job_can_be_cancelled_before_it_ever_reaches_the_network() {
     });
     let (commander, commands) = mpsc::channel(4);
     commander
-        .send(Command::Cancel(JobId::new(2).unwrap()))
+        .send(Command::Cancel(JobId::new(2).unwrap(), None))
         .await
         .unwrap();
     let outcomes = scheduler.run(rig.jobs().await, commands).await;

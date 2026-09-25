@@ -803,8 +803,10 @@ impl Engine {
         tokio::spawn(async move {
             while let Some(control) = control.recv().await {
                 let command = match control {
-                    Control::Pause => Command::Pause(id),
-                    Control::Cancel => Command::Cancel(id),
+                    // No reply channel: this mapper forwards a local control
+                    // signal, and there is no client waiting to be told.
+                    Control::Pause => Command::Pause(id, None),
+                    Control::Cancel => Command::Cancel(id, None),
                 };
                 if commands.send(command).await.is_err() {
                     return;
