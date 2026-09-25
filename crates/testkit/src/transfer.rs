@@ -267,6 +267,14 @@ pub struct StoreFaults {
     pub fail_sync: bool,
     /// Writes touching this offset fail with StorageFull.
     pub fail_write_at: Option<u64>,
+    /// The next `create` fails, and nothing is recorded for it.
+    ///
+    /// The window between a job taking a new generation and that generation's
+    /// part existing on disk is only reachable through this: the record has
+    /// moved and the disk has not, and no amount of waiting on a counter lands
+    /// there. Self-clearing, so a test injects one failure rather than a state
+    /// it then has to remember to undo.
+    pub fail_create: bool,
 }
 /// `live` is what reads see; `durable` is what survives `MemoryStore::crash`.
 #[derive(Default)]
@@ -379,6 +387,15 @@ impl SegmentStore for MemoryStore {
             }))
     }
     fn create(&self, _: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError> {
+        {
+            let mut faults = self.faults.lock().unwrap();
+            if faults.fail_create {
+                faults.fail_create = false;
+                // Not `Conflict`: the caller answers that by opening what is
+                // already there, and the point here is that nothing is.
+                return Err(StorageError::Io(std::io::ErrorKind::PermissionDenied));
+            }
+        }
         let mut files = self.files.lock().unwrap();
         let key = (spec.job(), spec.generation());
         if files.contains_key(&key) {

@@ -2,8 +2,8 @@ use fhd_app::{
     storage::Published, transport::TransportError, CommitError, DurableExtent, TransferRepository,
 };
 use fhd_domain::{
-    DestinationRef, Job, JobCommand, JobId, JobSpec, JobState, Priority, RetryPolicy, SourceRef,
-    StopReason,
+    DestinationRef, Generation, Job, JobCommand, JobId, JobSpec, JobState, Priority, RetryPolicy,
+    SourceRef, StopReason,
 };
 use fhd_runtime::{
     buffers::BufferPool,
@@ -617,4 +617,84 @@ async fn a_resumed_session_with_nothing_left_to_fetch_still_verifies() {
     );
     assert_eq!(rig.transport.fetches(), fetches);
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+}
+
+/// A job interrupted between taking a new generation and creating its part.
+///
+/// This is the window the end-to-end tests could not reach, and it is recorded
+/// in Â§10 of the publication contract as unimplemented -- so this implements it.
+/// A byte counter cannot land here: the resume's own ranged probe satisfies it
+/// before the new part exists, which is why the test that claimed this was
+/// renamed to what it actually proved.
+///
+/// The window is a state, not a moment: the record says generation 2 and the
+/// disk holds nothing for it. A representation change reaches exactly that, and
+/// the fault makes the first attempt to leave it fail as well, so the job is
+/// held there across two more runs. Throughout, generation 1's bytes must be
+/// untouched -- it is a different object, and the whole point of taking a new
+/// generation is that the old one is never written over.
+#[tokio::test]
+async fn a_failure_between_the_new_generation_and_its_part_leaves_the_old_one_whole() {
+    let content = body(40_000);
+    let rig = rig(&content, true, None);
+    rig.transport.fault(FetchFault::Truncate {
+        after: 2000,
+        error: TransportError::RepresentationChanged,
+    });
+    assert_eq!(rig.run().await, Ok(SessionEnd::Settled(JobState::Queued)));
+
+    // The window: the record has moved, and nothing on disk belongs to it.
+    let job = rig.job().await;
+    assert_eq!(job.generation().get(), 2);
+    let first = rig
+        .store
+        .bytes(job.id(), Generation::new(1).unwrap())
+        .expect("the first generation's part is still on disk");
+    assert!(
+        rig.store
+            .bytes(job.id(), Generation::new(2).unwrap())
+            .is_none(),
+        "the new generation already has a part, so this is not the window"
+    );
+
+    // Failing to leave the window is not failing into the old generation.
+    rig.store.set_faults(StoreFaults {
+        fail_create: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction)),
+        "a part that could not be created did not stop the job"
+    );
+    assert_eq!(
+        rig.job().await.reason(),
+        Some(StopReason::Storage),
+        "a storage failure in the window was reported as something else"
+    );
+    assert_eq!(
+        rig.store.bytes(job.id(), Generation::new(1).unwrap()),
+        Some(first.clone()),
+        "the old generation was touched while the new one failed to start"
+    );
+    assert_eq!(
+        rig.job().await.generation().get(),
+        2,
+        "the generation moved again"
+    );
+
+    // And the job carries on from the window once storage allows it.
+    rig.command(JobCommand::Resume).await;
+    assert_eq!(rig.job().await.state(), JobState::Queued);
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
+    );
+    assert_eq!(
+        rig.store.bytes(job.id(), Generation::new(1).unwrap()),
+        Some(first),
+        "the old generation was written over on the way to publishing"
+    );
 }
