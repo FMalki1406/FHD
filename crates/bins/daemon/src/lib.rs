@@ -1239,7 +1239,7 @@ pub fn publishable_name(leaf: &str) -> bool {
     })
 }
 
-/// Only controlled categories reach the operator: never a URL or server text./// Only controlled categories reach the operator: never a URL or server text.
+/// Only controlled categories reach the operator: never a URL or server text.
 pub fn code(error: &EngineError) -> String {
     match error {
         EngineError::InvalidInput => "ENGINE-INVALID-INPUT".into(),
@@ -1248,6 +1248,13 @@ pub fn code(error: &EngineError) -> String {
         EngineError::DestinationRefused => "DESTINATION-REFUSED".into(),
         EngineError::NothingToContinue => "NOTHING-TO-CONTINUE".into(),
         EngineError::NeedsDecision(reason) => match reason {
+            // A resume is refused for this one, by design: the part may already
+            // be the user's file. Telling the operator to rerun with `--resume`
+            // -- which is what every other stop says, and what this used to say
+            // -- advises the one action that cannot be taken, and they would get
+            // this same code back for their trouble. What it needs instead is
+            // the question only a person can answer: is the file there?
+            Some(StopReason::Unconfirmed) => "STOPPED-UNCONFIRMED-CHECK-DESTINATION".into(),
             Some(reason) => format!("STOPPED-{}-RERUN-WITH-RESUME", stop_reason(reason)),
             None => "STOPPED-RERUN-WITH-RESUME".into(),
         },
@@ -1313,5 +1320,53 @@ mod names {
         ] {
             assert!(super::publishable_name(accepted), "refused {accepted:?}");
         }
+    }
+}
+
+/// What the operator is told when a job stops, which is the whole of what they
+/// have to act on.
+#[cfg(test)]
+mod told {
+    use super::{code, EngineError};
+    use fhd_domain::StopReason;
+
+    /// The one reason that must not advise a resume, and every other one that
+    /// must still advise it.
+    ///
+    /// A review found this saying `STOPPED-UNCONFIRMED-RERUN-WITH-RESUME`: for
+    /// the single state where resuming is refused by design, the engine was
+    /// telling the operator to resume. Following that advice returns this same
+    /// code, so the only thing it could produce is a loop.
+    #[test]
+    fn the_one_reason_that_cannot_be_resumed_does_not_advise_resuming() {
+        let unconfirmed = code(&EngineError::NeedsDecision(Some(StopReason::Unconfirmed)));
+        assert_eq!(unconfirmed, "STOPPED-UNCONFIRMED-CHECK-DESTINATION");
+        assert!(
+            !unconfirmed.contains("RESUME"),
+            "the engine advised the one action it refuses: {unconfirmed}"
+        );
+
+        for reason in [
+            StopReason::Network,
+            StopReason::Storage,
+            StopReason::Authentication,
+            StopReason::Destination,
+            StopReason::Policy,
+            StopReason::Unknown,
+            StopReason::SourceChanged,
+            StopReason::Integrity,
+            StopReason::Unreadable,
+        ] {
+            let told = code(&EngineError::NeedsDecision(Some(reason)));
+            assert!(
+                told.ends_with("-RERUN-WITH-RESUME"),
+                "{reason:?} stopped telling the operator what to do: {told}"
+            );
+            assert!(told.contains(super::stop_reason(&reason)), "{reason:?}");
+        }
+        assert_eq!(
+            code(&EngineError::NeedsDecision(None)),
+            "STOPPED-RERUN-WITH-RESUME"
+        );
     }
 }
