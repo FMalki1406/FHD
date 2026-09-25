@@ -18,6 +18,7 @@ use fhd_runtime::{
     origin::{OriginGovernor, OriginLimits},
     scheduler::{Applied, Command, Scheduler, SchedulerConfig},
 };
+use fhd_telemetry::{emit, Code, Event};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -324,11 +325,22 @@ impl Service {
             // found. The one-shot path has always settled these on the way in;
             // this is the same call, in the place the service loads jobs.
             //
-            // A job that cannot be settled is left rather than failing the whole
-            // startup: one unreadable part must not keep the engine shut.
+            // A job that cannot be settled is left where it is rather than
+            // failing the whole startup -- but said out loud, which it was not.
+            // An earlier comment here justified the skip with "one unreadable
+            // part must not keep the engine shut", and that is not what this
+            // error is: `drop_part` is best effort and reports its own trouble
+            // as an event. What reaches here is the repository refusing a
+            // commit, which is the case where skipping silently is least
+            // defensible -- the service would list jobs in impossible states
+            // with nothing saying why.
+            let id = job.id();
             let job = match self.coordinator.recover(job).await {
                 Ok(job) => job,
-                Err(_) => continue,
+                Err(_) => {
+                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                    continue;
+                }
             };
             let Some(reference) = sources.get(&job.spec().source()) else {
                 continue;
@@ -349,7 +361,25 @@ impl Service {
             {
                 continue;
             }
-            if matches!(job.state(), JobState::Queued | JobState::RetryWait) {
+            // What the scheduler can take, which is what this list is for.
+            //
+            // `Publishing` belongs here and was missing, and a review showed it
+            // is the worst of the mid-flight states rather than the mildest: a
+            // crash there leaves a job the scheduler never sees, so
+            // `resume_publish` -- the only thing that reconciles an interrupted
+            // publication against the destination -- never runs. And unlike the
+            // others it cannot be cancelled or paused either, because the domain
+            // refuses both while a publication is in progress. It had no exit at
+            // all. Handing it over is also what the one-shot path does, so the
+            // two stop disagreeing about a crash.
+            //
+            // `Verifying` is deliberately absent: `recover` above pauses it, so
+            // it cannot reach this line, and verification is not resumed without
+            // an operator saying so.
+            if matches!(
+                job.state(),
+                JobState::Queued | JobState::RetryWait | JobState::Publishing
+            ) {
                 restored.push(job);
             }
         }

@@ -1021,7 +1021,12 @@ async fn a_job_this_question_cannot_resolve_is_told_apart_from_an_absent_file() 
 /// running, it will not run, and it is not resting either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_a_crash_left_mid_transfer_is_settled_when_the_service_opens() {
-    let body = content(4 * 1024 * 1024);
+    // Larger than the engine's 8 MiB checkpoint threshold, so the interruption
+    // lands on a job with committed extents and a part on disk rather than one
+    // whose segments are all still pending. A review pointed out that the first
+    // version of this used 4 MiB, which cannot checkpoint at all -- so it was
+    // settling an empty map and calling that "a crash mid-transfer".
+    let body = content(12 * 1024 * 1024);
     let state = Directory::new("resident-crash");
     let downloads = state.0.join("downloads");
     std::fs::create_dir(&downloads).unwrap();
@@ -1043,20 +1048,28 @@ async fn a_job_a_crash_left_mid_transfer_is_settled_when_the_service_opens() {
     {
         let run = engine.run(receiver);
         tokio::pin!(run);
-        // Let it get properly under way, then stop driving the future -- which is
-        // what a process dying looks like to the record.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        // Driven until the record holds committed bytes, then abandoned -- which
+        // is what a process dying looks like to the record.
+        //
+        // The wait is on the committed bytes themselves, not on how much the
+        // server has handed over. Delivered bytes say nothing about whether a
+        // checkpoint landed, and waiting on them is how the first version of
+        // this ended up interrupting a job whose segments were all still
+        // pending. This waits for the thing the assertion below needs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
             tokio::select! {
                 _ = &mut run => panic!("the run finished before it could be interrupted"),
                 () = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
-            if server.delivered.load(Ordering::Relaxed) > 64 * 1024 {
+            if engine.durable_bytes().await.unwrap_or(0) > 0 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the transfer never got under way"
+                "nothing was ever committed, so there was no crash to stage: \
+                 {} bytes delivered",
+                server.delivered.load(Ordering::Relaxed)
             );
         }
         // Leaving this scope is what drops the future. Dropping `run` would
@@ -1089,13 +1102,132 @@ async fn a_job_a_crash_left_mid_transfer_is_settled_when_the_service_opens() {
     let _ = stop.send(());
     let _ = running.await;
 
-    // Anything that rests is an answer. `Transferring` is not one: nothing is
-    // transferring, and nothing will.
-    assert!(
-        matches!(
-            found.state.as_str(),
-            "Paused" | "NeedsAction" | "Queued" | "Failed" | "Verifying" | "Completed"
-        ),
+    // Paused, and only paused.
+    //
+    // An accept-list of "anything that rests" was the first version, and it
+    // included `Verifying` -- which for the service is not a resting state at
+    // all but the other stuck one, so the test would have passed on exactly the
+    // defect beside this one. It also allowed `Queued`, which the scheduler may
+    // start, making the answer a race. The engine settles an interrupted
+    // transfer to `Paused`; that is the claim, so that is the assertion.
+    assert_eq!(
+        found.state, "Paused",
         "a job a crash left mid-transfer was not settled by the service: {found:?}"
     );
+    assert!(
+        found.durable_bytes > 0,
+        "nothing was committed before the interruption, so this settles an \
+         empty map rather than a crash mid-transfer: {found:?}"
+    );
+}
+
+/// A crash during publication is reconciled when the service opens.
+///
+/// `Publishing` was the worst of the mid-flight states and the last one left.
+/// The service handed the scheduler only `Queued | RetryWait`, so the job was
+/// never given to anyone -- and `resume_publish`, the only thing that reconciles
+/// an interrupted publication against the destination, never ran. Unlike the
+/// others it could not be cancelled or paused either: the domain refuses both
+/// while a publication is in progress. It had no exit at all, and `List`
+/// answered "Publishing" for ever.
+///
+/// A review found it while checking the fix for the state beside it, which had
+/// closed four of the six and left this one open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_during_publication_is_reconciled_when_the_service_opens() {
+    let body = content(256 * 1024);
+    let (port, _) = serve_file(body.clone(), 0);
+    let state = Directory::new("resident-publishing");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    // A job that got as far as publishing and was interrupted there. Reaching
+    // that state honestly means letting a run publish, then putting the record
+    // back to where the crash would have left it -- which is what the durable
+    // publish intent is for: it is written before the link and survives.
+    let one_shot = EngineConfig {
+        destination: destination.clone(),
+        ..settings(&state)
+    };
+    let engine = Engine::open(one_shot, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), engine.run(receiver))
+        .await
+        .expect("the first run did not come back");
+    // On a platform that cannot publish there is no publication to interrupt,
+    // and the rest of this is about one.
+    if !PUBLISHES {
+        assert!(outcome.is_ok(), "the transfer failed: {outcome:?}");
+        return;
+    }
+    assert!(outcome.is_ok(), "the transfer failed: {outcome:?}");
+    drop(engine);
+
+    // The file is at the destination and the record says Completed. Putting the
+    // record back to `Publishing` is exactly the state a crash between the link
+    // and the commit leaves, and it is the state this test is about.
+    let record = state.engine().join("state").join("admission.sqlite");
+    let connection = rusqlite::Connection::open(&record).unwrap();
+    let publishing: i64 = 8;
+    let changed = connection
+        .execute("UPDATE job_state SET state=?1 WHERE job_id=1", [publishing])
+        .unwrap();
+    assert_eq!(changed, 1, "the job record was not put back to Publishing");
+    // And the intent with it. A publication that was interrupted still has one:
+    // it is written before the seal and before the link, and removed only when
+    // the publication is committed. Staging the state without it would stage a
+    // job nothing can reconcile, which is a different case -- and the first
+    // version of this test did exactly that, proving only that the job settles.
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO publish_intents(job_id, generation, attempt, size, digest) \
+             VALUES (1, 1, 1, ?1, ?2)",
+            rusqlite::params![body.len() as i64, expected_digest(&body).to_vec()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let address = endpoint("resident-publishing");
+    let serving = reopen(&state).await.bind(address.clone()).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+
+    // It settles, rather than sitting in a state that means work is under way.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let settled = loop {
+        let listed = ask(&mut client, 1, &Request::List { after: None })
+            .await
+            .unwrap();
+        let Response::Jobs { jobs, .. } = listed else {
+            panic!("the engine refused to list: {listed:?}");
+        };
+        let found = jobs.first().expect("the job is in the record").clone();
+        if found.state != "Publishing" {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a crash during publication was never reconciled: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let _ = stop.send(());
+    let _ = running.await;
+
+    // Our own bytes are already at the destination, so the reconciliation
+    // completes the job rather than publishing anything a second time.
+    assert_eq!(
+        settled.state, "Completed",
+        "the reconciliation did not recognise the file it had published: {settled:?}"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), body);
 }

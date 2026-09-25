@@ -433,7 +433,24 @@ impl Coordinator {
                     step(repository, &mut job, JobCommand::WorkersDrained).await?;
                 }
             }
-            JobState::Stopping => step(repository, &mut job, JobCommand::WorkersDrained).await?,
+            JobState::Stopping => {
+                step(repository, &mut job, JobCommand::WorkersDrained).await?;
+                // The drain lands on whichever stop target was persisted, and
+                // one of them is `Verifying`: a job that had just committed its
+                // last durable bytes when the crash came. That is not a state
+                // anything rests in -- the service does not restore it, so the
+                // job would sit there exactly as the crash left it, fully
+                // downloaded and never verified. The `Pause` above is re-checked
+                // for the same reason; this is the other place the same need
+                // arises, and a review found it by driving the persisted form
+                // through the one step this arm applies.
+                if job.state() == JobState::Verifying {
+                    step(repository, &mut job, JobCommand::Pause).await?;
+                    if job.state() == JobState::Stopping {
+                        step(repository, &mut job, JobCommand::WorkersDrained).await?;
+                    }
+                }
+            }
             JobState::Cancelling => {
                 // A cancellation interrupted by a crash still keeps nothing.
                 self.drop_part(&job, PartCleanup::Unknown).await;
