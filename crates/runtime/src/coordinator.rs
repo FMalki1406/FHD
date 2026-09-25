@@ -104,6 +104,25 @@ enum Failure {
     Panicked,
 }
 
+/// What asking about an unconfirmed job's destination established.
+///
+/// Three answers, not two, because "the destination does not hold it" and "this
+/// is not a job that question applies to" are different things and only the
+/// first is about the filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// The destination holds the file that was to be published, so the job is
+    /// completed on that evidence.
+    Published,
+    /// The destination was looked at and does not hold it. **Not** evidence the
+    /// file was never delivered: a folder can be renamed.
+    NotAtDestination,
+    /// No such job, or one this question cannot resolve -- another state,
+    /// another reason, or no record of what it was about to publish. Nothing
+    /// was looked at.
+    NotThisJob,
+}
+
 /// Why a part is being dropped, which decides whether it may be kept.
 ///
 /// A review warned that the retention guard would leak, because `drop_part` is
@@ -346,17 +365,22 @@ impl Coordinator {
     /// conclude anything from an absent or different file -- that stays unknown,
     /// which is the whole reason this state exists -- so `Ok(false)` means "not
     /// resolved", never "not delivered".
-    pub async fn resolve_unconfirmed(&self, id: fhd_domain::JobId) -> Result<bool, RunError> {
+    pub async fn resolve_unconfirmed(&self, id: fhd_domain::JobId) -> Result<Resolved, RunError> {
         let repository = self.ports.repository.as_ref();
         let jobs = repository
             .load_jobs()
             .await
             .map_err(|_| RunError::Repository)?;
+        // Each of these says something different, and answering them all with
+        // one code told the caller a filesystem fact about four situations that
+        // never touched the filesystem -- including a job that does not exist,
+        // which every other command answers as such. A review named it as the
+        // one place this surface claimed more than it had looked at.
         let Some(mut job) = jobs.into_iter().find(|job| job.id() == id) else {
-            return Ok(false);
+            return Ok(Resolved::NotThisJob);
         };
         if job.state() != JobState::NeedsAction || job.reason() != Some(StopReason::Unconfirmed) {
-            return Ok(false);
+            return Ok(Resolved::NotThisJob);
         }
         let Some(intent) = repository
             .publish_intent(id)
@@ -365,8 +389,9 @@ impl Coordinator {
             .filter(|intent| intent.generation() == job.generation())
         else {
             // No intent of this generation: nothing recorded what would have
-            // been published, so there is nothing to compare against.
-            return Ok(false);
+            // been published, so there is nothing to compare against. Not a
+            // statement about the destination either.
+            return Ok(Resolved::NotThisJob);
         };
         let destination = self
             .ports
@@ -389,11 +414,12 @@ impl Coordinator {
                 // and no longer a record of something that may have happened.
                 step(repository, &mut job, JobCommand::PublishCommitted).await?;
                 self.drop_part(&job, PartCleanup::Published).await;
-                Ok(true)
+                Ok(Resolved::Published)
             }
             // A file of another size, another content, or none at all. None of
-            // those is evidence against delivery, so the state stands.
-            _ => Ok(false),
+            // those is evidence against delivery, so the state stands. This is
+            // the only answer here that is about the destination.
+            _ => Ok(Resolved::NotAtDestination),
         }
     }
 

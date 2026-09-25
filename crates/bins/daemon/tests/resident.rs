@@ -864,8 +864,7 @@ async fn the_file_at_the_destination_resolves_an_unconfirmed_job_and_nothing_els
         "a question that resolved nothing removed the part"
     );
 
-    // A file that is not ours is not an answer either: same size would still be
-    // the wrong bytes, and this one is neither.
+    // A file of another size is not an answer.
     std::fs::write(&destination, b"not the download").unwrap();
     let wrong = ask(&mut client, 4, &Request::Confirm { job })
         .await
@@ -873,6 +872,26 @@ async fn the_file_at_the_destination_resolves_an_unconfirmed_job_and_nothing_els
     assert!(
         matches!(&wrong, Response::Failed { code } if code == "UNCONFIRMED-NOT-AT-DESTINATION"),
         "a different file was treated as ours: {wrong:?}"
+    );
+
+    // Nor is a file of exactly the right size holding the wrong bytes -- the
+    // case the digest exists for, and the only one that makes it do any work.
+    //
+    // The line above cannot reach it: `inspect` refuses to hash a file whose
+    // size is not the recorded size, so a sixteen-byte stand-in is rejected on
+    // size and the digest is never compared. A security review demonstrated
+    // that by relaxing the digest check to `|| true` and watching the whole
+    // suite pass. One flipped byte is the difference between a test of "size
+    // and digest" and a test of size.
+    let mut flipped = body.clone();
+    flipped[body.len() / 2] ^= 0xff;
+    std::fs::write(&destination, &flipped).unwrap();
+    let wrong_bytes = ask(&mut client, 5, &Request::Confirm { job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&wrong_bytes, Response::Failed { code } if code == "UNCONFIRMED-NOT-AT-DESTINATION"),
+        "a file of the right size holding the wrong bytes was treated as ours: {wrong_bytes:?}"
     );
 
     // And the file itself, which is the evidence the state was waiting for.
@@ -925,4 +944,70 @@ async fn the_file_at_the_destination_resolves_an_unconfirmed_job_and_nothing_els
         "the file was touched by the question about it"
     );
     assert!(!part.exists(), "a resolved job kept its part");
+}
+
+/// Asking about a job this question cannot resolve says so, rather than making
+/// a claim about a destination nobody looked at.
+///
+/// One code used to answer five situations, four of which never touched the
+/// filesystem -- including a job that does not exist, which every other command
+/// answers as such. A review named it as the one place this surface said more
+/// than it had checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_this_question_cannot_resolve_is_told_apart_from_an_absent_file() {
+    let body = content(64 * 1024);
+    let (port, _) = serve_file(body.clone(), 0);
+    let state = Directory::new("confirm-other");
+    let downloads = state.0.join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("wanted.bin");
+    let address = endpoint("confirm-other");
+
+    let serving = Resident::open(settings(&state))
+        .await
+        .unwrap()
+        .bind(address.clone())
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let running = tokio::spawn(async move {
+        serving
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut client = connect(&address).await.unwrap();
+
+    // A job nobody has.
+    let unknown = ask(&mut client, 1, &Request::Confirm { job: 4242 })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&unknown, Response::Failed { code } if code == "ENGINE-INVALID-INPUT"),
+        "a job that does not exist was answered with a fact about a destination: {unknown:?}"
+    );
+
+    // And one that exists but is not in this state: the answer is the same, and
+    // it is not the one that talks about the destination.
+    let url = format!("http://127.0.0.1:{port}/file");
+    let accepted = ask(
+        &mut client,
+        2,
+        &add(url, &destination, expected_digest(&body)),
+    )
+    .await
+    .unwrap();
+    let Response::Accepted { job, .. } = accepted else {
+        panic!("the engine refused the request: {accepted:?}");
+    };
+    let running_job = ask(&mut client, 3, &Request::Confirm { job })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&running_job, Response::Failed { code } if code == "ENGINE-INVALID-INPUT"),
+        "a job in another state was answered with a fact about a destination: {running_job:?}"
+    );
+
+    let _ = stop.send(());
+    let _ = running.await;
 }

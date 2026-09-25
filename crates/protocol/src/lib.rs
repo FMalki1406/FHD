@@ -232,6 +232,15 @@ pub const WARNINGS: [&str; 1] = ["DESTINATION-SHARED"];
 /// has a limit to enforce rather than a list to trust.
 pub const MAX_WARNINGS: usize = 8;
 
+/// The answer to `Confirm` when the destination was looked at and does not hold
+/// the file.
+///
+/// Declared here rather than spelled inline where it is produced, because a
+/// client prints it and a code only one crate knows is a code nobody can rely
+/// on. It says what was found, never what is true of the file: a destination
+/// that does not hold it is not evidence it was never delivered.
+pub const UNCONFIRMED_NOT_AT_DESTINATION: &str = "UNCONFIRMED-NOT-AT-DESTINATION";
+
 /// Why a job is waiting for a person, as it crosses this boundary.
 ///
 /// Warnings were enumerated here and reasons were not, so a reason was a free
@@ -440,6 +449,7 @@ mod tests {
             Request::Pause { job: 1 },
             Request::Resume { job: 2 },
             Request::Cancel { job: 3 },
+            Request::Confirm { job: 4 },
             Request::Shutdown,
         ] {
             let frame = encode_request(42, &request).unwrap();

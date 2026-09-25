@@ -13,6 +13,7 @@ use fhd_persistence::{Limits, SqliteRepository};
 use fhd_protocol::{AddRequest, JobSummary, Request, Response, MAX_JOBS_PER_PAGE};
 use fhd_runtime::{
     buffers::BufferPool,
+    coordinator::Resolved,
     coordinator::{Coordinator, CoordinatorConfig, Ports},
     origin::{OriginGovernor, OriginLimits},
     scheduler::{Applied, Command, Scheduler, SchedulerConfig},
@@ -584,13 +585,19 @@ impl Handler for Service {
                     .await
                     .map_err(EngineError::Run)
                 {
-                    Ok(true) => Response::Done,
-                    // Not resolved: no such job, a different state, or a
-                    // destination that does not hold the file. None of those is
-                    // evidence the file was never delivered, so the job is left
-                    // exactly as it was and the operator is told nothing changed.
-                    Ok(false) => Response::Failed {
-                        code: "UNCONFIRMED-NOT-AT-DESTINATION".into(),
+                    Ok(Resolved::Published) => Response::Done,
+                    // Looked at, and the file is not there. The job is left
+                    // exactly as it was, because this is not evidence it was
+                    // never delivered.
+                    Ok(Resolved::NotAtDestination) => Response::Failed {
+                        code: fhd_protocol::UNCONFIRMED_NOT_AT_DESTINATION.into(),
+                    },
+                    // Nothing was looked at: no such job, or not one this
+                    // question applies to. Answered as every other command
+                    // answers a job it cannot act on, rather than as a claim
+                    // about a destination nobody inspected.
+                    Ok(Resolved::NotThisJob) => Response::Failed {
+                        code: "ENGINE-INVALID-INPUT".into(),
                     },
                     Err(error) => Response::Failed {
                         code: crate::code(&error),

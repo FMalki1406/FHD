@@ -220,10 +220,18 @@ async fn client_run(state: PathBuf, mut args: impl Iterator<Item = String>) -> !
             // "done" and exit zero, leaving the operator believing both were
             // cancelled -- and this refusal happens before anything is sent.
             refuse_extra(args);
+            // Every word spelled out, and the catch-all is a refusal rather than
+            // the destructive one. A review pointed out what the fall-through
+            // was: add a fourth word to the arm above, forget it here, and it
+            // silently becomes `cancel`.
             match command.as_str() {
                 "pause" => Request::Pause { job },
+                "cancel" => Request::Cancel { job },
                 "confirm" => Request::Confirm { job },
-                _ => Request::Cancel { job },
+                _ => {
+                    eprintln!("{}", usage());
+                    std::process::exit(2);
+                }
             }
         }
         "stop" => {
