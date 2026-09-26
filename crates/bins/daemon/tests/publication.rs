@@ -121,11 +121,9 @@ fn attested(part: &mut dyn SegmentFile) -> Vec<(ByteRange, [u8; 32])> {
 /// **The gate.** The source name is taken over at the boundary, and what gets
 /// published must still be the bytes that were proved.
 ///
-/// Windows only, because that is the only platform with a mechanism. Elsewhere
-/// publication refuses, which is a different property with its own test in the
-/// storage adapter, and the support is tracked per platform rather than
-/// inferred from this one passing.
-#[cfg(windows)]
+/// This exercises the real mechanism on Windows and Linux. macOS still refuses
+/// publication, which is a separate outcome checked in the storage adapter.
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn publication_carries_the_proved_bytes_though_the_source_name_is_taken() {
     let directory = Directory::new("publish-substitute");
@@ -176,7 +174,7 @@ fn publication_carries_the_proved_bytes_though_the_source_name_is_taken() {
 
 /// An occupied destination is refused and its contents are untouched, through
 /// the same mechanism.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn publication_never_replaces_a_file_that_is_already_there() {
     let directory = Directory::new("publish-occupied");
@@ -239,7 +237,7 @@ fn publication_never_replaces_a_file_that_is_already_there() {
 /// So this is not a passing test dressed as a guarantee. It records the shape
 /// of the window and the identity that fits through it, so that a later change
 /// which widens either is visible.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
     struct WriteThenLink {
@@ -334,7 +332,7 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
 /// volume here they are `Authenticated Users: Modify`, which carries `DELETE`,
 /// so on such a folder the answer is yes. That is the declared ceiling -- a
 /// download is protected up to the permissions of the folder chosen for it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
     struct SwapFolderThenLink {
