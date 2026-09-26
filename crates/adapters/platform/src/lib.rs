@@ -16,10 +16,9 @@
 // fails the build, and every allowance is named in `tools/check-architecture.mjs`
 // against the item it sits on.
 //
-// There are three: `our_uid` calls `geteuid(2)`; `link_into_directory` calls
-// `linkat(2)`, which is the only way to publish into a directory handle without
-// resolving a path; and `source_name` calls `fcntl(F_GETPATH)` on the systems
-// with no `/proc`, which is how a descriptor is named there at all.
+// There are two off Windows: `our_uid` calls `geteuid(2)`, and the Linux
+// `link_into_directory` calls `linkat(2)` using the held source and directory.
+// macOS has no corresponding publication call and refuses publication.
 #![cfg_attr(not(windows), deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -125,10 +124,15 @@ impl ForeignWriters {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::ffi::{CString, OsStr};
+    #[cfg(target_os = "linux")]
     use std::fs::File;
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(target_os = "linux")]
     use std::os::unix::io::AsRawFd;
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     /// Not available without a platform call this crate does not yet make.
@@ -150,9 +154,10 @@ mod imp {
     /// AT_SYMLINK_FOLLOW)`. The magic symlink under `/proc/self/fd` resolves to
     /// the inode the descriptor holds, and `AT_SYMLINK_FOLLOW` makes `linkat`
     /// follow it to that inode rather than linking the symlink -- so the object
-    /// published is the object verified, even if every name it ever had has
-    /// since been taken over. The destination is `dirfd` plus one component, so
-    /// no path is resolved there either.
+    /// published is the object verified when the kernel permits linking it.
+    /// The destination is `dirfd` plus one component, so no destination parent
+    /// path is resolved again. The case where the source has no remaining name
+    /// has not been measured and is not needed to prove a successful link safe.
     ///
     /// `AT_EMPTY_PATH` would say this more directly and is not usable: for
     /// `linkat` the kernel requires `CAP_DAC_READ_SEARCH` for it, which a
@@ -161,21 +166,12 @@ mod imp {
     /// use. Its cost is a dependency on `/proc` being mounted; where it is not,
     /// this fails rather than falling back to a path.
     ///
-    /// **macOS.** There is no `/proc` and no `AT_EMPTY_PATH`, so no route from a
-    /// descriptor to a new name exists in the documented surface. `F_GETPATH`
-    /// answers with a path, which is the thing being avoided -- it is a name the
-    /// file had a moment ago, not the object. So this call is `linkat` from that
-    /// path, and **the identity of what was created is proved afterwards** by
-    /// comparing the destination against this descriptor; the port already has
-    /// `same_object` for that, and publication already refuses to claim a path
-    /// it cannot verify. What cannot be claimed on macOS is that the window
-    /// between reading the path and linking it does not exist; what is claimed
-    /// is that a file landing there that is not ours is detected rather than
-    /// published as ours.
+    /// **macOS.** This function is Linux-only. macOS currently refuses
+    /// publication; a prior `F_GETPATH` proposal was rejected because it would
+    /// re-resolve the source name between verification and linking.
     ///
-    /// **Never replaces.** `linkat` fails with `EEXIST` on an occupied name on
-    /// both systems, which surfaces as `AlreadyExists`, exactly as the Windows
-    /// call does with `ReplaceIfExists = false`.
+    /// **Never replaces.** `linkat` fails with `EEXIST` on an occupied name,
+    /// which surfaces as `AlreadyExists`.
     ///
     /// **A failure creates nothing.** `linkat` is one system call: it either
     /// creates the name or reports why it did not. The port's contract requires

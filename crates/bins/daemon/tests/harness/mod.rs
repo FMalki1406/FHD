@@ -22,7 +22,7 @@ use std::{
 /// below assert against, and `publication_support_on_this_platform_is_declared`
 /// is what ties it to the engine's actual behaviour, so the two cannot drift
 /// into a suite that passes while nothing works.
-pub const PUBLISHES: bool = cfg!(windows);
+pub const PUBLISHES: bool = cfg!(any(windows, target_os = "linux"));
 
 /// Whether a part beside `destination` holds exactly `body`.
 ///

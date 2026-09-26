@@ -263,12 +263,11 @@ fn inspect_found_directory(directory: &Path) -> Result<(), AppError> {
 /// runs -- so between proving the bytes and naming them, the name can be made
 /// to mean another file. Measured, and it published the other file's bytes.
 ///
-/// **Windows has a mechanism and Unix does not yet.** `linkat` through
-/// `/proc/self/fd` on Linux and `/dev/fd` on macOS are candidates and neither is
-/// measured, so neither is claimed here. Until one is, publication on those
-/// platforms refuses with `Unsupported` rather than linking by name: the
-/// fallback is the behaviour being replaced, and taking it quietly would leave
-/// the same hole under a new arrangement.
+/// Windows links from handles, and Linux links through the held descriptor's
+/// entry under `/proc/self/fd`. macOS still refuses with `Unsupported`; linking
+/// from a recovered source path would reintroduce the substitution this port
+/// exists to prevent. Linux needs an end-to-end download test before it can be
+/// counted as supported.
 struct PlatformLinker;
 
 impl fhd_app::storage::HandleLinker for PlatformLinker {
@@ -327,11 +326,10 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
         // `docs/publication-contract.md`.
         #[cfg(target_os = "linux")]
         {
-            // The same mapping as Windows, from the same kinds. `Unsupported`
-            // keeps its meaning -- a system with no mechanism -- and now covers
-            // the two ways `linkat` says so: a filesystem that has no hard links
-            // at all, and a destination on another device, which no link can
-            // cross on any system.
+            // The same mapping as Windows, from the same kinds. A filesystem
+            // without hard links or a cross-device destination is unsupported.
+            // Missing procfs can instead surface as Io(NotFound); there is no
+            // fallback to a source path in either case.
             fhd_platform::link_into_directory(file, directory, name).map_err(|error| {
                 match error.kind() {
                     std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
