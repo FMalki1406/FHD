@@ -38,7 +38,9 @@ use fhd_storage::FileStorage;
 use harness::Directory;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
