@@ -2173,13 +2173,26 @@ fn volume_of(path: &Path) -> Option<std::ffi::OsString> {
 /// `a_destination_on_a_second_volume_downloads_and_publishes` uses, and the
 /// support matrix in `docs/feature-download-to-a-different-disk.md` records these
 /// as coverage the default suite does not carry.
-fn second_volume(state: &Directory) -> Option<PathBuf> {
-    let elsewhere = std::env::var_os("FHD_SECOND_VOLUME")
+fn second_volume(state: &Directory, label: &str) -> Option<PathBuf> {
+    let root = std::env::var_os("FHD_SECOND_VOLUME")
         .map(PathBuf::from)
         .expect(
             "this test needs FHD_SECOND_VOLUME to name a writable directory on \
              another volume; without it the cross-volume claim is uncovered",
         );
+    // A directory of its own per test, for the same reason the state side gets
+    // one. `.fhd-parts` lives beside the destination, so two tests sharing a
+    // destination folder share it -- and each one's "nothing left beside the
+    // destination" assertion then reads the other's parts. Measured: both tests
+    // passed alone and failed together until this was split.
+    let elsewhere = root.join(format!(
+        "{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     std::fs::create_dir_all(&elsewhere).expect("the second-volume directory is usable");
     assert_ne!(
         volume_of(&state.engine()),
@@ -2214,7 +2227,7 @@ fn second_volume(state: &Directory) -> Option<PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_download_to_a_second_volume_resumes_across_a_restart_and_matches_its_digest() {
     let state = Directory::new("second-volume-resume");
-    let Some(elsewhere) = second_volume(&state) else {
+    let Some(elsewhere) = second_volume(&state, "resume") else {
         return;
     };
     let destination = elsewhere.join(format!("fhd-resume-{}.bin", std::process::id()));
@@ -2353,7 +2366,7 @@ async fn a_download_to_a_second_volume_resumes_across_a_restart_and_matches_its_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
     let state = Directory::new("cross-volume-link");
-    let Some(elsewhere) = second_volume(&state) else {
+    let Some(elsewhere) = second_volume(&state, "link") else {
         return;
     };
 
@@ -2400,4 +2413,155 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
         "a refused cross-volume link disturbed the source"
     );
     let _ = std::fs::remove_dir_all(&folder_path);
+}
+
+/// **A crash at each publication stage, with the record and the part on
+/// different disks.**
+///
+/// The four stages themselves are already measured at the storage port, on one
+/// volume: `a_crash_before_the_link_began_publishes_on_the_next_run` and
+/// `a_crash_during_or_after_the_link_neither_retries_nor_reopens` in
+/// `fhd-storage`, and the sealed-after-a-crash and reconciled-publication tests
+/// in `crates/bins/daemon/tests/publication.rs`. This does not repeat them.
+///
+/// What it adds is the dimension this phase is about: **the record and the bytes
+/// are on different filesystems.** A crash leaves the job record in SQLite under
+/// the state directory on one disk and the part's own record in
+/// `.fhd-parts/<engine>/1-1.meta` on the other, and recovery has to read both and
+/// agree with itself. If the two ever disagreed about what stage publication
+/// reached, the wrong answer would be either refetching a file the user already
+/// has, or unsealing one.
+///
+/// Two stages, because they are the two answers:
+///
+/// * `Sealed` -- the link had not begun, so no name leads to these bytes and
+///   nothing can be anyone's file. It may publish on the next run.
+/// * `Attempted` -- the link may or may not have been made, so the file may
+///   already be the user's. It must **not** publish again and must **not** become
+///   writable, whichever disk it is on.
+///
+/// Ignored by default for the same reason as its siblings: it needs a second
+/// writable volume, and a test that passes where it cannot run is worse than one
+/// that is not run.
+#[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_at_each_publication_stage_recovers_with_the_record_on_another_disk() {
+    for stage in ["sealed", "attempted"] {
+        let state = Directory::new(&format!("cross-volume-crash-{stage}"));
+        let Some(elsewhere) = second_volume(&state, &format!("crash-{stage}")) else {
+            return;
+        };
+        let destination = elsewhere.join(format!("fhd-{stage}-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&destination);
+        let bystander = elsewhere.join(format!("fhd-bystander-{}.bin", std::process::id()));
+        std::fs::write(&bystander, b"not ours to touch").unwrap();
+
+        let body = content(6 * 1024 * 1024);
+        let server = harness::serve_slowly(body.clone(), 64 * 1024, Duration::from_millis(1));
+        let url = format!("http://127.0.0.1:{}/file", server.port);
+        // `(meta, part)`, in that order. I wrote it the other way round first and
+        // patched byte 33 of the **data file** instead of the record, so the crash
+        // never happened: the engine legitimately refetched and published, and I
+        // nearly recorded that as a defect. The order is what the sibling callers
+        // use and what `paused_part` returns.
+        let (meta, part) = paused_part(&state, &destination, &server, body.len() as u64).await;
+
+        // The part really is on the other disk, and the record really is not.
+        assert_ne!(
+            volume_of(&part),
+            volume_of(&state.engine()),
+            "{stage}: the part is on the state volume, so nothing crossed"
+        );
+        assert!(
+            part.exists() && meta.exists(),
+            "{stage}: no part was left to crash on"
+        );
+
+        // The crash: the stage the part was in when the process died. Written
+        // straight into the byte the format keeps it in, which is what a restart
+        // would actually find.
+        let mut record = std::fs::read(&meta).unwrap();
+        record[33] = match stage {
+            "sealed" => 1, // SEALED
+            _ => 3,        // SEALED | ATTEMPTED
+        };
+        std::fs::write(&meta, &record).unwrap();
+        let bytes_before = std::fs::metadata(&part).unwrap().len();
+        // Sampled after the server goes quiet. A chunk from the paused run can still
+        // be draining, and an exact comparison then fails by a byte for reasons that
+        // have nothing to do with refetching -- it failed here by exactly one.
+        server.quiet(Duration::from_secs(30)).await;
+        let delivered_before = server.delivered.load(Ordering::Relaxed);
+
+        // Reopened on the same state directory: a restart.
+        let resumed = Engine::open(resuming(&state, destination.clone(), 2), &url)
+            .await
+            .unwrap();
+        let (_control, receiver) = mpsc::channel(1);
+        let outcome = tokio::time::timeout(Duration::from_secs(180), resumed.run(receiver))
+            .await
+            .expect("the run after the crash did not settle within 180s");
+        let reason = resumed.reason().await.unwrap();
+        drop(resumed);
+
+        match stage {
+            // No name led to those bytes, so finishing and publishing is right.
+            "sealed" => {
+                match outcome.expect("the run after a sealed crash failed") {
+                    SessionEnd::Published(Published::At(path)) => assert_eq!(
+                        std::fs::canonicalize(&path).unwrap(),
+                        std::fs::canonicalize(&destination).unwrap()
+                    ),
+                    other => panic!("sealed: not published: {other:?}, reason {reason:?}"),
+                }
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    body,
+                    "sealed: the published bytes are not the bytes that were served"
+                );
+            }
+            // The file may already be the user's. It must not be published a
+            // second time and its bytes must not be rewritten.
+            _ => {
+                assert!(
+                    !matches!(outcome, Ok(SessionEnd::Published(_))),
+                    "attempted: an undecidable publication was retried: {outcome:?}"
+                );
+                // The part is still there, still its size, still sealed against
+                // writing -- the record was not lifted because the record on the
+                // other disk said the attempt had begun.
+                assert!(part.exists(), "attempted: the part was removed");
+                assert_eq!(
+                    std::fs::metadata(&part).unwrap().len(),
+                    bytes_before,
+                    "attempted: the part was rewritten"
+                );
+                let after = std::fs::read(&meta).unwrap();
+                assert_ne!(
+                    after[33], 0,
+                    "attempted: the part was unsealed, so a delivered file could be \
+                     rewritten under the user"
+                );
+                // And nothing was refetched: asking the server again for a file
+                // that may already be delivered is the other wrong answer.
+                let fetched = server
+                    .delivered
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(delivered_before);
+                assert!(
+                    fetched < 1024 * 1024,
+                    "attempted: the engine refetched {fetched} bytes of a file that may \n                     already be delivered, from a {} byte body",
+                    body.len()
+                );
+            }
+        }
+
+        assert_eq!(
+            std::fs::read(&bystander).unwrap(),
+            b"not ours to touch",
+            "{stage}: an unrelated file on the destination disk was touched"
+        );
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(&bystander);
+    }
 }
