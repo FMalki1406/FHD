@@ -2157,3 +2157,247 @@ async fn corrupt_bytes_on_a_part_that_may_be_delivered_are_not_replaced() {
     );
     assert!(!destination.exists(), "a second copy was published");
 }
+
+/// The volume of a path, for tests that must prove two paths are on different
+/// ones rather than assume it.
+fn volume_of(path: &Path) -> Option<std::ffi::OsString> {
+    path.components()
+        .next()
+        .map(|component| component.as_os_str().to_ascii_lowercase())
+}
+
+/// A directory on a second volume, or `None` after saying why this run is not
+/// measuring one.
+///
+/// `FHD_SECOND_VOLUME` is the same switch
+/// `a_destination_on_a_second_volume_downloads_and_publishes` uses, and the
+/// support matrix in `docs/feature-download-to-a-different-disk.md` records these
+/// as coverage the default suite does not carry.
+fn second_volume(state: &Directory) -> Option<PathBuf> {
+    let elsewhere = std::env::var_os("FHD_SECOND_VOLUME")
+        .map(PathBuf::from)
+        .expect(
+            "this test needs FHD_SECOND_VOLUME to name a writable directory on \
+             another volume; without it the cross-volume claim is uncovered",
+        );
+    std::fs::create_dir_all(&elsewhere).expect("the second-volume directory is usable");
+    assert_ne!(
+        volume_of(&state.engine()),
+        volume_of(&elsewhere),
+        "FHD_SECOND_VOLUME is on the same volume as the state directory, so this \
+         would pass without crossing anything"
+    );
+    if !PUBLISHES {
+        eprintln!("skipped: this build does not publish on this platform");
+        return None;
+    }
+    Some(elsewhere)
+}
+
+/// **A download to a second volume survives the engine being closed and reopened,
+/// resumes the bytes it does not have, and publishes a file matching its digest.**
+///
+/// The sibling test proves a cross-volume download publishes in one run. This
+/// asks what that one does not: the part lives beside the destination, so across
+/// a restart the engine has to find it **on the other volume**, decide what it
+/// already holds, fetch only the rest, and publish -- with the record and the
+/// payload on different filesystems throughout.
+///
+/// The digest is declared up front, so publication is refused unless the bytes
+/// assembled across two runs hash to what was expected. That is what makes
+/// "resumed" mean the file is right rather than merely present.
+///
+/// Ignored by default: a second writable volume is not on every machine or
+/// runner, and a test that quietly passes where it cannot run is worse than one
+/// that is not run at all.
+#[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_download_to_a_second_volume_resumes_across_a_restart_and_matches_its_digest() {
+    let state = Directory::new("second-volume-resume");
+    let Some(elsewhere) = second_volume(&state) else {
+        return;
+    };
+    let destination = elsewhere.join(format!("fhd-resume-{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&destination);
+
+    // Large enough to cross the 8 MiB checkpoint before the pause, and delivered
+    // slowly so the pause lands mid-transfer. Both matter: with a body under the
+    // checkpoint nothing is ever committed, and a restart then has nothing to
+    // resume from -- which is how an earlier test in this project came to settle
+    // an empty map and call it a crash. A dropped connection is no substitute
+    // either, because the engine retries inside the same run and never restarts.
+    let body = content(24 * 1024 * 1024);
+    let server = harness::serve_slowly(body.clone(), 64 * 1024, Duration::from_millis(1));
+    let url = format!("http://127.0.0.1:{}/file", server.port);
+    let mut settings = config(&state, destination.clone(), 2);
+    settings.expected_sha256 = Some(expected_digest(&body));
+
+    let engine = Engine::open(settings, &url).await.unwrap();
+    let (control, receiver) = mpsc::channel(1);
+    let run = engine.run(receiver);
+    let delivered = server.delivered.clone();
+    let pause = async {
+        // Waits for **committed** bytes, not for delivered ones. Delivered says
+        // the server sent them; committed says the record will still know about
+        // them after the engine is gone, which is the thing a resume needs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if engine.durable_bytes().await.unwrap_or(0) > 0 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "nothing was committed in 90s ({} bytes delivered of {}), so the \
+                     pause would have had nothing to carry across the restart",
+                    delivered.load(Ordering::Relaxed),
+                    body.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = control.send(Control::Pause).await;
+    };
+    let (outcome, ()) = tokio::join!(run, pause);
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::Paused))),
+        "the run did not pause, so no restart was measured: {outcome:?}"
+    );
+
+    // Committed, and on the other volume beside the destination -- never under
+    // the state directory, which is the reason the volumes need not match.
+    let durable = engine.durable_bytes().await.unwrap();
+    assert!(
+        durable > 0,
+        "the pause did not leave committed bytes behind"
+    );
+    assert!(
+        durable < body.len() as u64,
+        "the whole file was committed before the pause, so nothing is left to resume"
+    );
+    assert!(
+        kept_beside(&destination) > 0,
+        "nothing was kept beside the destination on the second volume"
+    );
+    assert_eq!(
+        part_bytes(&state),
+        0,
+        "the part was written under the state directory, so nothing crossed volumes"
+    );
+    drop(engine);
+    let sent_before = delivered.load(Ordering::Relaxed);
+
+    // Reopened: a second `Engine::open` on the same state directory, which is
+    // what a restart is from the engine's point of view.
+    let mut again = resuming(&state, destination.clone(), 2);
+    again.expected_sha256 = Some(expected_digest(&body));
+    let resumed = Engine::open(again, &url).await.unwrap();
+    let (_control, receiver) = mpsc::channel(1);
+    let outcome = tokio::time::timeout(Duration::from_secs(180), resumed.run(receiver))
+        .await
+        .expect("the resumed run did not finish within 180s")
+        .unwrap();
+
+    let published = match &outcome {
+        SessionEnd::Published(Published::At(path)) => path.clone(),
+        other => panic!(
+            "not published: {other:?}, reason: {:?}",
+            resumed.reason().await.unwrap()
+        ),
+    };
+    assert_eq!(
+        std::fs::canonicalize(&published).unwrap(),
+        std::fs::canonicalize(&destination).unwrap()
+    );
+    // With the digest declared on both runs, matching bytes mean publication
+    // verified what two runs assembled rather than merely concatenating it.
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        body,
+        "the published bytes are not the bytes that were served"
+    );
+    // The second run fetched strictly less than the whole file, so it resumed
+    // from the committed bytes instead of starting over.
+    let second_run = delivered.load(Ordering::Relaxed) - sent_before;
+    assert!(
+        second_run < body.len() as u64,
+        "the resume refetched the whole file: {second_run} bytes after the restart, \
+         body {} bytes, {durable} committed before it",
+        body.len()
+    );
+    // Nothing is left on the second volume once the outcome is recorded.
+    assert_eq!(
+        kept_beside(&destination),
+        0,
+        "a part was left beside the destination after publication"
+    );
+    let _ = std::fs::remove_file(&destination);
+}
+
+/// **The publication mechanism refuses to cross volumes, which is *why* the part
+/// lives beside the destination.**
+///
+/// The measurement behind that design rather than an argument for it. A hard link
+/// cannot span filesystems -- `linkat` reports `EXDEV`, Windows reports
+/// `STATUS_NOT_SAME_DEVICE` -- so if the part were kept under the state directory,
+/// as it once was, a download whose destination was on another disk could never be
+/// published, and the engine would only find out after fetching and verifying
+/// every byte.
+///
+/// So this is the one operation in the publication path that `EXDEV` can reach,
+/// and the design's answer is to make it unreachable by construction. The test
+/// asks directly: a file on the state volume, a folder on the second volume, the
+/// real linker. Whatever comes back, **nothing was created and nothing was
+/// destroyed** -- a silent copy here would be the worst outcome, bytes at the
+/// destination that no handle vouches for.
+#[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
+    let state = Directory::new("cross-volume-link");
+    let Some(elsewhere) = second_volume(&state) else {
+        return;
+    };
+
+    let source_path = state.0.join("source.bin");
+    std::fs::write(&source_path, b"the proved bytes").unwrap();
+    let source = std::fs::File::open(&source_path).unwrap();
+    let folder_path = elsewhere.join(format!("fhd-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder_path);
+    std::fs::create_dir_all(&folder_path).unwrap();
+
+    // The destination folder as a handle, the way adoption takes it.
+    #[cfg(windows)]
+    let folder = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(BACKUP_SEMANTICS)
+            .open(&folder_path)
+            .unwrap()
+    };
+    #[cfg(not(windows))]
+    let folder = std::fs::File::open(&folder_path).unwrap();
+
+    let refused =
+        fhd_platform::link_into_directory(&source, &folder, std::ffi::OsStr::new("landed.bin"));
+
+    let error = refused.expect_err(
+        "a hard link spanned two volumes. No filesystem this project targets permits \
+         that, so if this ever passes, the part no longer has to live beside the \
+         destination and that design can be revisited",
+    );
+    eprintln!(
+        "cross-volume link refused with: {error:?} (kind {:?})",
+        error.kind()
+    );
+    assert!(
+        !folder_path.join("landed.bin").exists(),
+        "a refused cross-volume link left a name behind"
+    );
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        b"the proved bytes",
+        "a refused cross-volume link disturbed the source"
+    );
+    let _ = std::fs::remove_dir_all(&folder_path);
+}
