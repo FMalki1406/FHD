@@ -202,25 +202,43 @@ async fn aggregate_limit_covers_two_real_downloads() {
 async fn active_download_observes_live_job_and_global_changes() {
     use download_engine::{download_controlled, Bandwidth, TrafficControl};
     for global_slow in [false, true] {
-        let fixture = Fixture::new(b"live-rate".to_vec());
+        // With the old 1 byte/s policy, this body takes over half a minute.
+        // Releasing the policy after the first committed byte must let this
+        // *same* transfer finish well before the bounded deadline.
+        let bytes = vec![b'l'; 32];
+        let fixture = Fixture::new(bytes.clone());
         let budget = Bandwidth::new(if global_slow { Some(1) } else { None }).unwrap();
         let control =
             TrafficControl::with_global(budget.clone(), if global_slow { None } else { Some(1) })
                 .unwrap();
         let update = control.clone();
-        let changer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            update.set_job_rate(None).unwrap();
-            budget.set_limit(None).unwrap();
-        });
+        let changed = Arc::new(AtomicBool::new(false));
+        let observed = changed.clone();
         let (owner, cancel) = watch::channel(false);
-        let start = Instant::now();
-        let result = download_controlled(fixture.options(1, 1), cancel, control, |_| {})
-            .await
-            .unwrap();
-        assert!(start.elapsed() < Duration::from_secs(3));
-        assert_eq!(std::fs::read(result.path).unwrap(), b"live-rate");
-        changer.await.unwrap();
+        let mut transfer = Box::pin(download_controlled(
+            fixture.options(1, 1),
+            cancel,
+            control,
+            move |committed| {
+                if committed > 0 && !changed.swap(true, Ordering::AcqRel) {
+                    update.set_job_rate(None).unwrap();
+                    budget.set_limit(None).unwrap();
+                }
+            },
+        ));
+        // Do not drop a live transfer on timeout: disk work may still be in
+        // flight. Ask it to cancel, then await its cleanup before failing.
+        let result = match tokio::time::timeout(Duration::from_secs(10), &mut transfer).await {
+            Ok(result) => result,
+            Err(_) => {
+                owner.send_replace(true);
+                let _ = transfer.await;
+                panic!("a live rate change did not release the active transfer");
+            }
+        }
+        .unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(result.path).unwrap(), bytes);
         drop(owner);
     }
 }
