@@ -1,7 +1,7 @@
 //! Operating-system primitives the rest of the engine cannot express safely.
 //!
-//! This is the one crate Â§4 allows `unsafe`, and it exists for a single reason:
-//! Â§3.1's control surface needs a Windows named pipe that carries the user's SID
+//! This is the one crate §4 allows `unsafe`, and it exists for a single reason:
+//! §3.1's control surface needs a Windows named pipe that carries the user's SID
 //! and session in its name, is created with a security descriptor only that user
 //! can reach, and can be checked by the client for who owns it before it sends a
 //! byte. None of that is expressible without calling Win32 directly.
@@ -16,9 +16,19 @@
 // fails the build, and every allowance is named in `tools/check-architecture.mjs`
 // against the item it sits on.
 //
-// There are two off Windows: `our_uid` calls `geteuid(2)`, and the Linux
-// `link_into_directory` calls `linkat(2)` using the held source and directory.
-// macOS has no corresponding publication call and refuses publication.
+// There are five off Windows. Two are used: `our_uid` calls `geteuid(2)`, and the
+// Linux `link_into_directory` calls `linkat(2)` using the held source and
+// directory. Three are macOS measurement primitives that nothing in the engine
+// calls -- `clone_into_directory`, `open_in_directory`, `move_into_directory` --
+// and macOS still refuses publication. Section 11 of
+// `docs/publication-contract.md` says why they cannot be adopted as they stand.
+//
+// This comment said "two" and "macOS has no corresponding publication call"
+// while the crate already had all five. A security review had already caught the
+// same drift in `Cargo.toml`, and the commit that fixed the manifest left its
+// sibling here untouched -- the first thing any reviewer of this file reads. The
+// rule the manifest states applies to both: a new use is a change to that text,
+// to this text, and to the allowance list, all three reviewed together.
 #![cfg_attr(not(windows), deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -34,7 +44,7 @@ pub struct UserScope {
 }
 impl UserScope {
     /// A short, stable component for an endpoint name: it identifies the account
-    /// and session without being a secret, which is exactly Â§3.1's requirement.
+    /// and session without being a secret, which is exactly §3.1's requirement.
     pub fn tag(&self) -> String {
         format!("{}-{}", self.identity, self.session)
     }
@@ -290,10 +300,24 @@ mod imp {
     ///
     /// **Measured, not adopted**, like the clone it exists to pin. It is the
     /// second step of the path macOS would need: a clone has to be opened to be
-    /// held, and opening it by a path would hand back the window the whole
-    /// design removes. `openat` against the directory descriptor resolves only
-    /// the last component, and `O_NOFOLLOW` refuses a symlink sitting at that
-    /// name rather than following it somewhere else.
+    /// held. `openat` against the directory descriptor resolves only the last
+    /// component, and `O_NOFOLLOW` refuses a symlink sitting at that name rather
+    /// than following it somewhere else.
+    ///
+    /// It does **not** remove the window the reviews objected to. Opening a name
+    /// is still opening a name: whatever `name` means at this instant is what
+    /// comes back, and `fclonefileat` gave no identity to compare it against.
+    /// Section 11 of `docs/publication-contract.md` records that in full.
+    ///
+    /// `O_NONBLOCK` and the regular-file check are not tidiness. `O_NOFOLLOW`
+    /// refuses only a symlink; a FIFO at that name makes a blocking `O_RDONLY`
+    /// open wait for a writer that may never come, which would hang publication
+    /// with no way to cancel it, and a directory or a device opens quite happily
+    /// and would then be moved into the user's folder as though it were the
+    /// download. Both were found by review, not by a test that failed.
+    ///
+    /// `O_NONBLOCK` is left set on what comes back: `read(2)` ignores it on a
+    /// regular file, and only a regular file gets past the check.
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
     pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {
@@ -307,37 +331,52 @@ mod imp {
             libc::openat(
                 directory.as_raw_fd(),
                 leaf.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if opened < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `opened` is a fresh descriptor from the call above, owned by
-        // this process and not held anywhere else.
-        Ok(unsafe { File::from_raw_fd(opened) })
+        // this process and not held anywhere else. Wrapping it here also means
+        // the refusal below closes it, rather than leaking it.
+        let file = unsafe { File::from_raw_fd(opened) };
+        let kind = file.metadata()?.file_type();
+        if !kind.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the name did not hold a regular file",
+            ));
+        }
+        Ok(file)
     }
 
     /// Moves `from_name` in `from` to `to_name` in `to`, never replacing.
     ///
-    /// **Measured, not adopted.** This is the third step of the candidate macOS
-    /// path, and the step that would make it publication: both ends are
-    /// directory descriptors plus one component, so no path is resolved at
-    /// either end, and `RENAME_EXCL` fails rather than replacing -- which is
-    /// what `ReplaceIfExists = false` gives on Windows and `EEXIST` gives
-    /// `linkat` on Linux.
+    /// **Measured, and refused for adoption.** This is the third step of the
+    /// candidate macOS path. `RENAME_EXCL` does fail rather than replace, which
+    /// is what `ReplaceIfExists = false` gives on Windows and `EEXIST` gives
+    /// `linkat` on Linux, and neither end resolves a *path*: both are a directory
+    /// descriptor plus one component.
     ///
-    /// What it would buy over cloning straight into the destination is the
-    /// thing the reviews objected to: `fclonefileat` does not hand back a
-    /// descriptor for what it made, so the engine would have to open the new
-    /// name to know what it published -- and between the create and that open,
-    /// the name can be made to mean another file. Cloning into a directory the
-    /// engine owns, holding the result open, and then moving *that object*
-    /// keeps a handle on the published file throughout.
+    /// **But it resolves a name, and that is the whole difficulty.** An earlier
+    /// version of this comment claimed the three-step path "keeps a handle on the
+    /// published file throughout". It does not, and the signature shows it: the
+    /// descriptor `open_in_directory` pinned is not a parameter here. This call
+    /// looks `from_name` up in `from` again, so what the rename carries is
+    /// whatever that name means at this instant -- and `fclonefileat` handed back
+    /// no identity for the clone, so there is nothing to compare it against.
     ///
-    /// `renameatx_np` is not POSIX. It is Apple's, documented with APFS, and
-    /// whether it satisfies this contract is exactly what the tests beside it
-    /// measure rather than assume.
+    /// So the three steps **relocate** the substitution window from the user's
+    /// folder into a directory the engine owns; they do not remove it. What
+    /// closes it there is that directory's permissions, which is an assumption
+    /// this crate does not verify and which `fhd-storage` explicitly declines to
+    /// make against a hostile process running as the same user. Two independent
+    /// reviews found this, and it is why nothing calls these three. Section 11 of
+    /// `docs/publication-contract.md` records the measurement, the reason macOS
+    /// cannot do better, and what would have to be true to adopt it.
+    ///
+    /// `renameatx_np` is not POSIX. It is Apple's, documented with APFS.
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
     pub fn move_into_directory(
@@ -640,7 +679,7 @@ mod imp {
 
     /// Only the owning user and the system may touch this pipe, and nothing
     /// below medium integrity may open it at all -- which is what keeps a
-    /// sandboxed process of the same account out (Â§3.1, Â§16.1).
+    /// sandboxed process of the same account out (§3.1, §16.1).
     fn owner_only_descriptor(sid: &str) -> io::Result<(Local, SECURITY_ATTRIBUTES)> {
         // O: the owner, stated rather than left to the token's default. An
         // elevated process on Windows stamps objects with the Administrators
@@ -1645,7 +1684,7 @@ mod imp {
     /// mandatory label no sandboxed process of the same account could have
     /// applied. A client that skipped this would hand its request -- and any
     /// credential in it -- to whoever took the name first, which is the attack
-    /// Â§3.1 names. Must be called inside a Tokio runtime with the I/O driver.
+    /// §3.1 names. Must be called inside a Tokio runtime with the I/O driver.
     pub fn open_pipe(name: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
         use windows_sys::Win32::{
             Security::{Authorization::GetSecurityInfo, Authorization::SE_KERNEL_OBJECT, PSID},

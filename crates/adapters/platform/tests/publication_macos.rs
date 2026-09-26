@@ -302,3 +302,178 @@ fn a_moved_clone_refuses_names_that_are_not_one_component() {
     assert!(!downloads.join("inner/escaped").exists());
     assert!(!downloads.join("wanted.bin").exists());
 }
+
+/// **The measurement that decides against the candidate.**
+///
+/// The three steps were proposed because `fclonefileat` hands back no descriptor
+/// for the clone it makes, so opening the new name to learn what was published
+/// lets the name be substituted first. Staging the clone somewhere private, then
+/// pinning it, then moving it was meant to close that.
+///
+/// It does not, and this measures it rather than arguing it. The staged name is
+/// replaced after the pin, and the move carries **the replacement**: it looks
+/// `staged` up again, because `renameatx_np` takes a name and the pinned
+/// descriptor is not one. So an engine that trusted the pinned handle would
+/// report success about bytes it never verified. That is the false reporting the
+/// whole design exists to prevent, which is why nothing calls these three.
+///
+/// If macOS ever grows a descriptor-sourced link or rename, this test is the one
+/// that should start failing.
+#[test]
+fn a_moved_clone_carries_the_staged_name_not_the_pinned_object() {
+    let sandbox = Sandbox::new();
+    let file = written(&sandbox.0.join("part"), b"the proved bytes");
+    let private = sandbox.0.join("private");
+    fs::create_dir(&private).unwrap();
+    let downloads = sandbox.0.join("downloads");
+    fs::create_dir(&downloads).unwrap();
+    let private_dir = File::open(&private).unwrap();
+    let folder = File::open(&downloads).unwrap();
+
+    fhd_platform::clone_into_directory(&file, &private_dir, OsStr::new("staged")).unwrap();
+    let pinned = fhd_platform::open_in_directory(&private_dir, OsStr::new("staged")).unwrap();
+
+    // Whatever can write the staging directory, between the pin and the move.
+    fs::remove_file(private.join("staged")).unwrap();
+    written(&private.join("staged"), b"bytes nobody verified");
+
+    fhd_platform::move_into_directory(
+        &private_dir,
+        OsStr::new("staged"),
+        &folder,
+        OsStr::new("wanted.bin"),
+    )
+    .unwrap();
+
+    let published = downloads.join("wanted.bin");
+    assert_eq!(
+        fs::read(&published).unwrap(),
+        b"bytes nobody verified",
+        "the move carried the pinned object, so macOS has a descriptor-sourced \
+         rename after all and section 11 of the publication contract is wrong"
+    );
+    let held = pinned.metadata().unwrap();
+    let landed = fs::metadata(&published).unwrap();
+    assert!(
+        held.ino() != landed.ino(),
+        "the published object is the pinned one, which would contradict the line above"
+    );
+}
+
+/// The pin refuses a symlink at that name rather than following it.
+///
+/// `O_NOFOLLOW`'s property, which had no test: every one of the four move
+/// properties passed with the flag deleted, so an engineering review pointed out
+/// that step two was constrained by nothing at all.
+#[test]
+fn a_pin_refuses_a_symlink_and_does_not_follow_it() {
+    let sandbox = Sandbox::new();
+    let private = sandbox.0.join("private");
+    fs::create_dir(&private).unwrap();
+    let secret = sandbox.0.join("secret");
+    written(&secret, b"not ours to publish");
+    std::os::unix::fs::symlink(&secret, private.join("staged")).unwrap();
+    let private_dir = File::open(&private).unwrap();
+
+    let refused = fhd_platform::open_in_directory(&private_dir, OsStr::new("staged"));
+    assert!(
+        refused.is_err(),
+        "a symlink at the staged name was followed instead of refused"
+    );
+}
+
+/// The pin refuses anything that is not a regular file.
+///
+/// A FIFO is the one that matters: a blocking `O_RDONLY` open on it waits for a
+/// writer that may never come, which would hang publication with nothing able to
+/// cancel it. A directory opens quite happily and would then be moved into the
+/// user's folder as though it were the download. Both came from review.
+#[test]
+fn a_pin_refuses_what_is_not_a_regular_file() {
+    let sandbox = Sandbox::new();
+    let private = sandbox.0.join("private");
+    fs::create_dir(&private).unwrap();
+    let private_dir = File::open(&private).unwrap();
+
+    fs::create_dir(private.join("a-directory")).unwrap();
+    let refused = fhd_platform::open_in_directory(&private_dir, OsStr::new("a-directory"));
+    assert_eq!(
+        refused.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a directory was pinned as though it were the download"
+    );
+
+    // `mkfifo(1)` rather than the libc call, so the test needs no unsafe of its
+    // own. If the tool is missing the assertion is skipped, not silently passed
+    // off as met -- the panic below says which.
+    let made = std::process::Command::new("mkfifo")
+        .arg(private.join("a-pipe"))
+        .status()
+        .expect("mkfifo(1) is needed to measure that a FIFO cannot hang the pin");
+    assert!(
+        made.success(),
+        "mkfifo(1) failed, so the FIFO case is unmeasured"
+    );
+
+    // The point is that this returns at all: without `O_NONBLOCK` it would block
+    // here forever and the test would time out rather than fail.
+    let refused = fhd_platform::open_in_directory(&private_dir, OsStr::new("a-pipe"));
+    assert_eq!(
+        refused.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a FIFO was pinned as though it were the download"
+    );
+}
+
+/// The pin resolves inside the descriptor it was given, not inside a path.
+///
+/// The staging directory is moved aside after its descriptor is opened and
+/// another directory takes its name, holding a different file under the same
+/// staged name. The pin must find the one in the directory that was opened.
+#[test]
+fn a_pin_looks_only_inside_the_directory_that_was_opened() {
+    let sandbox = Sandbox::new();
+    let private = sandbox.0.join("private");
+    fs::create_dir(&private).unwrap();
+    written(&private.join("staged"), b"the proved bytes");
+    let private_dir = File::open(&private).unwrap();
+
+    fs::rename(&private, sandbox.0.join("moved-away")).unwrap();
+    fs::create_dir(&private).unwrap();
+    written(&private.join("staged"), b"an impostor");
+
+    let pinned = fhd_platform::open_in_directory(&private_dir, OsStr::new("staged")).unwrap();
+    let held = pinned.metadata().unwrap();
+    let ours = fs::metadata(sandbox.0.join("moved-away").join("staged")).unwrap();
+    assert!(
+        held.dev() == ours.dev() && held.ino() == ours.ino(),
+        "the pin resolved the directory by name and found the impostor"
+    );
+}
+
+/// The pin refuses a name that is not one component, before any system call.
+#[test]
+fn a_pin_refuses_names_that_are_not_one_component() {
+    let sandbox = Sandbox::new();
+    let private = sandbox.0.join("private");
+    fs::create_dir(&private).unwrap();
+    fs::create_dir(private.join("inner")).unwrap();
+    written(&private.join("inner").join("escaped"), b"not ours");
+    let private_dir = File::open(&private).unwrap();
+
+    for name in [
+        "inner/escaped",
+        "../escaped",
+        "/absolute",
+        ".",
+        "..",
+        "inner/.",
+    ] {
+        let refused = fhd_platform::open_in_directory(&private_dir, OsStr::new(name));
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name} was not refused"
+        );
+    }
+}

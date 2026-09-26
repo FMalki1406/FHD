@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage, shellEscapeWreckage,
+  attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
+  doubleEncodedText, shellEscapeWreckage,
   UNSAFE_ALLOWANCES, unsafeOffendersIn, unusedAllowances, withoutComments,
 } from './check-architecture.mjs';
 
@@ -358,6 +359,16 @@ test('refuses a raw NUL in any reviewable source, whatever the tree or extension
     'crates/adapters/persistence/migrations/005_x.sql',
     'tools/gate.mjs',
     '.github/workflows/engine.yml',
+    // A third review widened the scan, and these are its examples. `Cargo.lock`
+    // and the pinned toolchain are where hiding a change pays best; `docs/` is
+    // where the mojibake damage actually happened; and `tools/rust.ps1` -- the
+    // wrapper whose shell caused all three damages -- was exempt from the rule
+    // named after PowerShell strings, because `.ps1` was not in the list.
+    'Cargo.lock',
+    'rust-toolchain.toml',
+    'package.json',
+    'docs/publication-contract.md',
+    'tools/rust.ps1',
   ]) {
     plant(relative, Buffer.from(`ab\u0000cd`, 'binary'));
     const offenders = checkReviewableSources(root);
@@ -372,6 +383,23 @@ test('refuses a raw NUL in any reviewable source, whatever the tree or extension
   plant('crates/a/target/debug/build.rs', Buffer.from('a\u0000b', 'binary'));
   plant('crates/a/fixture.bin', Buffer.from('a\u0000b', 'binary'));
   assert.deepEqual(checkReviewableSources(root), []);
+
+  // The root is scanned without descending. `.tools/` holds this project's
+  // pinned Rust toolchain -- thousands of files it neither owns nor tracks -- and
+  // recursing from the root would walk all of it. So a file in an unnamed
+  // directory is out of scope, while the root's own files are in it.
+  plant('.tools/rustup/toolchains/1.98.1/lib/rustlib/src/core/src/lib.rs',
+    Buffer.from('a\u0000b', 'binary'));
+  assert.deepEqual(checkReviewableSources(root), []);
+  plant('Cargo.toml', Buffer.from('a\u0000b', 'binary'));
+  assert.equal(checkReviewableSources(root).length, 1);
+  plant('Cargo.toml', '[workspace]\n');
+
+  // Each file is judged once, though the root entry and a named tree could both
+  // reach it if the root ever started recursing.
+  plant('docs/twice.md', Buffer.from('a\u0000b', 'binary'));
+  assert.equal(checkReviewableSources(root).length, 1);
+  plant('docs/twice.md', 'clean\n');
 
   // A dangling symlink must be skipped, not throw and fail the gate with an
   // error about nothing. Creating one needs privileges on Windows, so the
@@ -424,4 +452,74 @@ test('refuses what a PowerShell string edit leaves behind', () => {
   const tick = String.fromCharCode(0x60);
   const shipped = `        // because Path::components${tick}n        // normalises: it\r\n`;
   assert.equal(shellEscapeWreckage('lib.rs', Buffer.from(shipped, 'binary')).length, 1);
+
+  // The shape the first version missed, and the commoner one: the escape with no
+  // whitespace after it. The instance that shipped was caught only because the
+  // next line happened to be indented.
+  for (const text of [
+    `// because Path::components${tick}nnormalises\n`,
+    `let s = "a${tick}nb";\n`,
+    `// at the end of the file${tick}n`,
+  ]) {
+    assert.equal(shellEscapeWreckage('a.rs', Buffer.from(text, 'binary')).length, 1, text);
+  }
+
+  // Every PowerShell escape letter, not the four that happened to bite us. A
+  // literal backtick-e leaves a raw ESC, as invisible as the NUL byte the
+  // sibling rule exists for.
+  for (const letter of [...'0abefnrtv']) {
+    const text = `// first${tick}${letter}second\n`;
+    assert.equal(shellEscapeWreckage('a.rs', Buffer.from(text, 'binary')).length, 1, letter);
+  }
+
+  // A Markdown fence with a language tag puts an escape letter straight after a
+  // backtick with nothing closing it on that line. Widening to unclosed spans
+  // made every fenced block in `docs/` an offender, which is how this exception
+  // came to be measured rather than guessed.
+  for (const tag of ['text', 'rust', 'bash', 'none', 'toml', 'powershell']) {
+    const fence = `${tick}${tick}${tick}${tag}\nbody\n${tick}${tick}${tick}\n`;
+    assert.deepEqual(shellEscapeWreckage('a.md', Buffer.from(fence, 'binary')), [], tag);
+  }
+
+  // U+2028 and U+2029 end a line for a JavaScript parser exactly as the CR does,
+  // so a comment holding one stops being a comment. Judged only where a
+  // JavaScript parser reads the file.
+  // From char codes, not literals: this file is a `.mjs` the gate scans, so
+  // spelling them out would make the test data an offender.
+  for (const separator of [String.fromCharCode(0x2028), String.fromCharCode(0x2029)]) {
+    const text = `// a comment${separator}code();\n`;
+    assert.equal(shellEscapeWreckage('a.mjs', Buffer.from(text, 'utf8')).length, 1, separator);
+    assert.deepEqual(shellEscapeWreckage('a.rs', Buffer.from(text, 'utf8')), [], separator);
+  }
+});
+
+// The first of the three PowerShell damages, and the one that was still in the
+// tree: `docs/development.md` had written the hazard down while eight
+// occurrences sat in three source files, five of them in the first four lines of
+// the crate under review. Nothing checked for it until a security review counted
+// them by hand.
+test('refuses text that has been decoded twice', () => {
+  // The real bytes, as hex: the section sign, and an Arabic letter, each read as
+  // Latin-1 and re-encoded. Written as bytes rather than characters for the same
+  // reason as the backtick above -- the gate scans this file.
+  const section = Buffer.from('c382c2a7', 'hex');       // from C2 A7
+  const arabic = Buffer.from('c398c2af', 'hex');        // from D8 AF
+  for (const damaged of [section, arabic]) {
+    const text = Buffer.concat([Buffer.from('//! section '), damaged, Buffer.from('4 allows\n')]);
+    const found = doubleEncodedText('lib.rs', text);
+    assert.equal(found.length, 1, damaged.toString('hex'));
+    assert.match(found[0], /decoded twice at offset 12/u);
+  }
+
+  // Adjacent Latin-1 supplement characters are legal text, so the rule names the
+  // leads rather than the range. This is the sequence that refuted the first
+  // version: the multiplication sign followed by a closing Arabic quote, from
+  // `docs/status-report-2026-09-23.md`.
+  const legitimate = Buffer.concat([
+    Buffer.from('15'), Buffer.from('c397c2bb', 'hex'), Buffer.from(' and more\n'),
+  ]);
+  assert.deepEqual(doubleEncodedText('a.md', legitimate), []);
+
+  // Undamaged Arabic and an undamaged section sign both pass.
+  assert.deepEqual(doubleEncodedText('a.md', Buffer.from('§4 يسمح\n', 'utf8')), []);
 });

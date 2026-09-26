@@ -103,6 +103,15 @@ fn an_occupied_name_is_refused_and_the_file_there_is_untouched() {
 ///
 /// Anything with a separator would resolve a path inside the directory, which
 /// is the resolution this call exists to avoid.
+///
+/// The last three spellings are the reason the check reads the bytes *before*
+/// parsing, and an engineering and a security review both found that this list
+/// did not contain them. `Path::components` normalises: it reports `x/`, `x//`
+/// and `x/.` as the single component `x`, so the parse alone accepts all three.
+/// The first five here are refused by the parse, which meant deleting the byte
+/// check left this whole suite green -- on the platform where publication
+/// actually ships. `a_symlinked_directory_is_not_walked_by_a_trailing_dot` below
+/// is the half of it that has teeth.
 #[test]
 fn a_name_that_is_not_one_component_is_refused() {
     let sandbox = Sandbox::new();
@@ -110,15 +119,55 @@ fn a_name_that_is_not_one_component_is_refused() {
     fs::create_dir(sandbox.0.join("inner")).unwrap();
     let folder = File::open(&sandbox.0).unwrap();
 
-    for name in ["inner/escaped", "../escaped", "/absolute", ".", ".."] {
+    for name in [
+        "inner/escaped",
+        "../escaped",
+        "/absolute",
+        ".",
+        "..",
+        "inner/",
+        "inner//",
+        "inner/.",
+        "",
+    ] {
         let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new(name));
         assert_eq!(
             refused.unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput,
-            "{name} was not refused"
+            "{name:?} was not refused"
         );
     }
     assert!(!sandbox.0.join("inner/escaped").exists());
+}
+
+/// The spelling the byte check exists for, with the symlink that makes it matter.
+///
+/// `x/.` parses as the single component `x`. Where `x` is a symlink to a
+/// directory, the kernel walks it -- `AT_SYMLINK_FOLLOW` is set on the source, but
+/// this is the *destination* end, and a trailing `/.` forces the last component to
+/// be resolved as a directory. So a name the parse calls "one component" would
+/// have published into somewhere else entirely. Nothing in the tree measured this
+/// before; both reviews of the shared `one_component` asked for it by name.
+#[test]
+fn a_symlinked_directory_is_not_walked_by_a_trailing_dot() {
+    let sandbox = Sandbox::new();
+    let file = written(&sandbox.0.join("part"), b"ours");
+    let elsewhere = sandbox.0.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, sandbox.0.join("link")).unwrap();
+    let folder = File::open(&sandbox.0).unwrap();
+
+    let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new("link/."));
+    assert_eq!(
+        refused.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a trailing /. on a symlink to a directory was not refused"
+    );
+    assert_eq!(
+        fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "the link was followed and something was published through it"
+    );
 }
 
 /// The destination is the directory handle, not a path that can be swapped.

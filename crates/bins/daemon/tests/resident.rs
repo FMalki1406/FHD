@@ -760,7 +760,7 @@ async fn an_unconfirmed_job_is_cancelled_over_the_socket_and_keeps_its_part() {
 
 /// Evidence at the destination resolves an unconfirmed job; its absence does not.
 ///
-/// This is the procedure Â§10 recorded as missing -- the one thing that could end
+/// This is the procedure §10 recorded as missing -- the one thing that could end
 /// that state, leaving cancel as the only exit. The engine cannot decide it
 /// alone in both directions, and does not pretend to: a destination holding a
 /// file whose size and digest are the ones recorded is proof the publication

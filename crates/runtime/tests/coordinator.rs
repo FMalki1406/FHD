@@ -622,7 +622,7 @@ async fn a_resumed_session_with_nothing_left_to_fetch_still_verifies() {
 /// A job interrupted between taking a new generation and creating its part.
 ///
 /// This is the window the end-to-end tests could not reach, and it is recorded
-/// in Â§10 of the publication contract as unimplemented -- so this implements it.
+/// in §10 of the publication contract as unimplemented -- so this implements it.
 /// A byte counter cannot land here: the resume's own ranged probe satisfies it
 /// before the new part exists, which is why the test that claimed this was
 /// renamed to what it actually proved.

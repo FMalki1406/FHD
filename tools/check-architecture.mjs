@@ -86,6 +86,16 @@ export const UNSAFE_ALLOWANCES = new Map([
     // Both take borrowed descriptors and names owned by the caller, and both
     // are measured rather than adopted: nothing in the engine calls them.
     'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
+    // This one is a bare `pub fn move_into_directory(` because `itemBelow`
+    // returns a single trimmed line and the signature is wrapped across several.
+    // So it is the weakest entry here: changing a parameter -- `to: &Path`
+    // instead of `to: &File`, which is exactly the regression the publication
+    // contract forbids -- keeps the allowance satisfied. An engineering review
+    // pointed that out. Pinning it would mean teaching `itemBelow` to read a
+    // whole signature, and the entry is left as it is with the limit written
+    // down rather than papered over: the parameters are also asserted by
+    // `crates/adapters/platform/tests/publication_macos.rs`, which would stop
+    // compiling if they changed.
     'pub fn move_into_directory(',
   ]],
 ]);
@@ -290,24 +300,61 @@ function allowedItemsIn(text) {
 /// changed `CHECK` constraint, one in a workflow hides a changed CI step, and
 /// one in this file hides the gate's own rules. So the scan covers the source
 /// trees that make up the product and the extensions that carry logic.
-export const REVIEWABLE = ['.rs', '.sql', '.mjs', '.js', '.ts', '.toml', '.yml', '.yaml', '.md'];
-export function checkReviewableSources(root, trees = ['crates', 'tools', '.github']) {
+///
+/// A third review widened it again, and its examples are better than the rule
+/// was. `Cargo.lock` and `rust-toolchain.toml` are where hiding a change would
+/// pay best -- a dependency or a pinned toolchain nobody reviewed -- and both sat
+/// outside the scan. `docs/` was outside it too, which is where the mojibake
+/// damage actually happened, and where the Arabic product documentation lives.
+/// And `tools/rust.ps1` was exempt from the rule named after PowerShell strings:
+/// `.ps1` was not in this list at all.
+///
+/// `''` in `TREES` is the repository root, which picks up the root manifest,
+/// `Cargo.lock`, `rust-toolchain.toml`, `package.json`, `README.md` and
+/// `AGENTS.md` without descending anywhere new -- `walkSources` recurses, so the
+/// root entry covers every tree; the named ones stay for the error messages and
+/// for the test that each is reached.
+export const REVIEWABLE = [
+  '.rs', '.sql', '.mjs', '.js', '.ts', '.toml', '.yml', '.yaml', '.md', '.ps1', '.lock', '.json',
+];
+export const TREES = ['', 'crates', 'tools', '.github', 'docs'];
+export function checkReviewableSources(root, trees = TREES) {
   const offenders = [];
+  const seen = new Set();
+  const judge = (full) => {
+    if (seen.has(full)) return;
+    seen.add(full);
+    const bytes = readFileSync(full);
+    const relative = full.slice(root.length + 1).split('\\').join('/');
+    const at = bytes.indexOf(0);
+    if (at !== -1) {
+      offenders.push(
+        `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
+        `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
+      );
+    }
+    offenders.push(...shellEscapeWreckage(relative, bytes));
+    offenders.push(...doubleEncodedText(relative, bytes));
+  };
   for (const tree of trees) {
-    const base = `${root}/${tree}`;
+    const base = tree ? `${root}/${tree}` : root;
     if (!existsSync(base)) continue;
-    walkSources(base, (full) => {
-      const bytes = readFileSync(full);
-      const relative = full.slice(root.length + 1).split('\\').join('/');
-      const at = bytes.indexOf(0);
-      if (at !== -1) {
-        offenders.push(
-          `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
-          `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
-        );
+    // The root is scanned without descending. Recursing from it would walk
+    // `.tools/`, where this project keeps its pinned Rust toolchain -- thousands
+    // of files it does not own and does not track. The named trees below are
+    // where recursion belongs.
+    if (!tree) {
+      for (const entry of readdirSync(base)) {
+        if (!REVIEWABLE.some((extension) => entry.endsWith(extension))) continue;
+        const full = `${base}/${entry}`;
+        let stat;
+        try { stat = statSync(full); } catch { continue; }
+        if (stat.isDirectory()) continue;
+        judge(full);
       }
-      offenders.push(...shellEscapeWreckage(relative, bytes));
-    });
+      continue;
+    }
+    walkSources(base, judge);
   }
   return offenders;
 }
@@ -330,17 +377,32 @@ export function checkReviewableSources(root, trees = ['crates', 'tools', '.githu
 ///
 /// Two byte-level signatures, both with no legitimate spelling in this tree:
 ///
-///   * a CR that is not part of a CRLF -- a line terminator to a JavaScript
-///     parser and to `git diff`, and never written on purpose here;
-///   * a backtick followed by one of PowerShell's escape letters and then
-///     whitespace. In a comment or a doc that would be an unclosed one-letter
-///     code span, which nothing here writes; `` `n` `` and `` `\n` `` are both
-///     closed and both pass.
+///   * a CR that is not part of a CRLF, or a U+2028/U+2029 in a JavaScript
+///     source -- all three end a line for a JavaScript parser, and none is
+///     written on purpose here;
+///   * a backtick followed by one of PowerShell's escape letters, with **no
+///     closing backtick before the end of that line**.
+///
+/// The second signature started out as "followed by whitespace", which two
+/// reviews took apart from both sides at once. It rejected ordinary prose --
+/// `` `0 stopped in Completed` `` in a permissions document, and the very
+/// paragraph in `docs/development.md` that documents this rule, since a literal
+/// backtick has no other Markdown spelling. And it missed the commoner shape of
+/// the damage: the instance that shipped was caught only because the next line
+/// happened to be indented, so a literal escape before a full stop or a quote
+/// went through. Asking whether the span *closes on its line* answers both:
+/// `` `n` `` and `` `nothing here` `` close, a stray escape does not.
+///
+/// The letters are all of PowerShell's, not the four that happened to bite us.
+/// A literal backtick-e produces a raw ESC, as invisible in a review as the NUL
+/// the sibling rule exists for.
 ///
 /// It reads bytes, not text, so a file this rule would reject cannot hide behind
 /// being undecodable.
 export function shellEscapeWreckage(relative, bytes) {
   const offenders = [];
+  const ESCAPES = new Set([...'0abefnrtv'].map((letter) => letter.charCodeAt(0)));
+  const javascript = ['.mjs', '.js', '.ts'].some((extension) => relative.endsWith(extension));
   for (let index = 0; index < bytes.length; index += 1) {
     if (bytes[index] === 0x0d && bytes[index + 1] !== 0x0a) {
       offenders.push(
@@ -350,18 +412,81 @@ export function shellEscapeWreckage(relative, bytes) {
         'with an editor instead of building its text in a shell string.',
       );
     }
-    if (bytes[index] !== 0x60) continue;
-    const letter = bytes[index + 1];
-    const after = bytes[index + 2];
-    const escape = letter === 0x6e || letter === 0x72 || letter === 0x74 || letter === 0x30;
-    const unclosed = after === 0x20 || after === 0x09 || after === 0x0a || after === 0x0d;
-    if (escape && unclosed) {
+    // U+2028 and U+2029. A JavaScript parser ends a line on these exactly as it
+    // does on the CR above, so a `//` comment holding one has the same defect.
+    if (javascript && bytes[index] === 0xe2 && bytes[index + 1] === 0x80 &&
+        (bytes[index + 2] === 0xa8 || bytes[index + 2] === 0xa9)) {
       offenders.push(
-        `${relative}: \`${String.fromCharCode(letter)} at offset ${index}, followed by ` +
-        "whitespace. That is PowerShell's escape left literal, not a code span -- " +
-        'a line break that never happened. Write the text with an editor.',
+        `${relative}: a U+202${bytes[index + 2] === 0xa8 ? '8' : '9'} at offset ${index}. ` +
+        'JavaScript ends a line there, so a comment holding one stops being a ' +
+        'comment partway through. Nothing here writes one on purpose.',
       );
     }
+    if (bytes[index] !== 0x60 || !ESCAPES.has(bytes[index + 1])) continue;
+    // Not the tail of a run of backticks. A Markdown fence with a language tag
+    // -- ```text, ```rust, ```bash, ```none -- puts an escape letter directly
+    // after a backtick, and there is no closing backtick on that line. Widening
+    // the rule to unclosed spans turned every fenced block in `docs/` into an
+    // offender, which is how this exception got measured rather than guessed.
+    if (bytes[index - 1] === 0x60) continue;
+    // Does the span close before the line does?
+    let closed = false;
+    for (let scan = index + 2; scan < bytes.length; scan += 1) {
+      if (bytes[scan] === 0x0a || bytes[scan] === 0x0d) break;
+      if (bytes[scan] === 0x60) { closed = true; break; }
+    }
+    if (!closed) {
+      offenders.push(
+        `${relative}: \`${String.fromCharCode(bytes[index + 1])} at offset ${index}, ` +
+        'and no closing backtick before the end of the line. That is a ' +
+        "PowerShell escape left literal, not a code span -- a character that " +
+        'never became what it was meant to be. Write the text with an editor.',
+      );
+    }
+  }
+  return offenders;
+}
+
+/// Text that has been decoded once too many times.
+///
+/// The first of the three PowerShell damages was this: `Get-Content -Raw |
+/// Set-Content` read UTF-8 as the system codepage and wrote it back, so `§`
+/// became two characters and Arabic became runs of Latin-1 punctuation. It
+/// compiled, the tests passed, and `docs/development.md` wrote the hazard down --
+/// while **eight occurrences stayed in the tree**, five of them in the first four
+/// lines of the crate under review, until a security review counted them. A
+/// documented hazard that nothing checks is a hazard.
+///
+/// The signature is one of three specific characters immediately followed by a
+/// `C2`-prefixed one. `§` is `C2 A7`, and read as Latin-1 and re-encoded it
+/// becomes `C3 82 C2 A7`; Arabic letters are `D8`/`D9` pairs and become
+/// `C3 98 C2 xx` or `C3 99 C2 xx`. So the leads are `C3 82`, `C3 98` and
+/// `C3 99` -- the re-encodings of the lead bytes this repository's real text
+/// actually uses.
+///
+/// It started as "any `C3` character before any `C2` one", which a run over
+/// `docs/` refuted: `docs/status-report-2026-09-23.md` contains `C3 97 C2 BB`,
+/// which is the multiplication sign in "15x" followed by a closing Arabic quote
+/// -- ordinary text. Adjacent Latin-1 supplement characters are legal, so the
+/// rule has to name the leads rather than the range. That narrows it: mojibake
+/// through some other lead byte would pass, which is the honest limit of a
+/// byte-pattern check and is written down in `docs/development.md`.
+///
+/// The examples are given as hex on purpose. Written out they are the pattern,
+/// and this file is scanned by it -- the same reason the escapes above are named
+/// in words.
+export function doubleEncodedText(relative, bytes) {
+  const offenders = [];
+  const LEADS = new Set([0x82, 0x98, 0x99]);
+  for (let index = 0; index < bytes.length - 2; index += 1) {
+    if (bytes[index] !== 0xc3) continue;
+    if (!LEADS.has(bytes[index + 1])) continue;
+    if (bytes[index + 2] !== 0xc2) continue;
+    offenders.push(
+      `${relative}: text decoded twice at offset ${index} -- a C3 character ` +
+      'directly before a C2 one, which is what UTF-8 read as a system codepage ' +
+      'and written back looks like. Restore the file and edit it with an editor.',
+    );
   }
   return offenders;
 }
@@ -551,7 +676,7 @@ function main(args) {
   // Says what was scanned, not "every source". A review pointed out that the
   // previous wording claimed more than the walk covers, which is the same kind
   // of overclaim this gate exists to make expensive.
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes or stray shell escapes in crates/tools/.github sources).`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes, stray shell escapes or twice-decoded text in ${TREES.map((tree) => tree || '<root>').join('/')} sources).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

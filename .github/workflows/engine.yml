@@ -32,13 +32,14 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22.13.1"
+          package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Record environment
@@ -100,10 +101,10 @@ jobs:
         run: cargo +1.98.1 test -p fhd-platform --locked used_to_miss
       - name: Platform - a handle identifies its object after the name is taken
         if: runner.os == 'Windows'
-        run: cargo +1.98.1 test -p fhd-platform --locked identifies_its_object
+        run: bash tools/one-test.sh fhd-platform tests::a_handle_identifies_its_object_after_the_name_is_taken
       - name: Platform - a link from a handle carries the held file
         if: runner.os == 'Windows'
-        run: cargo +1.98.1 test -p fhd-platform --locked carries_the_held_file
+        run: bash tools/one-test.sh fhd-platform tests::a_link_from_a_handle_carries_the_held_file_and_never_replaces
       # Each test above is named by a step, and a step that matched nothing would
       # pass in silence. This fails if the crate grows a test no step runs.
       - name: Platform - a stranger who may write a unix directory is reported
@@ -130,16 +131,23 @@ jobs:
       # step name is the whole measurement, it has to name one test.
       - name: Publication on Linux - the object is published, not the name
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_source_name_taken_over_does_not_change_what_is_published
+        run: bash tools/one-test.sh fhd-platform a_source_name_taken_over_does_not_change_what_is_published
       - name: Publication on Linux - an occupied name is refused
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact an_occupied_name_is_refused_and_the_file_there_is_untouched
+        run: bash tools/one-test.sh fhd-platform an_occupied_name_is_refused_and_the_file_there_is_untouched
       - name: Publication on Linux - a name that is not one component is refused
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_name_that_is_not_one_component_is_refused
+        run: bash tools/one-test.sh fhd-platform a_name_that_is_not_one_component_is_refused
       - name: Publication on Linux - a swapped destination folder is not published into
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into
+        run: bash tools/one-test.sh fhd-platform a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into
+      # The spelling the byte-level check exists for. `Path::components` reports
+      # `x/.` as the single component `x`, and where `x` is a symlink to a
+      # directory the kernel walks it. Both reviews found that the check guarding
+      # this had no test on the platform where publication ships.
+      - name: Publication on Linux - a trailing dot does not walk a symlinked directory
+        if: runner.os == 'Linux'
+        run: bash tools/one-test.sh fhd-platform a_symlinked_directory_is_not_walked_by_a_trailing_dot
       # macOS only, and a measurement rather than a mechanism: nothing in the
       # engine calls what these exercise. macOS refuses to publish, and these
       # answer -- on a real macOS rather than from a manual page read on a
@@ -148,16 +156,16 @@ jobs:
       # same reason the Linux ones are: the logs need a token.
       - name: Publication on macOS - a clone carries the handle's bytes
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_carries_the_bytes_of_the_handle_not_of_its_name
+        run: bash tools/one-test.sh fhd-platform a_clone_carries_the_bytes_of_the_handle_not_of_its_name
       - name: Publication on macOS - a clone is a separate object
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_is_a_separate_object_from_the_part_it_came_from
+        run: bash tools/one-test.sh fhd-platform a_clone_is_a_separate_object_from_the_part_it_came_from
       - name: Publication on macOS - a clone refuses an occupied name
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_refuses_an_occupied_name_and_leaves_it_untouched
+        run: bash tools/one-test.sh fhd-platform a_clone_refuses_an_occupied_name_and_leaves_it_untouched
       - name: Publication on macOS - a clone name must be one component
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_name_that_is_not_one_component_is_refused
+        run: bash tools/one-test.sh fhd-platform a_clone_name_that_is_not_one_component_is_refused
       # The three-step candidate: clone into a directory the engine owns, hold
       # the result open, then move *that object* into the adopted folder. The
       # reviews refused cloning straight into the destination because
@@ -168,16 +176,38 @@ jobs:
       # and the support limit gets written down instead.
       - name: Publication on macOS - a moved clone keeps its identity
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder
+        run: bash tools/one-test.sh fhd-platform a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder
       - name: Publication on macOS - a moved clone refuses an occupied name
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_refuses_an_occupied_name_and_leaves_it_untouched
+        run: bash tools/one-test.sh fhd-platform a_moved_clone_refuses_an_occupied_name_and_leaves_it_untouched
       - name: Publication on macOS - a moved clone ignores a swapped destination
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_ignores_a_directory_that_took_the_destination_name
+        run: bash tools/one-test.sh fhd-platform a_moved_clone_ignores_a_directory_that_took_the_destination_name
       - name: Publication on macOS - a moved clone refuses names that are not one component
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_refuses_names_that_are_not_one_component
+        run: bash tools/one-test.sh fhd-platform a_moved_clone_refuses_names_that_are_not_one_component
+      # The step that decides against the candidate, and the four that constrain
+      # the pin. Both reviews found step two had no test at all: every property
+      # above passed with `O_NOFOLLOW` deleted and with the pin replaced by a
+      # path-based open. The first of these measures the reason macOS cannot
+      # adopt the path -- the move carries the staged *name*, not the pinned
+      # object -- so it is expected to pass, and its passing is the evidence for
+      # the support limit in section 11, not evidence that publication works.
+      - name: Publication on macOS - a moved clone carries the name, not the pinned object
+        if: runner.os == 'macOS'
+        run: bash tools/one-test.sh fhd-platform a_moved_clone_carries_the_staged_name_not_the_pinned_object
+      - name: Publication on macOS - the pin refuses a symlink
+        if: runner.os == 'macOS'
+        run: bash tools/one-test.sh fhd-platform a_pin_refuses_a_symlink_and_does_not_follow_it
+      - name: Publication on macOS - the pin refuses a FIFO or a directory
+        if: runner.os == 'macOS'
+        run: bash tools/one-test.sh fhd-platform a_pin_refuses_what_is_not_a_regular_file
+      - name: Publication on macOS - the pin looks only inside the opened directory
+        if: runner.os == 'macOS'
+        run: bash tools/one-test.sh fhd-platform a_pin_looks_only_inside_the_directory_that_was_opened
+      - name: Publication on macOS - the pin refuses names that are not one component
+        if: runner.os == 'macOS'
+        run: bash tools/one-test.sh fhd-platform a_pin_refuses_names_that_are_not_one_component
       # It runs everywhere now. While it was Windows-only, a test compiled
       # under cfg(unix) could be added and run nowhere with nothing saying
       # so -- which is what happened to the Unix half of foreign_writers:
@@ -192,36 +222,33 @@ jobs:
           # test and watched this step pass while nothing ran it.
           listed=$(cargo +1.98.1 test -p fhd-platform --locked --all-targets -- --list \
             | sed -n 's/: test$//p' | sed 's/^tests:://' | sort -u)
-          covered=$(for filter in the_scope descriptor_we_asked_for \
+          # Read out of this file rather than hand-kept beside it. An engineering
+          # review found the previous version kept two independent copies of the
+          # same names -- the substring filters here and the `expected` list below
+          # -- neither tied to the step that runs the test, so all three could
+          # drift apart. These are the exact names the steps pass to
+          # tools/one-test.sh, so they cannot disagree with the steps by
+          # construction.
+          named=$(grep -o 'one-test\.sh fhd-platform [A-Za-z0-9_:]*' .github/workflows/engine.yml \
+            | sed 's/.* //' | sed 's/^tests:://' | sort -u)
+          if [ -z "$named" ]; then
+            echo "read no step names out of the workflow; this check would pass vacuously"; exit 1
+          fi
+          covered=$( { for filter in the_scope descriptor_we_asked_for \
               sandboxed_process_could_make owned_by_the_account one_we_will_talk_to \
               either_spelling stranger_may_write until_it_is_protected \
               used_to_fail_open owner_rule_is_decided used_to_miss \
-              owner_only_and_one_we_find default_acl_on_the_parent \
-              source_name_taken_over occupied_name_is_refused not_one_component \
-              destination_folder_swapped clone_carries_the_bytes \
-              clone_is_a_separate_object clone_refuses_an_occupied_name \
-              clone_name_that_is_not_one_component \
-              moved_clone_keeps_its_identity moved_clone_ignores_a_directory \
-              moved_clone_refuses_names \
-              identifies_its_object carries_the_held_file; do
+              owner_only_and_one_we_find default_acl_on_the_parent; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
-          done | sort -u)
-          # A filter that matches nothing exits zero, so a step can go green
-          # having run no test at all. The list above catches a *rename* -- the
-          # test lands in listed and not in covered -- but not a deletion or
-          # a cfg that switches one off, because then it is in neither. Both
-          # reviews of the Linux work found that hole, and this is the half of
-          # it worth closing here: the publication properties must exist on the
-          # platform that claims them.
-          expected=""
-          case "${RUNNER_OS}" in
-            Linux) expected="a_source_name_taken_over_does_not_change_what_is_published an_occupied_name_is_refused_and_the_file_there_is_untouched a_name_that_is_not_one_component_is_refused a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into" ;;
-            macOS) expected="a_clone_carries_the_bytes_of_the_handle_not_of_its_name a_clone_is_a_separate_object_from_the_part_it_came_from a_clone_refuses_an_occupied_name_and_leaves_it_untouched a_clone_name_that_is_not_one_component_is_refused a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder a_moved_clone_refuses_an_occupied_name_and_leaves_it_untouched a_moved_clone_ignores_a_directory_that_took_the_destination_name a_moved_clone_refuses_names_that_are_not_one_component" ;;
-          esac
-          for wanted in $expected; do
-            printf '%s\n' "$listed" | grep -qx -- "$wanted" || {
-              echo "a step names this test and this platform does not have it: $wanted"; exit 1; }
-          done
+          done; printf '%s\n' "$named"; } | grep -v '^$' | sort -u)
+          # Only one direction is left to check here: a test this platform
+          # compiles that no step names. The other direction -- a step naming a
+          # test that does not exist, or one that is `#[ignore]`d -- used to be a
+          # hand-kept list of expected names, a second copy that could drift from
+          # the steps. tools/one-test.sh now refuses unless exactly one test ran
+          # and passed, so a step whose name is wrong, or whose test this platform
+          # does not compile, or which has been ignored, fails at that step and
+          # says which. That is stricter than the list was and cannot drift.
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))
           if [ -n "$missing" ]; then
             echo "no step runs these tests:"; printf '%s\n' "$missing"; exit 1
