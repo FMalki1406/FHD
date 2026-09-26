@@ -304,6 +304,32 @@ pub trait HandleLinker: Send + Sync {
         left: &std::fs::File,
         right: &std::fs::File,
     ) -> Result<bool, StorageError>;
+
+    /// Opens `path` for that comparison: **never blocking**, and only when a
+    /// regular file is there.
+    ///
+    /// `Ok(None)` means the path does not reach a regular file -- nothing is
+    /// there, or what is there is a directory, a FIFO, a socket or a device.
+    /// Publication reads every one of those as "the path does not reach what was
+    /// published", which is true of all of them. `Err` means the question went
+    /// unanswered, which is a third outcome and not a file that moved.
+    ///
+    /// **It is a port for a reason that cost something.** Publication asked this
+    /// with `std::fs::File::open`, and on Unix a blocking `O_RDONLY` open of a
+    /// FIFO waits for a writer that may never come. The link has already
+    /// happened at that point and the part is sealed, so whoever could write the
+    /// destination folder could leave a FIFO at the requested name and the call
+    /// that should report where the file landed would never return, with nothing
+    /// able to cancel it. Avoiding that needs `O_NONBLOCK`, which needs the
+    /// platform, and this adapter may not depend on it -- the same reason
+    /// `same_object` is here.
+    ///
+    /// An implementation must read the type from the **open handle**, not from
+    /// the path, or a swap between the two answers the wrong question. And it
+    /// must not report a regular file it could not open as absent: that is an
+    /// `Err`, because "I could not look" and "it is not there" lead to different
+    /// claims about the user's file.
+    fn open_for_identity(&self, path: &Path) -> Result<Option<std::fs::File>, StorageError>;
 }
 
 pub trait SegmentStore: Send + Sync {

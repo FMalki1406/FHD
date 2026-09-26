@@ -141,16 +141,22 @@ fn a_clone_name_that_is_not_one_component_is_refused() {
     assert!(!sandbox.0.join("inner/escaped").exists());
 }
 
-/// The move lands the pinned object in the adopted folder, and it is the same
-/// object.
+/// With nobody interfering, the object that lands in the adopted folder is the
+/// one that was pinned.
 ///
-/// This is the step that would make the macOS candidate publication rather than
-/// a copy nobody can identify. The clone is made in a directory the engine owns
-/// and opened there, so the handle is held before the name ever appears in the
-/// user's folder; the move then carries *that object*. If identity survives the
-/// move, the engine can answer "this path reaches the file I published" about
-/// the thing it is holding, which is what the reviews said cloning straight
-/// into the destination could not do.
+/// **That is all this measures, and it is less than it first appeared.** This
+/// comment used to say the move "carries *that object*", which is wrong: the
+/// move takes the staged **name**, and
+/// `a_moved_clone_carries_the_staged_name_not_the_pinned_object` below
+/// demonstrates it by substituting that name and watching the substitute get
+/// published. Identity holding here is what happens when nothing swaps the name
+/// in between -- a description of the quiet case, not a property the mechanism
+/// enforces.
+///
+/// It is kept because it is still worth knowing that the move is a move: the
+/// inode is preserved and the staged name is gone afterwards, so this is not a
+/// copy. What it must not be read as is evidence that the engine keeps hold of
+/// the published file.
 #[test]
 fn a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder() {
     let sandbox = Sandbox::new();

@@ -56,6 +56,9 @@ struct SubstituteThenLink {
 }
 
 impl HandleLinker for SubstituteThenLink {
+    fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+        open_identity_through_the_platform(path)
+    }
     fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
         objects_match(left, right)
     }
@@ -103,6 +106,17 @@ fn link_through_the_platform(
         std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
         other => StorageError::Io(other),
     })
+}
+
+/// The location check's open, through the platform, for the same reason.
+///
+/// A double that opened the requested path itself would be measuring its own
+/// open. In particular the FIFO case below is about `O_NONBLOCK` being set by
+/// the production implementation, which a double written in a crate without
+/// `libc` cannot reproduce.
+fn open_identity_through_the_platform(path: &Path) -> Result<Option<fs::File>, StorageError> {
+    fhd_platform::open_regular_without_blocking(path)
+        .map_err(|error| StorageError::Io(error.kind()))
 }
 
 fn spec(size: u64) -> PartSpec {
@@ -185,6 +199,9 @@ fn publication_never_replaces_a_file_that_is_already_there() {
 
     struct RealLinker;
     impl HandleLinker for RealLinker {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
             objects_match(left, right)
         }
@@ -245,6 +262,9 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
         wrote: Arc<AtomicBool>,
     }
     impl HandleLinker for WriteThenLink {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
             objects_match(left, right)
         }
@@ -341,6 +361,9 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
         swapped: Arc<AtomicBool>,
     }
     impl HandleLinker for SwapFolderThenLink {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
             objects_match(left, right)
         }
@@ -447,6 +470,9 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
 fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
     struct NoMechanism;
     impl HandleLinker for NoMechanism {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
             Err(StorageError::Unsupported)
         }
@@ -538,6 +564,9 @@ fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
 fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() {
     struct RealLinker;
     impl HandleLinker for RealLinker {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn link(
             &self,
             file: &fs::File,
@@ -612,6 +641,9 @@ fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() 
 fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_else() {
     struct Refuse(Arc<AtomicBool>);
     impl HandleLinker for Refuse {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn link(
             &self,
             file: &fs::File,
@@ -748,6 +780,9 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
 fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
     struct LinkButCannotCompare;
     impl HandleLinker for LinkButCannotCompare {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn link(
             &self,
             file: &fs::File,
@@ -821,6 +856,9 @@ fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
 fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
     struct RealLinker;
     impl HandleLinker for RealLinker {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn link(
             &self,
             file: &fs::File,
@@ -904,6 +942,9 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
 fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
     struct RealLinker;
     impl HandleLinker for RealLinker {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
         fn link(
             &self,
             file: &fs::File,
@@ -969,5 +1010,158 @@ fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
     assert!(
         fs::read_dir(&downloads).unwrap().next().is_none(),
         "a second copy was published into the folder that took the name"
+    );
+}
+
+/// **A FIFO at the requested path does not hang publication, and is not a move
+/// nobody can distinguish from a move.**
+///
+/// The location check used `File::open` on the requested path. On unix a blocking
+/// `O_RDONLY` open of a FIFO waits for a writer that may never come -- and by
+/// that line the file is already linked into the adopted folder and the part is
+/// sealed. So whoever could write the destination folder could leave a FIFO at
+/// the name the user chose and the call that reports *where the file landed*
+/// would never return, with nothing able to cancel it: not a lost file, but a
+/// download stuck in `Publishing` for good.
+///
+/// The scenario is the one that makes it reachable rather than hypothetical. The
+/// adopted folder is displaced **after** its handle was taken, an impostor
+/// directory takes its name, and a FIFO is put at the requested path. All three
+/// happen inside the linker call, which is the real boundary: after the bytes
+/// were proved, before the destination exists.
+///
+/// What must come back is the truth: the file was published -- into the folder
+/// whose handle was adopted, which is now somewhere else -- and the requested
+/// path does not reach it. That is `Moved`, and it must come back **within a
+/// bounded wait**, which is what the channel below is for. A hang is a timeout,
+/// not a failed assertion, so the test says which.
+///
+/// Unix only, because only unix has a FIFO to put there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_at_the_requested_path_does_not_hang_publication() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct DisplaceThenFifo {
+        approved: PathBuf,
+        aside: PathBuf,
+        requested: PathBuf,
+        compared: Arc<AtomicBool>,
+    }
+    impl HandleLinker for DisplaceThenFifo {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            // Published through the adopted handle first, so the file really is
+            // delivered before anything below can confuse the report about it.
+            link_through_the_platform(file, folder, name)?;
+            // The adopted folder is moved aside and an impostor takes its name.
+            fs::rename(&self.approved, &self.aside).expect("the folder is displaced");
+            fs::create_dir(&self.approved).expect("an impostor takes the name");
+            // And a FIFO is left at exactly the path the user asked for.
+            let made = std::process::Command::new("mkfifo")
+                .arg(&self.requested)
+                .status()
+                .expect("mkfifo(1) is needed to measure that a FIFO cannot hang publication");
+            assert!(
+                made.success(),
+                "mkfifo(1) failed, so this run measures nothing"
+            );
+            Ok(())
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            // Reaching here would mean the FIFO was opened and handed on to be
+            // compared, which is the thing that must not happen.
+            self.compared.store(true, Ordering::SeqCst);
+            objects_match(left, right)
+        }
+    }
+
+    let directory = Directory::new("publish-fifo");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let approved = directory.0.join("approved");
+    fs::create_dir(&approved).unwrap();
+    let destination = approved.join("published.bin");
+    // A file of someone else's, in the folder the impostor will not be, to show
+    // that none of this touches anything but the download.
+    let bystander = directory.0.join("bystander.bin");
+    fs::write(&bystander, b"someone else's file").unwrap();
+
+    let compared = Arc::new(AtomicBool::new(false));
+    let store = FileStorage::default().with_linker(Arc::new(DisplaceThenFifo {
+        approved: approved.clone(),
+        aside: directory.0.join("moved-away"),
+        requested: destination.clone(),
+        compared: compared.clone(),
+    }));
+
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    // On its own thread with a bounded wait, because the defect this measures is
+    // a call that never returns. A failed assertion and a hang are different
+    // findings and the message says which.
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = part.publish();
+        // The part is moved into the thread, so its seal is read here.
+        let _ = send.send(outcome);
+    });
+    let outcome = receive
+        .recv_timeout(Duration::from_secs(20))
+        .expect("publish did not return: the location check blocked on the FIFO");
+
+    let outcome = outcome.expect("publication itself succeeded before the check");
+    match outcome {
+        Published::Moved { name, .. } => assert_eq!(
+            name,
+            destination.file_name().unwrap(),
+            "the report named something other than the requested leaf"
+        ),
+        other => panic!("a FIFO at the requested path was reported as {other:?}"),
+    }
+    assert!(
+        !compared.load(Ordering::SeqCst),
+        "the FIFO was opened and passed on to be compared"
+    );
+
+    // The file really was published, into the folder whose handle was adopted.
+    assert_eq!(
+        fs::read(directory.0.join("moved-away").join("published.bin")).unwrap(),
+        b"AAAAAA",
+        "the published bytes are not the proved bytes"
+    );
+    // The FIFO is still a FIFO: nothing replaced or removed what was at the
+    // requested path, and nothing was published a second time.
+    let left = fs::symlink_metadata(&destination).unwrap();
+    assert!(
+        !left.file_type().is_file(),
+        "something was written over the requested path"
+    );
+    assert_eq!(
+        fs::read(&bystander).unwrap(),
+        b"someone else's file",
+        "an unrelated file was touched"
+    );
+    // And the part keeps its seal. A location check that came back "not here" is
+    // not a failed publication: the inode the delivered file links to must stay
+    // unwritable, or the user's file could be rewritten under them.
+    let meta = fs::read(parts.join("1-1.meta")).unwrap();
+    assert_eq!(
+        meta.get(33),
+        Some(&fhd_app::storage::Publication::Linked.to_byte()),
+        "a location check that could not find the file unsealed a part that published"
     );
 }

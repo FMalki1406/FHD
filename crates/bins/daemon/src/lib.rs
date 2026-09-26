@@ -295,6 +295,17 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
         }
     }
 
+    /// Both platforms answer this the same way, so it is not split by `cfg`:
+    /// `fhd-platform` opens without blocking where blocking is possible and
+    /// checks the type from the handle on both.
+    fn open_for_identity(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<std::fs::File>, fhd_app::storage::StorageError> {
+        fhd_platform::open_regular_without_blocking(path)
+            .map_err(|error| fhd_app::storage::StorageError::Io(error.kind()))
+    }
+
     fn link(
         &self,
         file: &std::fs::File,

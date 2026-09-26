@@ -988,13 +988,26 @@ impl SegmentFile for FilePart {
         // Nothing is republished and nothing is removed on any of these
         // branches. A second publication would leave a copy somewhere, and a
         // removal would act on a file this engine cannot prove is its own.
-        let at_path = match File::open(&requested) {
-            Ok(file) => file,
-            // Nothing is there. That is an answer: the path does not reach it.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(moved),
-            // Anything else -- denied, busy, a device that will not open -- is
-            // a question that went unanswered, not a file that moved.
-            Err(error) => return Ok(unverified(io(error))),
+        // Through the port, not `File::open`. A blocking open of a FIFO on Unix
+        // waits for a writer that may never come, and by this line the file is
+        // published and the part is sealed -- so whoever can write the
+        // destination folder could leave a FIFO at the requested name and hang
+        // the call that reports where the file landed, with nothing able to
+        // cancel it. The port opens without blocking and hands back a handle only
+        // for a regular file, both decided from the descriptor rather than the
+        // path.
+        //
+        // Every branch here returns `Ok`. The publication already happened; a
+        // location check that cannot finish says so and changes nothing else. It
+        // must not unseal a file the user may already have.
+        let at_path = match linker.open_for_identity(&requested) {
+            // Nothing there, or not a regular file: either way the path does not
+            // reach what was published.
+            Ok(None) => return Ok(moved),
+            Ok(Some(file)) => file,
+            // Denied, busy, a device that would not open -- a question that went
+            // unanswered, not a file that moved.
+            Err(error) => return Ok(unverified(error)),
         };
         match linker.same_object(&self.file, &at_path) {
             Ok(true) => Ok(Published::At(requested)),
@@ -1251,6 +1264,9 @@ mod tests {
         folder: PathBuf,
     }
     impl HandleLinker for LinkByName {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
+            identity_open_for_a_double(path)
+        }
         fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
             // Both handles ignored, both ends resolved by path: exactly the
             // behaviour the real linker replaces, which is why the properties
@@ -1281,6 +1297,30 @@ mod tests {
         }))
     }
 
+    /// What a double can manage for the location check's open.
+    ///
+    /// **It is not what production does, and the difference is the point of the
+    /// port.** Production sets `O_NONBLOCK`, which needs `libc`, which this crate
+    /// may not have -- so a double here asks the path for the type first and only
+    /// then opens. That is enough to keep these tests off a FIFO, and it is not
+    /// enough for production: between the question and the open, the name can be
+    /// made to mean something else. The non-blocking property is therefore
+    /// measured where the real implementation lives, in the daemon's
+    /// `a_fifo_at_the_requested_path_does_not_hang_publication`.
+    fn identity_open_for_a_double(path: &Path) -> Result<Option<File>, StorageError> {
+        match fs::metadata(path) {
+            Ok(found) if !found.file_type().is_file() => return Ok(None),
+            Ok(_) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StorageError::Io(error.kind())),
+        }
+        match File::open(path) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StorageError::Io(error.kind())),
+        }
+    }
+
     /// A platform with no mechanism.
     ///
     /// The unit tests here cannot reach the real one: `fhd-storage` may not
@@ -1291,6 +1331,9 @@ mod tests {
     /// tests, where the composition root lives.
     struct NoMechanism;
     impl HandleLinker for NoMechanism {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
+            identity_open_for_a_double(path)
+        }
         fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
@@ -1703,6 +1746,9 @@ mod tests {
             failing: Arc<std::sync::atomic::AtomicBool>,
         }
         impl HandleLinker for FailAfterFirst {
+            fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
+                identity_open_for_a_double(path)
+            }
             fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
                 if self.failing.load(Ordering::SeqCst) {
                     return Err(StorageError::Io(std::io::ErrorKind::StorageFull));
@@ -1842,6 +1888,9 @@ mod tests {
         seen: Arc<std::sync::Mutex<Option<u8>>>,
     }
     impl HandleLinker for WatchTheRecord {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
+            identity_open_for_a_double(path)
+        }
         fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
             let byte = fs::read(&self.meta)
                 .ok()

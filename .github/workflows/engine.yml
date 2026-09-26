@@ -49,10 +49,13 @@ jobs:
           node --version
       - name: Check formatting
         run: cargo +1.98.1 fmt --all -- --check
+      # Both gates and both of their test suites. Running a gate without its own
+      # tests is how an approved allowance once broke the build for everyone.
       - name: Enforce architecture boundaries
         run: |
           node tools/check-architecture.test.mjs
           node tools/check-architecture.mjs
+          node tools/check-contract-tests.test.mjs
       - name: Check Rust warnings
         run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
       # Split by area on purpose: a job's step names and their results are
@@ -287,8 +290,16 @@ jobs:
       # The publication contract, on the wired path. Named on its own because
       # the storage adapter cannot reach the platform mechanism, so this is the
       # only place it is measured.
+      # Not `cargo test` directly. That step went green with **zero tests** on
+      # ubuntu once, and it also goes green when a test is `#[ignore]`d or a cfg
+      # stops compiling one. The counting was then a one-off log read: somebody
+      # counted ten tests once and nothing kept counting. This runs the same
+      # tests and fails unless every property required on this platform ran and
+      # passed, with none ignored. Verified by mutation: an `#[ignore]`, a
+      # narrowed cfg, the whole file cfg'd off, and a test missing from the
+      # specification all fail it.
       - name: Test the publication contract
-        run: cargo +1.98.1 test -p fhd-daemon --test publication --locked
+        run: node tools/check-contract-tests.mjs
       - name: Test the engine as a program
         run: cargo +1.98.1 test -p fhd-daemon --locked --test process
       - name: Test legacy engine and stores

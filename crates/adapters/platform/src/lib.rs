@@ -406,6 +406,59 @@ mod imp {
         Err(io::Error::last_os_error())
     }
 
+    /// Opens `path` for the publication location check: never blocking, and only
+    /// when a regular file is there.
+    ///
+    /// `Ok(None)` means the path does not reach a regular file -- nothing is
+    /// there, or what is there is a directory, a FIFO, a socket or a device. The
+    /// caller reads that as "the path does not reach what was published", which
+    /// is true of all of them.
+    ///
+    /// **Why this is not `File::open`.** Publication links the verified object
+    /// into the adopted folder and only then asks whether the path the operator
+    /// gave still reaches it. That question was asked with `File::open`, and on
+    /// Unix a blocking `O_RDONLY` open of a **FIFO waits for a writer that may
+    /// never come**. Whoever can write the destination folder could leave one at
+    /// the requested name and the answer would never come back: the file is
+    /// already published and sealed, and the call that should report where it
+    /// landed hangs instead, with nothing able to cancel it. `O_NONBLOCK` makes
+    /// the open return, and the file-type check is what makes the answer
+    /// truthful rather than merely prompt.
+    ///
+    /// The type is read from the **open descriptor**, not from the path, so
+    /// nothing can be swapped in between the check and the answer.
+    ///
+    /// **`O_NOFOLLOW` is deliberately absent**, unlike `open_in_directory` above.
+    /// The two ask opposite questions. That one pins an object the engine just
+    /// created and must not accept a symlink standing in for it. This one asks
+    /// "does the path the operator gave reach what was published" -- and
+    /// following a symlink is part of what a path means, so a link pointing at the
+    /// published file is a path that does reach it. What the type check refuses is
+    /// answering `At` about something that is not a file at all.
+    ///
+    /// `O_NONBLOCK` is left set on what comes back: `read(2)` ignores it on a
+    /// regular file, and only a regular file is returned. Nothing reads through
+    /// this handle anyway -- it exists to be compared with `same_object`.
+    #[cfg(unix)]
+    pub fn open_regular_without_blocking(
+        path: &std::path::Path,
+    ) -> io::Result<Option<std::fs::File>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path);
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.file_type().is_file() {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
     /// Unix identifies the peer by credentials on the socket itself, so the name
     /// carries nothing: `fhd-ipc` checks ownership of the directory and socket
     /// and asks the kernel who connected.
@@ -1395,6 +1448,30 @@ mod imp {
     /// `FileLinkInfo`, so the documented Win32 surface has no route. Whether to
     /// take the NT one is an open decision, and until it is taken this is the
     /// difference between publishing the wrong bytes and refusing to.
+    /// Opens `path` for the publication location check, only when a regular file
+    /// is there.
+    ///
+    /// The unix side of this exists because a blocking open of a FIFO waits for a
+    /// writer that may never come, which hung publication after the file was
+    /// already published. Windows filesystem paths hold no FIFOs -- a named pipe
+    /// lives in its own namespace under `\\.\pipe\`, not under a directory the
+    /// user chose -- so there is no blocking case here to avoid. The type check
+    /// is kept all the same, so both platforms answer `At` on the same grounds
+    /// rather than on grounds that differ by accident.
+    ///
+    /// The type is read from the open handle, not from the path.
+    pub fn open_regular_without_blocking(path: &Path) -> io::Result<Option<File>> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.file_type().is_file() {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
     pub fn same_object(left: &File, right: &File) -> io::Result<bool> {
         fn identity(file: &File) -> io::Result<FILE_ID_INFO> {
             let mut info = FILE_ID_INFO {
@@ -1775,6 +1852,8 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 pub use imp::link_into_directory;
+/// Both platforms have this one, for the same question asked the same way.
+pub use imp::open_regular_without_blocking;
 #[cfg(windows)]
 pub use imp::{
     acceptable_descriptor, create_pipe, link_into_directory, open_directory, open_pipe, same_object,
