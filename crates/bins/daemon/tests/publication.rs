@@ -12,17 +12,21 @@
 //! and before the destination exists, and it receives the handle that was
 //! proved. A linker that takes the source name away and then delegates to the
 //! real mechanism reproduces the attack exactly, with no timing in the answer.
-// Every test here measures the Windows publication mechanism, so the whole file
-// is Windows-only. It says so once, at the crate root, rather than on each item.
+// Every test here measures a real publication mechanism, so the file compiles
+// where one exists: Windows and Linux.
 //
-// This is the fix for a CI failure that Windows could not see. The helpers and
-// the `SubstituteThenLink` double were not gated while all nine tests were, so
-// on Linux and macOS the file compiled to a struct nobody constructs and
-// functions nobody calls -- `dead_code` under `-D warnings` -- and worse, the
-// double's `same_object` called `fhd_platform::same_object`, which that crate
-// exports only on Windows. A hard name error, invisible here, red on both other
-// runners at `Check Rust warnings`.
-#![cfg(windows)]
+// It was Windows-only, and the reason given was that the doubles called
+// `fhd_platform::same_object`, which that crate exports only on Windows. That
+// was true and it stopped being true: Linux has had a mechanism since
+// `link_into_directory` landed there, and the answer `same_object` needs on
+// unix is `dev` and `ino`, which the composition root already writes. Two
+// independent reviews arrived at the same place from different directions --
+// the CI step named "Test the publication contract" was running **zero tests**
+// on ubuntu and exiting zero, so the substitution attack, the folder swap, the
+// seal after a crash and the refusal contract were all unmeasured on the
+// platform that had just been given a mechanism. A green step standing in for
+// evidence is worse than a missing one, because nobody goes looking.
+#![cfg(any(windows, target_os = "linux"))]
 
 mod harness;
 
@@ -53,27 +57,52 @@ struct SubstituteThenLink {
 
 impl HandleLinker for SubstituteThenLink {
     fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-        fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+        objects_match(left, right)
     }
     fn link(&self, file: &fs::File, folder: &fs::File, name: &OsStr) -> Result<(), StorageError> {
         fs::rename(&self.source, &self.aside).expect("the source name is taken");
         fs::write(&self.source, &self.theirs).expect("another file takes that name");
         self.reached.store(true, Ordering::SeqCst);
-        let _ = (file, folder, name);
-        #[cfg(windows)]
-        {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            Err(StorageError::Unsupported)
-        }
+        link_through_the_platform(file, folder, name)
     }
+}
+
+/// Whether two handles hold the same object, however this system says so.
+///
+/// The same answer the composition root gives, by the same means: Windows needs
+/// a platform call because `windows_by_handle` is unstable, and unix has `dev`
+/// and `ino` in safe std.
+fn objects_match(left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+    #[cfg(windows)]
+    {
+        fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = left
+            .metadata()
+            .map_err(|error| StorageError::Io(error.kind()))?;
+        let right = right
+            .metadata()
+            .map_err(|error| StorageError::Io(error.kind()))?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+}
+
+/// The real mechanism, called the way the engine calls it.
+///
+/// Every double here goes through this, so what the tests measure is the
+/// platform's own behaviour rather than a stand-in that agrees with the test.
+fn link_through_the_platform(
+    file: &fs::File,
+    folder: &fs::File,
+    name: &OsStr,
+) -> Result<(), StorageError> {
+    fhd_platform::link_into_directory(file, folder, name).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+        other => StorageError::Io(other),
+    })
 }
 
 fn spec(size: u64) -> PartSpec {
@@ -159,7 +188,7 @@ fn publication_never_replaces_a_file_that_is_already_there() {
     struct RealLinker;
     impl HandleLinker for RealLinker {
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
         fn link(
             &self,
@@ -167,12 +196,7 @@ fn publication_never_replaces_a_file_that_is_already_there() {
             folder: &fs::File,
             name: &OsStr,
         ) -> Result<(), StorageError> {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
     }
 
@@ -224,7 +248,7 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
     }
     impl HandleLinker for WriteThenLink {
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
         fn link(
             &self,
@@ -239,12 +263,7 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
                     self.wrote.store(true, Ordering::SeqCst);
                 }
             }
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
     }
 
@@ -325,7 +344,7 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
     }
     impl HandleLinker for SwapFolderThenLink {
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
         fn link(
             &self,
@@ -337,12 +356,7 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
                 fs::create_dir(&self.approved).expect("an impostor takes the name");
                 self.swapped.store(true, Ordering::SeqCst);
             }
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
     }
 
@@ -532,15 +546,10 @@ fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() 
             folder: &fs::File,
             name: &OsStr,
         ) -> Result<(), StorageError> {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
     }
 
@@ -614,15 +623,10 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
             if self.0.load(Ordering::SeqCst) {
                 return Err(StorageError::Unsupported);
             }
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
     }
 
@@ -752,12 +756,7 @@ fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
             folder: &fs::File,
             name: &OsStr,
         ) -> Result<(), StorageError> {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
             Err(StorageError::Unsupported)
@@ -830,15 +829,10 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
             folder: &fs::File,
             name: &OsStr,
         ) -> Result<(), StorageError> {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
     }
 
@@ -918,15 +912,10 @@ fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
             folder: &fs::File,
             name: &OsStr,
         ) -> Result<(), StorageError> {
-            fhd_platform::link_into_directory(file, folder, name).map_err(|error| {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-                    other => StorageError::Io(other),
-                }
-            })
+            link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
-            fhd_platform::same_object(left, right).map_err(|error| StorageError::Io(error.kind()))
+            objects_match(left, right)
         }
     }
 

@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 tokio = { version = "=1.51.4", features = ["net"] }
 
-# `geteuid(2)` and nothing else.
+# `geteuid(2)`, `linkat(2)` on Linux, and `fclonefileat(2)` on macOS.
 #
 # Already in Cargo.lock as a transitive dependency, so naming it here adds no
 # code to the build. That does not make it exempt from review: direct and
@@ -15,10 +15,24 @@ tokio = { version = "=1.51.4", features = ["net"] }
 # this project requires, and arriving through another crate has never been a way
 # round it.
 #
-# What is used and what is not: one function, `geteuid`, in `our_uid`. No
-# allocation, no pointers, no file descriptors, nothing that can fail. If a
-# second use appears it is a change to this comment and to the unsafe allowance
-# in tools/check-architecture.mjs, both of which are reviewed.
+# What is used, exactly:
+#
+#   * `geteuid` in `our_uid`. No arguments, no pointers, cannot fail.
+#   * `linkat` with `AT_FDCWD` and `AT_SYMLINK_FOLLOW` in `link_into_directory`
+#     on Linux: two borrowed descriptors, two NUL-terminated names owned by the
+#     caller, a status back. It publishes, so it can fail, and every failure it
+#     can return is mapped by the composition root.
+#   * `fclonefileat` in `clone_into_directory` on macOS, which nothing calls --
+#     it exists to be measured on the platform, and macOS still refuses to
+#     publish.
+#
+# This comment said "one function, `geteuid`, and nothing else" while the crate
+# had already grown the other two, and it is the comment that states the rule it
+# broke: a second use is a change to this text and to the unsafe allowance in
+# tools/check-architecture.mjs, both reviewed. The allowance was updated and this
+# was not, so a dependency reviewer reading the manifest got a wrong answer.
+# Found by an independent security review, which is later than it should have
+# been caught.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
 

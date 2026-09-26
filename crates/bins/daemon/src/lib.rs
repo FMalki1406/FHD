@@ -326,10 +326,25 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
         // `docs/publication-contract.md`.
         #[cfg(target_os = "linux")]
         {
-            // The same mapping as Windows, from the same kinds. A filesystem
-            // without hard links or a cross-device destination is unsupported.
-            // Missing procfs can instead surface as Io(NotFound); there is no
-            // fallback to a source path in either case.
+            // The same mapping as Windows, from the same kinds -- but what
+            // reaches it on Linux is not what this comment used to say.
+            //
+            // It claimed a filesystem without hard links arrives as
+            // `Unsupported`. It does not: `link(2)` returns **`EPERM`** for
+            // that, which std calls `PermissionDenied`, so the operator is told
+            // their permissions are wrong about a filesystem that simply cannot
+            // do it. `Unsupported` is reachable here only through `EXDEV`, and
+            // that is itself near-unreachable because the part directory is made
+            // inside the destination folder. A review worked the table out;
+            // correcting the mapping means telling `EPERM` from a real denial,
+            // which needs the errno rather than the kind, and is not done.
+            //
+            // Missing procfs arrives as `Io(NotFound)`, which reads as "your
+            // file is gone" rather than "this machine has no /proc" -- also
+            // recorded, also not fixed. What matters for safety is that no
+            // errno makes the engine retry or fall back to a path: the
+            // coordinator sends `Conflict` to `Destination` and everything else
+            // to `Storage`, both straight to `NeedsAction` with no retry loop.
             fhd_platform::link_into_directory(file, directory, name).map_err(|error| {
                 match error.kind() {
                     std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
@@ -487,7 +502,24 @@ fn reference(label: &[u8], parts: &[&[u8]]) -> u64 {
 /// too early apart from one that asked for something impossible.
 fn own_parts(state: &Path) -> Result<FileStorage, EngineError> {
     FileStorage::own(&state.join("parts"))
-        .map(|store| store.with_linker(Arc::new(PlatformLinker)))
+        .map(|store| {
+            // No linker at all where there is no mechanism, rather than one that
+            // refuses from the inside.
+            //
+            // The storage adapter has a branch for "no linker" that resolves it
+            // before anything is written, and it exists for exactly this: a
+            // refusal from inside `link` happens *after* `mark(Attempted)`, so a
+            // crash in that gap leaves the part in the one state nothing can
+            // decide -- on a platform where it is certain no name was created.
+            // macOS was reaching that branch, walking around a fix an earlier
+            // review had asked for, until a later review noticed. The decision
+            // belongs here, where the platform is known.
+            if cfg!(any(windows, target_os = "linux")) {
+                store.with_linker(Arc::new(PlatformLinker))
+            } else {
+                store
+            }
+        })
         .map_err(|error| match error {
             fhd_app::storage::StorageError::Locked => EngineError::StateBusy,
             _ => EngineError::InvalidInput,

@@ -183,6 +183,19 @@ mod imp {
         // A relative name under a directory is exactly one component. Any
         // separator would reopen the path resolution this call exists to avoid,
         // and an interior NUL cannot cross the C boundary at all.
+        //
+        // The bytes are checked before the parse, because Path::components`n        // normalises: it accepts `x/`, `x//` and `x/.` as the single component
+        // `x`. None of those escapes the directory -- they end in a separator, so
+        // the kernel refuses them -- except that `x/.` where `x` is a symlink to
+        // a directory **is** walked, which is destination-end path resolution and
+        // the one thing this call exists to prevent. A security review measured
+        // which spellings get through; the check is on the bytes now.
+        if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a link name must be a single path component",
+            ));
+        }
         let mut components = Path::new(name).components();
         match (components.next(), components.next()) {
             (Some(std::path::Component::Normal(_)), None) => (),

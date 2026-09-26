@@ -178,6 +178,22 @@ jobs:
               identifies_its_object carries_the_held_file; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
+          # A filter that matches nothing exits zero, so a step can go green
+          # having run no test at all. The list above catches a *rename* -- the
+          # test lands in listed and not in covered -- but not a deletion or
+          # a cfg that switches one off, because then it is in neither. Both
+          # reviews of the Linux work found that hole, and this is the half of
+          # it worth closing here: the publication properties must exist on the
+          # platform that claims them.
+          expected=""
+          case "${RUNNER_OS}" in
+            Linux) expected="a_source_name_taken_over_does_not_change_what_is_published an_occupied_name_is_refused_and_the_file_there_is_untouched a_name_that_is_not_one_component_is_refused a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into" ;;
+            macOS) expected="a_clone_carries_the_bytes_of_the_handle_not_of_its_name a_clone_is_a_separate_object_from_the_part_it_came_from a_clone_refuses_an_occupied_name_and_leaves_it_untouched a_clone_name_that_is_not_one_component_is_refused" ;;
+          esac
+          for wanted in $expected; do
+            printf '%s\n' "$listed" | grep -qx -- "$wanted" || {
+              echo "a step names this test and this platform does not have it: $wanted"; exit 1; }
+          done
           missing=$(comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$covered"))
           if [ -n "$missing" ]; then
             echo "no step runs these tests:"; printf '%s\n' "$missing"; exit 1

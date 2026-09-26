@@ -14,14 +14,21 @@ use std::{
 
 /// Whether this build can publish on this platform.
 ///
-/// Windows only today: the mechanism is an NT call, and no measured equivalent
-/// exists yet for Linux or macOS. Publication refuses there rather than falling
-/// back to linking by path, which is the behaviour being replaced.
+/// Windows and Linux: an NT call there, `linkat` through the descriptor's
+/// procfs entry here. macOS has no measured mechanism and refuses, rather than
+/// falling back to linking by path, which is the behaviour being replaced.
 ///
-/// **Green tests are not a support claim.** This constant is what the tests
-/// below assert against, and `publication_support_on_this_platform_is_declared`
-/// is what ties it to the engine's actual behaviour, so the two cannot drift
-/// into a suite that passes while nothing works.
+/// **Green tests are not a support claim.** What keeps this constant honest is
+/// the suites that read it: set it true where publication does not work and
+/// `published_as_declared` fails for want of a published file; set it false
+/// where it does and the refusal branch fails instead. So a wrong value is a
+/// red run either way.
+///
+/// It used to credit that guarantee to a test named
+/// `publication_support_on_this_platform_is_declared`, **which has never
+/// existed in this repository** -- a comment describing a control that was
+/// never written, which an independent review found by grepping for it. The
+/// guarantee is real; the attribution was not.
 pub const PUBLISHES: bool = cfg!(any(windows, target_os = "linux"));
 
 /// Whether a part beside `destination` holds exactly `body`.
