@@ -78,6 +78,27 @@ fn await_session(
     awaiting.entry(id).or_default().push((command, reply));
 }
 
+/// Whether a job actually reached where the command was taking it.
+///
+/// **Every site that answers a caller goes through this now.** Three of them used
+/// to answer `Yes` on weaker evidence, and two independent reviews found all
+/// three: a running job answered on the hand-off; a job left at `Cancelling`
+/// answered because the coordinator treated that as settled; and a queued job
+/// answered *before* its cleanup ran at all. A `Pause` that leaves a job in
+/// `Stopping` is the same shape -- the command was accepted and the job is not
+/// paused.
+///
+/// So the question is not "did a step succeed" but "is the job where the operator
+/// asked for it to be". Anything else is `No`, which is what the IPC layer turns
+/// into a failure the client can act on.
+fn reached(job: &Job, command: JobCommand) -> bool {
+    match command {
+        JobCommand::Cancel => job.state() == JobState::Cancelled,
+        JobCommand::Pause => job.state() == JobState::Paused,
+        _ => false,
+    }
+}
+
 /// Answers a caller once, if one is still waiting.
 fn answer(reply: Option<oneshot::Sender<Applied>>, applied: Applied) {
     if let Some(reply) = reply {
@@ -92,12 +113,13 @@ fn answer(reply: Option<oneshot::Sender<Applied>>, applied: Applied) {
 /// Nothing could tell an ignored command from a done one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
-    /// Handed to the session that is running the job, which stops itself, or
-    /// applied to a job this scheduler was holding or found resting in the
-    /// record. The job's own transition is recorded either way.
+    /// **The job is where the command asked for it to be, in the record.**
     ///
-    /// For a running job this means accepted rather than finished: the session
-    /// stops in its own time, and the record is what says when.
+    /// This used to say "handed to the session that is running the job, which
+    /// stops itself … accepted rather than finished". That was the semantics CI
+    /// caught as a false report, and both reviews of the fix found the comment
+    /// still publishing it. A `Yes` is now issued only after `reached` agrees with
+    /// the record: `Cancelled` for a cancel, `Paused` for a pause.
     Yes,
     /// No such job, or a command its state refuses.
     No,
@@ -231,12 +253,16 @@ impl Scheduler {
                     let Some(finished) = finished else { continue };
                     match finished {
                         Ok((id, job, result)) => {
-                            self.finish(&mut active, &mut awaiting, &mut used, id, &result).await;
+                            let settled = self
+                                .finish(&mut active, &mut awaiting, &mut used, id, &result)
+                                .await;
                             match result {
-                                // The job moved: classify it and let it run on.
+                                // The job moved: classify it and let it run on. The
+                                // record's copy wins over the session's wherever
+                                // answering a caller moved it.
                                 Ok(end) => {
                                     last.insert(id, Ok(end));
-                                    self.enqueue(&mut queue, job);
+                                    self.enqueue(&mut queue, settled.unwrap_or(job));
                                 }
                                 // A failed session proves nothing about the job: the
                                 // commit that failed is what the repository holds.
@@ -295,7 +321,21 @@ impl Scheduler {
         queue.take(Entry { job, origin });
     }
 
-    /// Releases the grant and tells the governor how the origin behaved.
+    /// Releases the grant, answers whoever was waiting, and tells the governor how
+    /// the origin behaved.
+    ///
+    /// **Returns the job as the record now holds it, when answering changed it.**
+    /// Not a convenience: answering a waiting caller can commit a transition, and
+    /// the run loop enqueues the `Job` the *session* returned one line later. That
+    /// copy is then a version behind, and an engineering review traced the
+    /// consequence -- the repository rejects the next transition on its version
+    /// check, so a job the record calls `Cancelled`, whose part has already been
+    /// deleted, comes back as a failed job; or, where the session ended `Queued`,
+    /// gets re-admitted and has a whole session spawned for it, opening a part for a
+    /// cancelled job.
+    ///
+    /// Before this change `finish` wrote nothing, so a stale copy was harmless.
+    /// Making it a mutator of the record is what made it matter.
     async fn finish(
         &self,
         active: &mut HashMap<JobId, Active>,
@@ -303,7 +343,7 @@ impl Scheduler {
         used: &mut usize,
         id: JobId,
         result: &Result<SessionEnd, RunError>,
-    ) {
+    ) -> Option<Job> {
         // The session is gone, so every caller that was handed to it can finally
         // be answered -- from the record, not from the hand-off. This is the whole
         // fix for the race: a session that ended without reading its channel left
@@ -311,18 +351,31 @@ impl Scheduler {
         //
         // Done first, so that a caller is answered even if the job was never in
         // `active` (a panicked session comes through here too).
+        let mut settled = None;
         for (command, reply) in awaiting.remove(&id).into_iter().flatten() {
-            let applied = match self.coordinator.confirm_command(id, command).await {
-                Ok(Some(_)) => Applied::Yes,
-                Ok(None) | Err(_) => {
-                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
-                    Applied::No
+            match self.coordinator.confirm_command(id, command).await {
+                Ok(Some(job)) => {
+                    let applied = if reached(&job, command) {
+                        Applied::Yes
+                    } else {
+                        emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                        Applied::No
+                    };
+                    // The authoritative copy, for the loop to enqueue in place of
+                    // the one the session returned.
+                    settled = Some(job);
+                    let _ = reply.send(applied);
                 }
-            };
-            let _ = reply.send(applied);
+                Ok(None) => {
+                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                    let _ = reply.send(Applied::No);
+                }
+                // Unknown rather than invalid; the reply is dropped.
+                Err(_) => emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1)),
+            }
         }
         let Some(entry) = active.remove(&id) else {
-            return;
+            return settled;
         };
         *used -= entry.grant;
         let now = self.clock.now_ms();
@@ -332,6 +385,7 @@ impl Scheduler {
         if matches!(result, Ok(SessionEnd::Published(_))) {
             self.governor.succeeded(entry.origin, now);
         }
+        settled
     }
 
     /// Moves every job whose retry deadline has passed back into the ready queue.
@@ -447,10 +501,18 @@ impl Scheduler {
                         Control::Cancel => JobCommand::Cancel,
                     };
                     match self.coordinator.command_resting(id, command).await {
-                        Ok(Some(_)) => answer(reply, Applied::Yes),
-                        Ok(None) | Err(_) => {
+                        Ok(Some(job)) if reached(&job, command) => answer(reply, Applied::Yes),
+                        Ok(_) => {
                             emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
                             answer(reply, Applied::No);
+                        }
+                        // Unknown, not invalid: the record could not be read, or the
+                        // transition could not be committed after part of it already
+                        // was. Dropping the reply is what the IPC layer reports as
+                        // unknown, and a review pointed out that calling it invalid
+                        // input manufactured a false negative.
+                        Err(_) => {
+                            emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
                         }
                     }
                 }
@@ -512,11 +574,14 @@ impl Scheduler {
             match self.coordinator.command_resting(id, command).await {
                 // No such job, or a command its state refuses: now the report is
                 // true rather than a description of this scheduler's bookkeeping.
-                Ok(None) | Err(_) => {
+                Ok(Some(job)) if reached(&job, command) => answer(reply, Applied::Yes),
+                Ok(_) => {
                     emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
                     answer(reply, Applied::No);
                 }
-                Ok(Some(_)) => answer(reply, Applied::Yes),
+                Err(_) => {
+                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                }
             }
             return false;
         };
@@ -525,16 +590,32 @@ impl Scheduler {
             Control::Cancel => JobCommand::Cancel,
         };
         match self.coordinator.command(entry.job, command).await {
-            Ok(job) => {
-                answer(reply, Applied::Yes);
-                match self.settle(job).await {
-                    Ok(job) => queue.take(Entry {
+            // Answered **after** settling, against what settling produced. This
+            // used to answer here, before `settle` -> `recover` had dropped the
+            // part and committed `CleanupFinished`, so a queued job could be
+            // reported cancelled while it rested at `Cancelling` with its part on
+            // disk. A security review found that the headline claim was therefore
+            // not true engine-wide, only for the running-session path.
+            Ok(job) => match self.settle(job).await {
+                Ok(job) => {
+                    answer(
+                        reply,
+                        if reached(&job, command) {
+                            Applied::Yes
+                        } else {
+                            emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                            Applied::No
+                        },
+                    );
+                    queue.take(Entry {
                         job,
                         origin: entry.origin,
-                    }),
-                    Err((id, error)) => queue.done.push(Outcome::failed(id, error)),
+                    });
                 }
-            }
+                // Settling failed, so what became of the command is unknown: the
+                // reply is dropped rather than guessed at.
+                Err((id, error)) => queue.done.push(Outcome::failed(id, error)),
+            },
             Err(error) => {
                 answer(reply, Applied::No);
                 queue.done.push(Outcome::failed(id, error));

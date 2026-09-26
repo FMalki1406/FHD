@@ -385,10 +385,26 @@ impl Coordinator {
         // Already where the command was taking it. Stepping again would be
         // refused by the domain, and reporting that refusal as "your cancel did
         // not work" would be the same lie in the opposite direction.
+        // `Cancelling` is **not** settled, and putting it here was a real defect.
+        //
+        // The first version of this treated it as settled, on the reasoning that
+        // "stepping again would be refused by the domain". That reasoning was
+        // wrong: `(Cancelling, Cancel)` is an accepted no-op, not a refusal. And a
+        // job can be left at `Cancelling` -- a session commits it and then ends
+        // before `CleanupFinished`, through a commit error, a domain error while
+        // draining, or a panicked task. So the short-circuit answered `Yes` for a
+        // job whose record still said `Cancelling`, with its part still on disk
+        // beside the user's destination, and nothing in that pass to finish it:
+        // only the next engine start would heal it through `recover`. That is
+        // exactly the false report this whole change exists to stop, which an
+        // engineering review demonstrated with a probe.
+        //
+        // Letting it fall through does the right thing by itself: `command_resting`
+        // no-ops the `Cancel`, then its own `if job.state() == Cancelling` block
+        // drops the part and commits `CleanupFinished` -- the same finish `recover`
+        // performs after a crash.
         let settled = match command {
-            JobCommand::Cancel => {
-                matches!(job.state(), JobState::Cancelled | JobState::Cancelling)
-            }
+            JobCommand::Cancel => job.state() == JobState::Cancelled,
             JobCommand::Pause => job.state() == JobState::Paused,
             _ => false,
         };

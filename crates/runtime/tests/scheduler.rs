@@ -428,12 +428,19 @@ async fn the_same_job_twice_is_refused_rather_than_run_twice() {
     );
 }
 
-/// A transport that parks inside `probe` until the test lets it go, then refuses
+/// A transport that parks inside `fetch` until the test lets it go, then refuses
 /// in a way that rests the job where an operator has to decide.
 ///
-/// The parking is the point. While the session is inside this call it is **not**
-/// polling its control channel, so a command handed to it during that window sits
-/// in the channel unread -- which is the state the race needs.
+/// **What the parking does and does not achieve.** It holds the transfer open so a
+/// command can be handed to a live session. It does *not* stop the session reading
+/// its control channel: `fetch` runs on a spawned worker task while the session
+/// keeps polling `control.recv()` in its own `select!`. An earlier version of this
+/// comment claimed otherwise, and two reviews found it -- the session does read the
+/// command here, which is why the record reads `Cancelling` mid-test.
+///
+/// So this measures the property that the reply is not sent on the hand-off. The
+/// path where a session ends *without* reading the command is measured at the
+/// coordinator seam instead, by `confirm_command`'s own tests.
 struct ParkedThenRefused {
     inner: ScriptedTransport,
     origin: OriginId,
@@ -446,7 +453,9 @@ impl Transport for ParkedThenRefused {
     }
     fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>> {
         // Answers normally. Probing happens at intake, before any session exists,
-        // so parking here would not put the scheduler in the state this measures.
+        // so parking here would not put the scheduler in the state this measures --
+        // measured: a command sent then is answered through the queue instead, with
+        // the record already `Cancelled`.
         self.inner.probe(source)
     }
     fn fetch(
@@ -477,9 +486,11 @@ impl Transport for ParkedThenRefused {
 /// task and the command with it, so the client was told `Done` while the job rested
 /// in `NeedsAction`, for the whole 120 seconds the test waited on it.
 ///
-/// The transport above parks the session inside `probe`, so the command is handed
-/// over while nothing is reading. Then the gate opens, the probe is refused, and
-/// the session ends.
+/// The transport above parks the transfer inside `fetch`, so the command is handed
+/// to a live session. Then the gate opens, the fetch is refused, and the session
+/// ends. The session does read the command on this path -- see the transport's own
+/// comment -- so what is measured here is that the **reply** is not sent until the
+/// record backs it.
 ///
 /// **The assertion is the invariant, not the interleaving.** Whether the session
 /// glances at its channel on the way out is a scheduling detail no test can pin;

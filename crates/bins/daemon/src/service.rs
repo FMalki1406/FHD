@@ -662,9 +662,15 @@ impl Handler for Service {
                 // send to succeed. It used to be the send: a command the
                 // scheduler then dropped was reported to the client as done, so
                 // `Pause` and `Cancel` on any stopped job said they had worked
-                // and had not. `Done` now means the job's transition was applied,
-                // or -- for a job a session is running -- that the session was
-                // handed the command and stops in its own time.
+                // and had not.
+                //
+                // **`Done` means the job is where the command asked for it to be,
+                // in the record.** This comment used to end "or -- for a job a
+                // session is running -- that the session was handed the command and
+                // stops in its own time", which is the semantics CI caught as a
+                // false report: the session could end without reading the command.
+                // Both reviews of the fix found this sentence still here, at the one
+                // boundary that defines what `Done` means to a client.
                 let (reply, applied) = oneshot::channel();
                 let command = match request {
                     Request::Cancel { .. } => Command::Cancel(id, Some(reply)),

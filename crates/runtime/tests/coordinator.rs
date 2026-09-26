@@ -797,3 +797,66 @@ async fn confirm_command_cancels_a_resting_job_and_is_safe_to_ask_twice() {
         "asking twice moved the job"
     );
 }
+
+/// **A job left at `Cancelling` is finished, not reported as already done.**
+///
+/// The arm that had no test, and the defect two independent reviews demonstrated
+/// with probes. `confirm_command` treated `Cancelling` as settled and answered
+/// yes -- so the operator was told the cancel was done while the record said
+/// `Cancelling`, the part was still on disk beside their download folder, and
+/// nothing in that pass would finish it: only the next engine start heals it.
+///
+/// The justification for the short-circuit was wrong too. `(Cancelling, Cancel)`
+/// is an **accepted no-op** in the domain, not a refusal, so falling through costs
+/// nothing and lets `command_resting`'s own `Cancelling` block drop the part and
+/// commit `CleanupFinished` -- the same finish `recover` performs after a crash.
+///
+/// A session can genuinely leave a job there: it commits `Cancelling` when it
+/// reads the command and only reaches `CleanupFinished` later, so a commit error,
+/// a domain error while draining, or a panicked task ends it in between.
+#[tokio::test]
+async fn a_job_left_at_cancelling_is_finished_rather_than_called_done() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    // A real part with real bytes, then stopped where an operator decides.
+    rig.transport
+        .fail_probe(fhd_app::transport::TransportError::UserAction(
+            StopReason::Authentication,
+        ));
+    let outcome = rig.run().await;
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the job did not come to rest where this test needs it: {outcome:?}"
+    );
+
+    // The record a session leaves when it commits the cancel and then dies before
+    // finishing it.
+    rig.coordinator
+        .command(rig.job().await, JobCommand::Cancel)
+        .await
+        .expect("the domain accepts a cancel from NeedsAction");
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::Cancelling,
+        "this test needs the record to say Cancelling"
+    );
+
+    let answered = rig
+        .coordinator
+        .confirm_command(rig.id, JobCommand::Cancel)
+        .await
+        .expect("confirming a cancel for a job at Cancelling failed");
+    let answered = answered.expect("the job was not found in the record");
+
+    // Finished, not merely acknowledged. Before the fix this was `Cancelling`.
+    assert_eq!(
+        answered.state(),
+        JobState::Cancelled,
+        "a job left at Cancelling was reported without being finished"
+    );
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::Cancelled,
+        "the record still says Cancelling after the command was confirmed"
+    );
+}
