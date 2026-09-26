@@ -1242,11 +1242,10 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
 
 /// What a platform with no publication mechanism actually does, end to end.
 ///
-/// **This branch does not finish downloads on Linux or macOS**, and that is a
-/// deliberate refusal: the alternative was linking by path, which is the
-/// behaviour being replaced, and taking it quietly would leave the same hole
-/// wearing a new arrangement. The other end-to-end tests here expect a
-/// published file, so they fail on those platforms, and CI is red there.
+/// **macOS does not finish downloads on this branch**. It refuses publication
+/// because linking by a recovered source path would reintroduce the
+/// substitution the handle contract prevents. Linux has a mechanism and its
+/// end-to-end tests require a published file with matching bytes.
 ///
 /// A prose statement of that is not evidence. This measures it, so the record
 /// says what the engine does rather than what was intended:
@@ -1258,10 +1257,9 @@ async fn two_engines_sharing_a_download_folder_keep_their_own_parts() {
 /// - the downloaded bytes are still on disk, so the day a mechanism exists the
 ///   transfer finishes rather than starting again.
 ///
-/// It is `cfg(not(windows))` on purpose. The day Linux or macOS gains a
-/// mechanism this test fails, which is the notice that it should be rewritten
-/// -- not a gate that quietly keeps passing.
-#[cfg(not(windows))]
+/// This test is for platforms still lacking a mechanism. Linux now publishes
+/// and is covered by the shared end-to-end tests above; macOS still refuses.
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tokio::test]
 async fn a_platform_without_a_mechanism_refuses_to_publish_and_keeps_the_bytes() {
     let body = content(64 * 1024 + 17);
