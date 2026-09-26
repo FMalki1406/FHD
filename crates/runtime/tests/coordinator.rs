@@ -698,3 +698,102 @@ async fn a_failure_between_the_new_generation_and_its_part_leaves_the_old_one_wh
         "the old generation was written over on the way to publishing"
     );
 }
+
+/// **A cancel that arrives after publication is refused, and takes nothing with
+/// it.**
+///
+/// The third thing the cancel race needed settling. Once the file is the user's,
+/// "cancel" cannot mean "undo": the job is finished, the bytes are delivered, and
+/// the part's name is a second name for a file somebody now owns. So the answer
+/// must be a refusal -- and a refusal that touches nothing.
+///
+/// `confirm_command` is the seam the scheduler now asks when a session ends, so
+/// this asks it directly rather than racing a session to reach the same state.
+/// What must hold:
+///
+/// * the command is refused, not silently accepted;
+/// * the job stays `Completed` -- it is not walked back to `Cancelling`;
+/// * the published file still holds the published bytes.
+#[tokio::test]
+async fn a_cancel_after_publication_is_refused_and_leaves_the_file_alone() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
+    );
+    assert_eq!(rig.job().await.state(), JobState::Completed);
+
+    let refused = rig
+        .coordinator
+        .confirm_command(rig.id, JobCommand::Cancel)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a cancel was accepted for a job whose file the user already has: {refused:?}"
+    );
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::Completed,
+        "a refused cancel moved a completed job"
+    );
+    assert_eq!(
+        rig.store.published(&rig.destination).unwrap(),
+        content,
+        "a refused cancel disturbed the published file"
+    );
+}
+
+/// **A cancel for a job resting where a session left it is applied, and saying so
+/// twice does not double-apply it.**
+///
+/// The other half of what the scheduler now relies on. When a session ends without
+/// having applied a command it was handed, `confirm_command` is what makes the
+/// answer true -- so it has to apply the transition to the resting job, and it has
+/// to be safe to ask again, because more than one caller can be waiting on the same
+/// job and the scheduler answers them in turn.
+#[tokio::test]
+async fn confirm_command_cancels_a_resting_job_and_is_safe_to_ask_twice() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    // Stopped for a reason and resting: the state the race left behind.
+    rig.transport
+        .fail_probe(fhd_app::transport::TransportError::UserAction(
+            StopReason::Authentication,
+        ));
+    let outcome = rig.run().await;
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the job did not come to rest where this test needs it: {outcome:?}"
+    );
+
+    let first = rig
+        .coordinator
+        .confirm_command(rig.id, JobCommand::Cancel)
+        .await;
+    assert!(first.is_ok(), "a resting job refused a cancel: {first:?}");
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::Cancelled,
+        "the cancel was reported as applied and the record disagrees"
+    );
+
+    // Asked again, which is what a second waiting caller does. It must not be
+    // refused -- the job is where the command was taking it -- and it must not
+    // step the job anywhere else.
+    let again = rig
+        .coordinator
+        .confirm_command(rig.id, JobCommand::Cancel)
+        .await;
+    assert!(
+        again.is_ok(),
+        "asking twice about the same cancel was refused the second time: {again:?}"
+    );
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::Cancelled,
+        "asking twice moved the job"
+    );
+}

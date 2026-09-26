@@ -54,6 +54,30 @@ pub enum Command {
 /// Commands a session's channel refused, waiting with the reply they owe.
 type Deferred = VecDeque<(JobId, Control, Option<oneshot::Sender<Applied>>)>;
 
+/// Callers waiting for a command a session was handed to actually take effect.
+///
+/// A session that is already finishing can end without reading its control
+/// channel, and the command goes with the task. Answering on the hand-off
+/// therefore told the client `Done` for a cancel that never happened -- CI caught
+/// it on Windows, with the job resting in `NeedsAction` for 120 seconds. The reply
+/// waits here until the session is reaped and the record can be consulted.
+type Awaiting = HashMap<JobId, Vec<(JobCommand, oneshot::Sender<Applied>)>>;
+
+/// Remembers a caller until the session that was handed its command has ended.
+fn await_session(
+    awaiting: &mut Awaiting,
+    id: JobId,
+    control: Control,
+    reply: Option<oneshot::Sender<Applied>>,
+) {
+    let Some(reply) = reply else { return };
+    let command = match control {
+        Control::Pause => JobCommand::Pause,
+        Control::Cancel => JobCommand::Cancel,
+    };
+    awaiting.entry(id).or_default().push((command, reply));
+}
+
 /// Answers a caller once, if one is still waiting.
 fn answer(reply: Option<oneshot::Sender<Applied>>, applied: Applied) {
     if let Some(reply) = reply {
@@ -172,11 +196,12 @@ impl Scheduler {
         // one that stopped to wait out a retry is classified and runs again here.
         let mut last: HashMap<JobId, Result<SessionEnd, RunError>> = HashMap::new();
         let mut deferred: Deferred = VecDeque::new();
+        let mut awaiting: Awaiting = HashMap::new();
         let mut used = 0usize;
         let mut open = true;
         let mut stopping = false;
         loop {
-            self.deliver(&mut deferred, &active).await;
+            self.deliver(&mut deferred, &mut awaiting, &active).await;
             let mut started = false;
             if !stopping {
                 self.promote_due(&mut queue).await;
@@ -206,7 +231,7 @@ impl Scheduler {
                     let Some(finished) = finished else { continue };
                     match finished {
                         Ok((id, job, result)) => {
-                            self.finish(&mut active, &mut used, id, &result);
+                            self.finish(&mut active, &mut awaiting, &mut used, id, &result).await;
                             match result {
                                 // The job moved: classify it and let it run on.
                                 Ok(end) => {
@@ -222,14 +247,14 @@ impl Scheduler {
                             // A session task is never aborted from here, so this is a
                             // panic. Only that job is lost; its peers keep running.
                             let Some(id) = owners.remove(&error.id()) else { continue };
-                            self.finish(&mut active, &mut used, id, &Err(RunError::Invariant));
+                            self.finish(&mut active, &mut awaiting, &mut used, id, &Err(RunError::Invariant)).await;
                             queue.done.push(Outcome::failed(id, RunError::Invariant));
                         }
                     }
                 }
                 command = commands.recv(), if open => {
                     let Some(command) = command else { open = false; continue };
-                    if self.on_command(command, &mut queue, &active, &mut deferred).await {
+                    if self.on_command(command, &mut queue, &active, &mut deferred, &mut awaiting).await {
                         stopping = true;
                     }
                 }
@@ -271,13 +296,31 @@ impl Scheduler {
     }
 
     /// Releases the grant and tells the governor how the origin behaved.
-    fn finish(
+    async fn finish(
         &self,
         active: &mut HashMap<JobId, Active>,
+        awaiting: &mut Awaiting,
         used: &mut usize,
         id: JobId,
         result: &Result<SessionEnd, RunError>,
     ) {
+        // The session is gone, so every caller that was handed to it can finally
+        // be answered -- from the record, not from the hand-off. This is the whole
+        // fix for the race: a session that ended without reading its channel left
+        // the command undone while the client had been told `Done`.
+        //
+        // Done first, so that a caller is answered even if the job was never in
+        // `active` (a panicked session comes through here too).
+        for (command, reply) in awaiting.remove(&id).into_iter().flatten() {
+            let applied = match self.coordinator.confirm_command(id, command).await {
+                Ok(Some(_)) => Applied::Yes,
+                Ok(None) | Err(_) => {
+                    emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                    Applied::No
+                }
+            };
+            let _ = reply.send(applied);
+        }
         let Some(entry) = active.remove(&id) else {
             return;
         };
@@ -377,7 +420,12 @@ impl Scheduler {
     /// be told its cancel had been taken while the command was still in this
     /// queue -- and be told it even when the session ended and the command was
     /// dropped here. It is answered where it is resolved.
-    async fn deliver(&self, deferred: &mut Deferred, active: &HashMap<JobId, Active>) {
+    async fn deliver(
+        &self,
+        deferred: &mut Deferred,
+        awaiting: &mut Awaiting,
+        active: &HashMap<JobId, Active>,
+    ) {
         for _ in 0..deferred.len() {
             let Some((id, control, reply)) = deferred.pop_front() else {
                 break;
@@ -386,8 +434,10 @@ impl Scheduler {
                 Some(entry) if entry.control.try_send(control).is_err() => {
                     deferred.push_back((id, control, reply));
                 }
-                // Handed over: the session stops itself from here.
-                Some(_) => answer(reply, Applied::Yes),
+                // Handed over. **Not answered here**: the session may end without
+                // reading its channel, and the command would go with it. The caller
+                // waits until the session is reaped and the record decides.
+                Some(_) => await_session(awaiting, id, control, reply),
                 // The session ended before the command reached it. That is not
                 // "nothing to stop" -- the job is now resting in the record, and
                 // that is exactly where a command for a stopped job belongs.
@@ -415,6 +465,7 @@ impl Scheduler {
         queue: &mut Queue,
         active: &HashMap<JobId, Active>,
         deferred: &mut Deferred,
+        awaiting: &mut Awaiting,
     ) -> bool {
         let (id, control, reply) = match command {
             Command::Admit(job) => {
@@ -440,7 +491,9 @@ impl Scheduler {
             if entry.control.try_send(control).is_err() {
                 deferred.push_back((id, control, reply));
             } else {
-                answer(reply, Applied::Yes);
+                // Handed to the session, which is not the same as done -- see
+                // `Awaiting`.
+                await_session(awaiting, id, control, reply);
             }
             return false;
         }

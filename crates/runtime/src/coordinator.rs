@@ -348,6 +348,56 @@ impl Coordinator {
         Ok(Some(job))
     }
 
+    /// Whether an operator's command has actually taken effect, applying it to a
+    /// resting job when the session ended without doing so.
+    ///
+    /// **This exists because `Done` used to mean "the session was handed the
+    /// command".** The scheduler answered the caller the moment a `Cancel` landed
+    /// in a session's control channel, and a session that was already finishing
+    /// could end without ever reading it -- the channel went with the task and the
+    /// command with it. CI caught the race on Windows: the client was told `Done`
+    /// and the job sat in `NeedsAction` for the full 120 seconds.
+    ///
+    /// So the answer is decided here, against the record, after the session is
+    /// gone:
+    ///
+    /// * the session applied it -- the job already rests where the command asked
+    ///   -- and the answer is yes without touching anything;
+    /// * the session did not, and the job is resting, so the command is applied
+    ///   here, which is where a command for a stopped job belongs anyway;
+    /// * the job has published, and the domain refuses to cancel it. That is a
+    ///   truthful no. **Nothing unseals and nothing of the user's is touched**:
+    ///   the part is only dropped when the step actually reaches `Cancelling`, and
+    ///   a part that published is a second name for a file the user already has.
+    pub async fn confirm_command(
+        &self,
+        id: fhd_domain::JobId,
+        command: JobCommand,
+    ) -> Result<Option<Job>, RunError> {
+        let repository = self.ports.repository.as_ref();
+        let jobs = repository
+            .load_jobs()
+            .await
+            .map_err(|_| RunError::Repository)?;
+        let Some(job) = jobs.into_iter().find(|job| job.id() == id) else {
+            return Ok(None);
+        };
+        // Already where the command was taking it. Stepping again would be
+        // refused by the domain, and reporting that refusal as "your cancel did
+        // not work" would be the same lie in the opposite direction.
+        let settled = match command {
+            JobCommand::Cancel => {
+                matches!(job.state(), JobState::Cancelled | JobState::Cancelling)
+            }
+            JobCommand::Pause => job.state() == JobState::Paused,
+            _ => false,
+        };
+        if settled {
+            return Ok(Some(job));
+        }
+        self.command_resting(id, command).await
+    }
+
     /// Answers, for a job stopped as `Unconfirmed`, whether the file is there.
     ///
     /// This is the one thing that could resolve that state and had no

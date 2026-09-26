@@ -6,13 +6,13 @@ use fhd_app::{
 };
 use fhd_domain::{
     ByteRange, DestinationRef, Job, JobCommand, JobId, JobSpec, JobState, Priority, RetryPolicy,
-    SourceRef,
+    SourceRef, StopReason,
 };
 use fhd_runtime::{
     buffers::BufferPool,
     coordinator::{Clock, Coordinator, CoordinatorConfig, Ports, RunError, SessionEnd},
     origin::{OriginGovernor, OriginLimits},
-    scheduler::{Command, Outcome, Scheduler, SchedulerConfig},
+    scheduler::{Applied, Command, Outcome, Scheduler, SchedulerConfig},
 };
 use fhd_testkit::transfer::{MemoryStore, MemoryTransfers, ScriptedTransport};
 use std::{
@@ -426,4 +426,231 @@ async fn the_same_job_twice_is_refused_rather_than_run_twice() {
             .admit(rig.transport.origin(SourceRef::new(1).unwrap()), 8, 0),
         8
     );
+}
+
+/// A transport that parks inside `probe` until the test lets it go, then refuses
+/// in a way that rests the job where an operator has to decide.
+///
+/// The parking is the point. While the session is inside this call it is **not**
+/// polling its control channel, so a command handed to it during that window sits
+/// in the channel unread -- which is the state the race needs.
+struct ParkedThenRefused {
+    inner: ScriptedTransport,
+    origin: OriginId,
+    reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+impl Transport for ParkedThenRefused {
+    fn origin(&self, _: SourceRef) -> OriginId {
+        self.origin
+    }
+    fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>> {
+        // Answers normally. Probing happens at intake, before any session exists,
+        // so parking here would not put the scheduler in the state this measures.
+        self.inner.probe(source)
+    }
+    fn fetch(
+        &self,
+        _: SourceRef,
+        _: ByteRange,
+        _: Option<[u8; 32]>,
+    ) -> PortFuture<'_, Result<Box<dyn ByteStream>, TransportError>> {
+        Box::pin(async move {
+            if let Some(reached) = self.reached.lock().unwrap().take() {
+                let _ = reached.send(());
+            }
+            if let Some(gate) = self.gate.lock().await.take() {
+                let _ = gate.await;
+            }
+            // Not transient: the job rests at `NeedsAction`, which is where the
+            // race left it while the client had been told the cancel was done.
+            Err(TransportError::UserAction(StopReason::Authentication))
+        })
+    }
+}
+
+/// **`Done` for a cancel means the record says cancelled.**
+///
+/// The race CI caught on Windows. The scheduler answered the caller as soon as a
+/// `Cancel` landed in the running session's control channel -- and a session that
+/// is already finishing can end without ever reading it. The channel goes with the
+/// task and the command with it, so the client was told `Done` while the job rested
+/// in `NeedsAction`, for the whole 120 seconds the test waited on it.
+///
+/// The transport above parks the session inside `probe`, so the command is handed
+/// over while nothing is reading. Then the gate opens, the probe is refused, and
+/// the session ends.
+///
+/// **The assertion is the invariant, not the interleaving.** Whether the session
+/// glances at its channel on the way out is a scheduling detail no test can pin;
+/// what must hold either way is that the answer is backed by the record:
+///
+/// * `Applied::Yes` and the job is `Cancelled`. This is the assertion that fails
+///   before the fix, with the job resting in `NeedsAction`.
+/// * `Applied::No` and the job is not cancelled, so the refusal was honest.
+///
+/// And the reply must arrive at all: a caller left waiting for ever is the other
+/// way this could go wrong, so it is bounded.
+#[tokio::test]
+async fn done_for_a_cancel_means_the_record_says_cancelled() {
+    let directory = std::env::temp_dir().join(format!(
+        "fhd-cancel-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let (reached, parked) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let transport = Arc::new(ParkedThenRefused {
+        inner: ScriptedTransport::new(body(64 * 1024), true, 4096),
+        origin: OriginId::new([7; 16]),
+        reached: Mutex::new(Some(reached)),
+        gate: tokio::sync::Mutex::new(Some(gate)),
+    });
+
+    let repo = Arc::new(MemoryTransfers::default());
+    let spec = JobSpec::new(
+        SourceRef::new(1).unwrap(),
+        DestinationRef::new(1).unwrap(),
+        None,
+        Priority::Normal,
+        1 << 30,
+    )
+    .unwrap();
+    repo.admit(&Job::new(JobId::new(1).unwrap(), spec));
+
+    let governor = Arc::new(OriginGovernor::new(OriginLimits::default()).unwrap());
+    let coordinator = Arc::new(
+        Coordinator::new(
+            Ports {
+                repository: repo.clone(),
+                store: Arc::new(MemoryStore::default()),
+                transport: transport.clone(),
+                destinations: Arc::new(PerJob(directory.clone())),
+            },
+            BufferPool::new(4 * 1024 * 1024).unwrap(),
+            Arc::new(TestClock::default()),
+            CoordinatorConfig {
+                connections: 4,
+                max_segments: 64,
+                min_segment: 4096,
+                checkpoint_bytes: 32 * 1024,
+                writer_capacity: 8,
+                retry: RetryPolicy::new(4, 1000, 10_000).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_governor(governor.clone()),
+    );
+    let scheduler = Scheduler::new(
+        coordinator,
+        governor,
+        SchedulerConfig {
+            max_active: 1,
+            connections: 4,
+            per_job: 2,
+            resident: false,
+        },
+    )
+    .unwrap();
+
+    let jobs = repo.load_jobs().await.unwrap();
+    let (commands, receiver) = mpsc::channel(4);
+    let run = tokio::spawn(async move { scheduler.run(jobs, receiver).await });
+
+    // The session is inside `probe` now, so nothing is reading its control
+    // channel. Everything below is ordered after this.
+    parked
+        .await
+        .expect("the session never reached the transport");
+
+    let (reply, mut applied) = tokio::sync::oneshot::channel();
+    commands
+        .send(Command::Cancel(JobId::new(1).unwrap(), Some(reply)))
+        .await
+        .expect("the scheduler is still accepting commands");
+    // Turns for the scheduler to take the command off its queue and hand it to the
+    // parked session. Without these the command could arrive after the session has
+    // already ended, which is the path that always worked.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // **The discriminator, and it is deterministic.** The session is still parked
+    // inside `probe` with the gate shut, so whatever the scheduler has answered by
+    // now, it answered before the session stopped.
+    //
+    // An early answer is not itself wrong: a cancel applied to the record straight
+    // away is answered straight away, and that is honest. What is wrong is a `Yes`
+    // the record does not back -- which is precisely what the hand-off reply was,
+    // because the command was sitting in a channel that goes away with the task.
+    // So the question asked here is not "has it answered" but "if it has, is the
+    // transition there".
+    if let Ok(early) = applied.try_recv() {
+        let recorded = repo
+            .load_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id() == JobId::new(1).unwrap())
+            .expect("the job is in the record");
+        assert_eq!(
+            (early, recorded.state()),
+            (Applied::Yes, JobState::Cancelled),
+            "the cancel was answered {early:?} while the session was still parked \
+             and the record says {:?}: the reply was sent for the hand-off rather \
+             than for the transition",
+            recorded.state()
+        );
+        // Answered and recorded, so the rest of this test has nothing left to
+        // measure; the session is released so the scheduler can finish.
+        let _ = release.send(());
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("the scheduler did not finish")
+            .expect("the scheduler panicked");
+        assert_eq!(outcomes.len(), 1);
+        let _ = std::fs::remove_dir_all(&directory);
+        return;
+    }
+
+    let _ = release.send(());
+
+    let applied = tokio::time::timeout(std::time::Duration::from_secs(30), applied)
+        .await
+        .expect("the cancel was never answered, so a caller waits for ever")
+        .expect("the scheduler dropped the reply without answering");
+
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("the scheduler did not finish")
+        .expect("the scheduler panicked");
+    assert_eq!(outcomes.len(), 1);
+
+    let recorded = repo
+        .load_jobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id() == JobId::new(1).unwrap())
+        .expect("the job is in the record");
+    match applied {
+        Applied::Yes => assert_eq!(
+            recorded.state(),
+            JobState::Cancelled,
+            "the cancel was reported as done and the record says {:?}: the session \
+             was handed the command and ended without reading it",
+            recorded.state()
+        ),
+        Applied::No => assert_ne!(
+            recorded.state(),
+            JobState::Cancelled,
+            "the cancel was refused and the record says it was cancelled anyway"
+        ),
+    }
+    let _ = std::fs::remove_dir_all(&directory);
 }
