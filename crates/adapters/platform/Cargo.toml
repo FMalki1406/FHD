@@ -7,7 +7,8 @@ publish = false
 [dependencies]
 tokio = { version = "=1.51.4", features = ["net"] }
 
-# `geteuid(2)`, `linkat(2)` on Linux, and `fclonefileat(2)` on macOS.
+# `geteuid(2)`, `linkat(2)` on Linux, and `fclonefileat(2)`, `openat(2)` and
+# `renameatx_np` on macOS.
 #
 # Already in Cargo.lock as a transitive dependency, so naming it here adds no
 # code to the build. That does not make it exempt from review: direct and
@@ -25,6 +26,13 @@ tokio = { version = "=1.51.4", features = ["net"] }
 #   * `fclonefileat` in `clone_into_directory` on macOS, which nothing calls --
 #     it exists to be measured on the platform, and macOS still refuses to
 #     publish.
+#   * `openat` with `O_NOFOLLOW` in `open_in_directory`, and `renameatx_np` with
+#     `RENAME_EXCL` in `move_into_directory`, both macOS and both also called by
+#     nothing: they are the second and third steps of the candidate path -- pin
+#     the clone, then move the pinned object into the adopted folder without
+#     replacing. `renameatx_np` is Apple's, not POSIX; whether it satisfies the
+#     publication contract is what the tests measure, not something this
+#     manifest asserts.
 #
 # This comment said "one function, `geteuid`, and nothing else" while the crate
 # had already grown the other two, and it is the comment that states the rule it

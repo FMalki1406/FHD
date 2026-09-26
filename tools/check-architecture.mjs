@@ -81,6 +81,12 @@ export const UNSAFE_ALLOWANCES = new Map([
     // measured rather than adopted: nothing in the engine calls it, and the
     // publication contract says what adopting it would require first.
     'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
+    // `open_in_directory` calls `openat(2)` and `move_into_directory` calls
+    // `renameatx_np`, the second and third steps of the candidate macOS path.
+    // Both take borrowed descriptors and names owned by the caller, and both
+    // are measured rather than adopted: nothing in the engine calls them.
+    'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
+    'pub fn move_into_directory(',
   ]],
 ]);
 
@@ -292,14 +298,70 @@ export function checkReviewableSources(root, trees = ['crates', 'tools', '.githu
     if (!existsSync(base)) continue;
     walkSources(base, (full) => {
       const bytes = readFileSync(full);
-      const at = bytes.indexOf(0);
-      if (at === -1) return;
       const relative = full.slice(root.length + 1).split('\\').join('/');
-      offenders.push(
-        `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
-        `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
-      );
+      const at = bytes.indexOf(0);
+      if (at !== -1) {
+        offenders.push(
+          `${relative}: a raw NUL byte at offset ${at} makes git diff this file as ` +
+          `binary, so no change to it is ever reviewed. Write it as the escape \\x00.`,
+        );
+      }
+      offenders.push(...shellEscapeWreckage(relative, bytes));
     });
+  }
+  return offenders;
+}
+
+/// What a PowerShell string edit leaves behind when its escapes are not what the
+/// author thought they were.
+///
+/// This machine is Windows, and editing a source by building a string in
+/// PowerShell has now damaged files three separate times: a BOM plus mojibake'd
+/// Arabic, a raw NUL that made a whole reviewed diff invisible, and -- twice in
+/// one file -- backtick escapes. Backtick-r became a carriage return, which Node
+/// treats as a line terminator: it ended a `//` comment mid-sentence and the
+/// rest of the line became code, so the gate itself stopped parsing.
+/// Backtick-n went the other way and stayed literal, sitting inside a comment
+/// where a line break was meant, where it compiled and shipped and was found
+/// only by reading.
+///
+/// The escapes are named in words here on purpose: spelled as one-letter code
+/// spans they are the pattern below, and this file is scanned by it.
+///
+/// Two byte-level signatures, both with no legitimate spelling in this tree:
+///
+///   * a CR that is not part of a CRLF -- a line terminator to a JavaScript
+///     parser and to `git diff`, and never written on purpose here;
+///   * a backtick followed by one of PowerShell's escape letters and then
+///     whitespace. In a comment or a doc that would be an unclosed one-letter
+///     code span, which nothing here writes; `` `n` `` and `` `\n` `` are both
+///     closed and both pass.
+///
+/// It reads bytes, not text, so a file this rule would reject cannot hide behind
+/// being undecodable.
+export function shellEscapeWreckage(relative, bytes) {
+  const offenders = [];
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 0x0d && bytes[index + 1] !== 0x0a) {
+      offenders.push(
+        `${relative}: a carriage return at offset ${index} with no newline after it. ` +
+        'A parser and git both end the line there, so whatever follows on the ' +
+        "line is read as code. It is PowerShell's ``r`` escape; edit the file " +
+        'with an editor instead of building its text in a shell string.',
+      );
+    }
+    if (bytes[index] !== 0x60) continue;
+    const letter = bytes[index + 1];
+    const after = bytes[index + 2];
+    const escape = letter === 0x6e || letter === 0x72 || letter === 0x74 || letter === 0x30;
+    const unclosed = after === 0x20 || after === 0x09 || after === 0x0a || after === 0x0d;
+    if (escape && unclosed) {
+      offenders.push(
+        `${relative}: \`${String.fromCharCode(letter)} at offset ${index}, followed by ` +
+        "whitespace. That is PowerShell's escape left literal, not a code span -- " +
+        'a line break that never happened. Write the text with an editor.',
+      );
+    }
   }
   return offenders;
 }
@@ -489,7 +551,7 @@ function main(args) {
   // Says what was scanned, not "every source". A review pointed out that the
   // previous wording claimed more than the walk covers, which is the same kind
   // of overclaim this gate exists to make expensive.
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes in crates/tools/.github sources).`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes or stray shell escapes in crates/tools/.github sources).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

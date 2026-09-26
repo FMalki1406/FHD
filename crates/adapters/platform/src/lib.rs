@@ -184,30 +184,11 @@ mod imp {
         // separator would reopen the path resolution this call exists to avoid,
         // and an interior NUL cannot cross the C boundary at all.
         //
-        // The bytes are checked before the parse, because Path::components`n        // normalises: it accepts `x/`, `x//` and `x/.` as the single component
-        // `x`. None of those escapes the directory -- they end in a separator, so
-        // the kernel refuses them -- except that `x/.` where `x` is a symlink to
-        // a directory **is** walked, which is destination-end path resolution and
-        // the one thing this call exists to prevent. A security review measured
-        // which spellings get through; the check is on the bytes now.
-        if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a link name must be a single path component",
-            ));
-        }
-        let mut components = Path::new(name).components();
-        match (components.next(), components.next()) {
-            (Some(std::path::Component::Normal(_)), None) => (),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a link name must be a single path component",
-                ));
-            }
-        }
-        let leaf = CString::new(name.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a link name holds a NUL"))?;
+        // Both checks live in `one_component`, which says why the bytes are read
+        // before the parse: `Path::components` normalises `x/.`, and where `x` is
+        // a symlink to a directory the kernel walks it, which is the
+        // destination-end path resolution this call exists to prevent.
+        let leaf = one_component(name)?;
         let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a descriptor with a NUL"))?;
 
@@ -261,18 +242,7 @@ mod imp {
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
     pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
-        let mut components = Path::new(name).components();
-        match (components.next(), components.next()) {
-            (Some(std::path::Component::Normal(_)), None) => (),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a link name must be a single path component",
-                ));
-            }
-        }
-        let leaf = CString::new(name.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a link name holds a NUL"))?;
+        let leaf = one_component(name)?;
 
         // SAFETY: both descriptors are borrowed from open `File`s and outlive
         // the call; `leaf` is NUL-terminated and owned here for its duration.
@@ -284,6 +254,114 @@ mod imp {
             libc::fclonefileat(file.as_raw_fd(), directory.as_raw_fd(), leaf.as_ptr(), 0)
         };
         if created == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    /// One component, checked on the bytes before anything is parsed.
+    ///
+    /// `Path::components` normalises, so it reads `x/`, `x//` and `x/.` as the
+    /// single component `x` -- and `x/.` where `x` is a symlink to a directory
+    /// is walked by the kernel, which is destination-end path resolution and the
+    /// one thing these calls exist to prevent. A security review measured which
+    /// spellings get through.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn one_component(name: &OsStr) -> io::Result<CString> {
+        let refused = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a link name must be a single path component",
+            )
+        };
+        if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
+            return Err(refused());
+        }
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => (),
+            _ => return Err(refused()),
+        }
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a link name holds a NUL"))
+    }
+
+    /// Opens `name` inside `directory`, resolving nothing above it.
+    ///
+    /// **Measured, not adopted**, like the clone it exists to pin. It is the
+    /// second step of the path macOS would need: a clone has to be opened to be
+    /// held, and opening it by a path would hand back the window the whole
+    /// design removes. `openat` against the directory descriptor resolves only
+    /// the last component, and `O_NOFOLLOW` refuses a symlink sitting at that
+    /// name rather than following it somewhere else.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {
+        use std::os::unix::io::FromRawFd;
+        let leaf = one_component(name)?;
+        // SAFETY: the directory descriptor is borrowed from an open `File` and
+        // outlives the call; `leaf` is NUL-terminated and owned here for its
+        // duration. `openat` returns a new descriptor this process owns, which
+        // is handed straight to `File` so it is closed exactly once.
+        let opened = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if opened < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `opened` is a fresh descriptor from the call above, owned by
+        // this process and not held anywhere else.
+        Ok(unsafe { File::from_raw_fd(opened) })
+    }
+
+    /// Moves `from_name` in `from` to `to_name` in `to`, never replacing.
+    ///
+    /// **Measured, not adopted.** This is the third step of the candidate macOS
+    /// path, and the step that would make it publication: both ends are
+    /// directory descriptors plus one component, so no path is resolved at
+    /// either end, and `RENAME_EXCL` fails rather than replacing -- which is
+    /// what `ReplaceIfExists = false` gives on Windows and `EEXIST` gives
+    /// `linkat` on Linux.
+    ///
+    /// What it would buy over cloning straight into the destination is the
+    /// thing the reviews objected to: `fclonefileat` does not hand back a
+    /// descriptor for what it made, so the engine would have to open the new
+    /// name to know what it published -- and between the create and that open,
+    /// the name can be made to mean another file. Cloning into a directory the
+    /// engine owns, holding the result open, and then moving *that object*
+    /// keeps a handle on the published file throughout.
+    ///
+    /// `renameatx_np` is not POSIX. It is Apple's, documented with APFS, and
+    /// whether it satisfies this contract is exactly what the tests beside it
+    /// measure rather than assume.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub fn move_into_directory(
+        from: &File,
+        from_name: &OsStr,
+        to: &File,
+        to_name: &OsStr,
+    ) -> io::Result<()> {
+        let source = one_component(from_name)?;
+        let leaf = one_component(to_name)?;
+        // SAFETY: both descriptors are borrowed from open `File`s and outlive
+        // the call; both names are NUL-terminated and owned here for its
+        // duration. `renameatx_np` reads them and returns a status, taking
+        // ownership of nothing.
+        let moved = unsafe {
+            libc::renameatx_np(
+                from.as_raw_fd(),
+                source.as_ptr(),
+                to.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if moved == 0 {
             return Ok(());
         }
         Err(io::Error::last_os_error())
@@ -1656,15 +1734,16 @@ mod imp {
     }
 }
 
-/// Exported so it can be measured on a real macOS. Nothing calls it.
-#[cfg(target_os = "macos")]
-pub use imp::clone_into_directory;
 #[cfg(target_os = "linux")]
 pub use imp::link_into_directory;
 #[cfg(windows)]
 pub use imp::{
     acceptable_descriptor, create_pipe, link_into_directory, open_directory, open_pipe, same_object,
 };
+/// The three steps of the candidate macOS path, exported so they can be
+/// measured on a real macOS. Nothing in the engine calls any of them.
+#[cfg(target_os = "macos")]
+pub use imp::{clone_into_directory, move_into_directory, open_in_directory};
 pub use imp::{
     create_protected_directory, foreign_writers, process_cpu, protect_new_directory,
     swappable_components, user_scope,

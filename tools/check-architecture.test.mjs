@@ -4,8 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
-  unsafeOffendersIn, unusedAllowances, withoutComments,
+  attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage, shellEscapeWreckage,
+  UNSAFE_ALLOWANCES, unsafeOffendersIn, unusedAllowances, withoutComments,
 } from './check-architecture.mjs';
 
 function metadata(graph) {
@@ -291,17 +291,24 @@ test('an approved allowance that no longer exists in the tree is reported', () =
   // item with one implementation per system -- still reports the missing one.
   const linker =
     'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
-  const clone =
-    'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
-  const once = unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, clone]]]));
+  // Every other approved item, each approved exactly once. Read from the list
+  // rather than copied out of it: the question here is whether a *duplicate*
+  // entry found once is reported, and spelling the singles out again would make
+  // this test fail every time a single-platform call is approved, which taught
+  // nothing the first three times it happened.
+  const singles = UNSAFE_ALLOWANCES.get(platform).filter(item => item !== linker);
+  assert.equal(
+    singles.length,
+    new Set(singles).size,
+    'a second duplicated approval needs this test to say which one it is isolating',
+  );
+
+  const once = unusedAllowances(new Map([[platform, [...singles, linker]]]));
   assert.equal(once.length, 1, JSON.stringify(once));
   assert.match(once[0], /link_into_directory/u);
 
   // And everything present reports nothing.
-  assert.deepEqual(
-    unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, linker, clone]]])),
-    [],
-  );
+  assert.deepEqual(unusedAllowances(new Map([[platform, [...singles, linker, linker]]])), []);
 });
 
 test('a restriction is the policy, not a breach of it', () => {
@@ -375,4 +382,46 @@ test('refuses a raw NUL in any reviewable source, whatever the tree or extension
     return;
   }
   assert.deepEqual(checkReviewableSources(root), []);
+});
+
+// Planted, because both of these really happened in this tree and neither was
+// caught by anything: the carriage return stopped the gate parsing, and the
+// literal backtick-n compiled, shipped, and was found by eye afterwards.
+test('refuses what a PowerShell string edit leaves behind', () => {
+  const clean = [
+    'let x = 1;\r\n// a CRLF file is fine\r\n',
+    'let y = 2;\n// so is an LF file\n',
+    // The escapes as closed one-letter code spans, which is how prose refers to
+    // them. Rejecting these would make the rule unusable in its own comment.
+    '// PowerShell writes `n` and `r`, and Rust writes `\\n`.\n',
+    // A backtick span that merely starts with one of the letters.
+    '// `nothing here` and `renameatx_np` are ordinary spans.\n',
+  ];
+  for (const text of clean) {
+    assert.deepEqual(shellEscapeWreckage('a.rs', Buffer.from(text, 'binary')), [], text);
+  }
+
+  // A bare CR: to a JavaScript parser the comment ends there and `code` is code.
+  const bare = shellEscapeWreckage('a.mjs', Buffer.from('// a comment\rcode();\n', 'binary'));
+  assert.equal(bare.length, 1, JSON.stringify(bare));
+  assert.match(bare[0], /carriage return at offset 12 with no newline/u);
+  assert.ok(bare[0].startsWith('a.mjs'));
+
+  // The literal escape where a line break was meant, for each letter.
+  for (const letter of ['n', 'r', 't', '0']) {
+    const text = `// first\`${letter}        // second\n`;
+    const found = shellEscapeWreckage('a.rs', Buffer.from(text, 'binary'));
+    assert.equal(found.length, 1, `${letter}: ${JSON.stringify(found)}`);
+    assert.match(found[0], new RegExp(`\`${letter} at offset 8`, 'u'));
+  }
+
+  // And the exact shape that shipped: the escape followed by spaces, inside a
+  // Rust comment, in a file that is otherwise CRLF.
+  //
+  // The backtick comes from a char code because the gate walks `tools/`: a
+  // fixture spelled literally here would make this file an offender and fail the
+  // gate on its own test data. The bytes handed to the rule are identical.
+  const tick = String.fromCharCode(0x60);
+  const shipped = `        // because Path::components${tick}n        // normalises: it\r\n`;
+  assert.equal(shellEscapeWreckage('lib.rs', Buffer.from(shipped, 'binary')).length, 1);
 });

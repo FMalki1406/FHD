@@ -122,18 +122,24 @@ jobs:
       # descriptor to a new name. Each property is its own step so that which of
       # them holds is legible from the job's steps alone -- the logs need a
       # token, and a measurement nobody can read is not a measurement.
+      #
+      # Each filter is `--exact`. A substring filter reads whichever tests grow
+      # to contain it: adding the moved-clone properties below made
+      # `clone_refuses_an_occupied_name` match two tests, so a failure in the
+      # new one would have reddened the step named for the old one. When the
+      # step name is the whole measurement, it has to name one test.
       - name: Publication on Linux - the object is published, not the name
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked source_name_taken_over
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_source_name_taken_over_does_not_change_what_is_published
       - name: Publication on Linux - an occupied name is refused
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked occupied_name_is_refused
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact an_occupied_name_is_refused_and_the_file_there_is_untouched
       - name: Publication on Linux - a name that is not one component is refused
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked not_one_component
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_name_that_is_not_one_component_is_refused
       - name: Publication on Linux - a swapped destination folder is not published into
         if: runner.os == 'Linux'
-        run: cargo +1.98.1 test -p fhd-platform --locked destination_folder_swapped
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into
       # macOS only, and a measurement rather than a mechanism: nothing in the
       # engine calls what these exercise. macOS refuses to publish, and these
       # answer -- on a real macOS rather than from a manual page read on a
@@ -142,16 +148,36 @@ jobs:
       # same reason the Linux ones are: the logs need a token.
       - name: Publication on macOS - a clone carries the handle's bytes
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked clone_carries_the_bytes
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_carries_the_bytes_of_the_handle_not_of_its_name
       - name: Publication on macOS - a clone is a separate object
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked clone_is_a_separate_object
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_is_a_separate_object_from_the_part_it_came_from
       - name: Publication on macOS - a clone refuses an occupied name
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked clone_refuses_an_occupied_name
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_refuses_an_occupied_name_and_leaves_it_untouched
       - name: Publication on macOS - a clone name must be one component
         if: runner.os == 'macOS'
-        run: cargo +1.98.1 test -p fhd-platform --locked clone_name_that_is_not_one_component
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_clone_name_that_is_not_one_component_is_refused
+      # The three-step candidate: clone into a directory the engine owns, hold
+      # the result open, then move *that object* into the adopted folder. The
+      # reviews refused cloning straight into the destination because
+      # `fclonefileat` hands back no descriptor for what it made, so the engine
+      # would have to open the new name to learn what it published -- and the
+      # name can be made to mean another file in between. These four measure
+      # whether the move step closes that, or whether macOS has no safe route
+      # and the support limit gets written down instead.
+      - name: Publication on macOS - a moved clone keeps its identity
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder
+      - name: Publication on macOS - a moved clone refuses an occupied name
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_refuses_an_occupied_name_and_leaves_it_untouched
+      - name: Publication on macOS - a moved clone ignores a swapped destination
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_ignores_a_directory_that_took_the_destination_name
+      - name: Publication on macOS - a moved clone refuses names that are not one component
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked -- --exact a_moved_clone_refuses_names_that_are_not_one_component
       # It runs everywhere now. While it was Windows-only, a test compiled
       # under cfg(unix) could be added and run nowhere with nothing saying
       # so -- which is what happened to the Unix half of foreign_writers:
@@ -175,6 +201,8 @@ jobs:
               destination_folder_swapped clone_carries_the_bytes \
               clone_is_a_separate_object clone_refuses_an_occupied_name \
               clone_name_that_is_not_one_component \
+              moved_clone_keeps_its_identity moved_clone_ignores_a_directory \
+              moved_clone_refuses_names \
               identifies_its_object carries_the_held_file; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
@@ -188,7 +216,7 @@ jobs:
           expected=""
           case "${RUNNER_OS}" in
             Linux) expected="a_source_name_taken_over_does_not_change_what_is_published an_occupied_name_is_refused_and_the_file_there_is_untouched a_name_that_is_not_one_component_is_refused a_destination_folder_swapped_after_it_was_opened_is_not_the_one_published_into" ;;
-            macOS) expected="a_clone_carries_the_bytes_of_the_handle_not_of_its_name a_clone_is_a_separate_object_from_the_part_it_came_from a_clone_refuses_an_occupied_name_and_leaves_it_untouched a_clone_name_that_is_not_one_component_is_refused" ;;
+            macOS) expected="a_clone_carries_the_bytes_of_the_handle_not_of_its_name a_clone_is_a_separate_object_from_the_part_it_came_from a_clone_refuses_an_occupied_name_and_leaves_it_untouched a_clone_name_that_is_not_one_component_is_refused a_moved_clone_keeps_its_identity_and_lands_in_the_opened_folder a_moved_clone_refuses_an_occupied_name_and_leaves_it_untouched a_moved_clone_ignores_a_directory_that_took_the_destination_name a_moved_clone_refuses_names_that_are_not_one_component" ;;
           esac
           for wanted in $expected; do
             printf '%s\n' "$listed" | grep -qx -- "$wanted" || {
