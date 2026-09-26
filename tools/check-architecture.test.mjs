@@ -291,13 +291,15 @@ test('an approved allowance that no longer exists in the tree is reported', () =
   // item with one implementation per system -- still reports the missing one.
   const linker =
     'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
-  const once = unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker]]]));
+  const clone =
+    'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
+  const once = unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, clone]]]));
   assert.equal(once.length, 1, JSON.stringify(once));
   assert.match(once[0], /link_into_directory/u);
 
   // And everything present reports nothing.
   assert.deepEqual(
-    unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, linker]]])),
+    unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, linker, clone]]])),
     [],
   );
 });
