@@ -38,9 +38,7 @@ use fhd_storage::FileStorage;
 use harness::Directory;
 use std::ffi::OsStr;
 use std::fs;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -535,7 +533,7 @@ fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
 /// What is *not* claimed: that the adopted folder is the one the operator
 /// meant. Only that it is the one their path led to at the earliest moment the
 /// engine could look, and that it does not change afterwards.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() {
     struct RealLinker;
@@ -609,7 +607,7 @@ fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() 
 /// The third is asserted over a directory listing rather than one bystander
 /// file, because "we did not delete the file we were thinking of" is a weaker
 /// claim than "we did not delete anything".
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_else() {
     struct Refuse(Arc<AtomicBool>);
@@ -745,7 +743,7 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
 /// The failure is injected at the one place the answer comes from: the port's
 /// `same_object`. The link itself is the real mechanism, so what is measured is
 /// the adapter's handling of an unanswered question, not a fake publication.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
     struct LinkButCannotCompare;
@@ -818,7 +816,7 @@ fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
 /// file is a link to. Lifting it on a part whose bytes have already been
 /// delivered would make a delivered file writable again. Nothing in the engine
 /// asks twice today; this makes it safe for the one that eventually does.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
     struct RealLinker;
