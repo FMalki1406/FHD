@@ -2158,8 +2158,9 @@ async fn corrupt_bytes_on_a_part_that_may_be_delivered_are_not_replaced() {
     assert!(!destination.exists(), "a second copy was published");
 }
 
-/// The volume of a path, for tests that must prove two paths are on different
-/// ones rather than assume it.
+/// A drive-letter precheck for these Windows cross-volume probes. The manual
+/// C:/D: run also verified that these were distinct fixed NTFS volumes; drive
+/// letters alone are not a general volume-identity test.
 fn volume_of(path: &Path) -> Option<std::ffi::OsString> {
     path.components()
         .next()
@@ -2362,6 +2363,7 @@ async fn a_download_to_a_second_volume_resumes_across_a_restart_and_matches_its_
 /// real linker. Whatever comes back, **nothing was created and nothing was
 /// destroyed** -- a silent copy here would be the worst outcome, bytes at the
 /// destination that no handle vouches for.
+#[cfg(any(windows, target_os = "linux"))]
 #[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
@@ -2403,6 +2405,17 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
         "cross-volume link refused with: {error:?} (kind {:?})",
         error.kind()
     );
+    #[cfg(windows)]
+    assert!(
+        error.to_string().contains("0xc00000d4"),
+        "the refusal was not STATUS_NOT_SAME_DEVICE: {error}"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        error.raw_os_error(),
+        Some(18), // EXDEV on Linux
+        "the refusal was not EXDEV: {error}"
+    );
     assert!(
         !folder_path.join("landed.bin").exists(),
         "a refused cross-volume link left a name behind"
@@ -2418,7 +2431,7 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
 /// **A crash at each publication stage, with the record and the part on
 /// different disks.**
 ///
-/// The four stages themselves are already measured at the storage port, on one
+/// The publication stages are measured separately at the storage port, on one
 /// volume: `a_crash_before_the_link_began_publishes_on_the_next_run` and
 /// `a_crash_during_or_after_the_link_neither_retries_nor_reopens` in
 /// `fhd-storage`, and the sealed-after-a-crash and reconciled-publication tests
@@ -2432,7 +2445,8 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
 /// reached, the wrong answer would be either refetching a file the user already
 /// has, or unsealing one.
 ///
-/// Two stages, because they are the two answers:
+/// This probe injects two persisted states after a stopped transfer. It does
+/// not interrupt a live link or measure the Linked state:
 ///
 /// * `Sealed` -- the link had not begun, so no name leads to these bytes and
 ///   nothing can be anyone's file. It may publish on the next run.
@@ -2445,7 +2459,7 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
 /// that is not run.
 #[ignore = "needs a writable directory on a second volume in FHD_SECOND_VOLUME"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_crash_at_each_publication_stage_recovers_with_the_record_on_another_disk() {
+async fn sealed_and_attempted_records_recover_with_the_record_on_another_disk() {
     for stage in ["sealed", "attempted"] {
         let state = Directory::new(&format!("cross-volume-crash-{stage}"));
         let Some(elsewhere) = second_volume(&state, &format!("crash-{stage}")) else {
