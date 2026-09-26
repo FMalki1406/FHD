@@ -124,15 +124,15 @@ impl ForeignWriters {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::ffi::{CString, OsStr};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::fs::File;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::ffi::OsStrExt;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::io::AsRawFd;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::Path;
 
     /// Not available without a platform call this crate does not yet make.
@@ -212,6 +212,63 @@ mod imp {
                 leaf.as_ptr(),
                 libc::AT_SYMLINK_FOLLOW,
             )
+        };
+        if created == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    /// Copies the file this handle holds into `directory` under `name`, by
+    /// cloning it.
+    ///
+    /// **Measured, not adopted.** Nothing in the engine calls this: macOS still
+    /// refuses to publish. It exists so the one remaining candidate mechanism
+    /// there can be measured on a real macOS rather than argued about, which is
+    /// what `docs/publication-contract.md` section 11 asks for before anything
+    /// is built on it.
+    ///
+    /// `fclonefileat(2)` is the only call on macOS that takes **an open
+    /// descriptor as its source** and a directory descriptor plus one name as
+    /// its destination. Everything else there starts from a path, and a path is
+    /// what publication must not re-resolve: between proving some bytes and
+    /// publishing them, a name can be made to mean another file.
+    ///
+    /// **What it is not.** It does not create a hard link. It creates a new
+    /// inode that shares storage copy-on-write, so the published file and the
+    /// part are *different objects* holding the same bytes. That difference is
+    /// the reason this is not simply wired in: the engine claims `At` only when
+    /// the requested path leads to the object it published, and it currently
+    /// asks that question about the part. Adopting this means `link` handing
+    /// back the object it created so the comparison is against that -- which is
+    /// the sentence the publication code already uses, and does not yet do.
+    ///
+    /// It needs APFS. On any other filesystem it fails rather than copying, and
+    /// a copy is not what publication may quietly fall back to.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => (),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a link name must be a single path component",
+                ));
+            }
+        }
+        let leaf = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a link name holds a NUL"))?;
+
+        // SAFETY: both descriptors are borrowed from open `File`s and outlive
+        // the call; `leaf` is NUL-terminated and owned here for its duration.
+        // `fclonefileat` reads them and returns a status, taking ownership of
+        // nothing. The flags are zero: no `CLONE_NOFOLLOW` is wanted, because
+        // the source is a descriptor rather than a name, and nothing here wants
+        // to drop ownership information.
+        let created = unsafe {
+            libc::fclonefileat(file.as_raw_fd(), directory.as_raw_fd(), leaf.as_ptr(), 0)
         };
         if created == 0 {
             return Ok(());
@@ -1586,6 +1643,9 @@ mod imp {
     }
 }
 
+/// Exported so it can be measured on a real macOS. Nothing calls it.
+#[cfg(target_os = "macos")]
+pub use imp::clone_into_directory;
 #[cfg(target_os = "linux")]
 pub use imp::link_into_directory;
 #[cfg(windows)]

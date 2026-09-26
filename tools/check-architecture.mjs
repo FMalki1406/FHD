@@ -76,6 +76,11 @@ export const UNSAFE_ALLOWANCES = new Map([
     // the whole publication design rests on.
     'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
     'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
+    // `clone_into_directory` calls `fclonefileat(2)` on macOS. Same shape as the
+    // linkers -- borrowed descriptors, a name owned here, a status back -- and
+    // measured rather than adopted: nothing in the engine calls it, and the
+    // publication contract says what adopting it would require first.
+    'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
   ]],
 ]);
 

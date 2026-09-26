@@ -134,6 +134,24 @@ jobs:
       - name: Publication on Linux - a swapped destination folder is not published into
         if: runner.os == 'Linux'
         run: cargo +1.98.1 test -p fhd-platform --locked destination_folder_swapped
+      # macOS only, and a measurement rather than a mechanism: nothing in the
+      # engine calls what these exercise. macOS refuses to publish, and these
+      # answer -- on a real macOS rather than from a manual page read on a
+      # Windows machine -- whether the one remaining candidate could carry it,
+      # and what adopting it would cost. Each property is its own step for the
+      # same reason the Linux ones are: the logs need a token.
+      - name: Publication on macOS - a clone carries the handle's bytes
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked clone_carries_the_bytes
+      - name: Publication on macOS - a clone is a separate object
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked clone_is_a_separate_object
+      - name: Publication on macOS - a clone refuses an occupied name
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked clone_refuses_an_occupied_name
+      - name: Publication on macOS - a clone name must be one component
+        if: runner.os == 'macOS'
+        run: cargo +1.98.1 test -p fhd-platform --locked clone_name_that_is_not_one_component
       # It runs everywhere now. While it was Windows-only, a test compiled
       # under cfg(unix) could be added and run nowhere with nothing saying
       # so -- which is what happened to the Unix half of foreign_writers:
@@ -154,7 +172,9 @@ jobs:
               used_to_fail_open owner_rule_is_decided used_to_miss \
               owner_only_and_one_we_find default_acl_on_the_parent \
               source_name_taken_over occupied_name_is_refused not_one_component \
-              destination_folder_swapped \
+              destination_folder_swapped clone_carries_the_bytes \
+              clone_is_a_separate_object clone_refuses_an_occupied_name \
+              clone_name_that_is_not_one_component \
               identifies_its_object carries_the_held_file; do
             printf '%s\n' "$listed" | grep -- "$filter" || true
           done | sort -u)
