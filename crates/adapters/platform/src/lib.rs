@@ -406,13 +406,19 @@ mod imp {
         Err(io::Error::last_os_error())
     }
 
-    /// Opens `path` for the publication location check: never blocking, and only
-    /// when a regular file is there.
+    /// Opens `path` for the publication location check, without waiting on a peer
+    /// that may never arrive, and only when a regular file is there that the name
+    /// leads to directly.
+    ///
+    /// The first line used to say "never blocking", which the "What still blocks"
+    /// paragraph below contradicts and which no Unix implementation can deliver
+    /// with open flags. The stronger claim is what a reader skimming the signature
+    /// sees first, so it is gone.
     ///
     /// `Ok(None)` means the path does not reach a regular file -- nothing is
-    /// there, or what is there is a directory, a FIFO, a socket or a device. The
-    /// caller reads that as "the path does not reach what was published", which
-    /// is true of all of them.
+    /// there, or what is there is a directory, a FIFO, a socket, a device, or a
+    /// symlink. The caller reads that as "the path does not reach what was
+    /// published", which is true of all of them.
     ///
     /// **Why this is not `File::open`.** Publication links the verified object
     /// into the adopted folder and only then asks whether the path the operator
@@ -428,19 +434,35 @@ mod imp {
     /// The type is read from the **open descriptor**, not from the path, so
     /// nothing can be swapped in between the check and the answer.
     ///
-    /// **`O_NOFOLLOW` is deliberately absent**, unlike `open_in_directory` above.
-    /// The two ask opposite questions. That one pins an object the engine just
-    /// created and must not accept a symlink standing in for it. This one asks
-    /// "does the path the operator gave reach what was published" -- and
-    /// following a symlink is part of what a path means, so a link pointing at the
-    /// published file is a path that does reach it. What the type check refuses is
-    /// answering `At` about something that is not a file at all.
+    /// **`O_NOFOLLOW` is set, and an earlier version of this comment argued at
+    /// length that it should not be.** That argument -- "following a symlink is
+    /// part of what a path means, so a link pointing at the published file is a
+    /// path that does reach it" -- missed two facts, and a security review found
+    /// what they add up to:
     ///
-    /// Two facts make that safe, and a security review asked for them to be
-    /// written down because they are load-bearing and a change to either is a
-    /// change to this decision: **the daemon is per-user**, so a symlink reaches
-    /// only what this user could open anyway, and **nothing ever reads through
-    /// this handle** -- it exists to be `fstat`ed and compared.
+    /// * **What publication creates is a hard link**, made by `link` inside the
+    ///   adopted folder. It is never a symlink. So a symlink at the requested name
+    ///   is by construction not the entry the engine made.
+    /// * **The part's name is unlinked immediately after a successful publish**
+    ///   (`FilePart::discard`, called from the coordinator's `release_part` once
+    ///   the outcome is recorded). The inode survives through the published hard
+    ///   link; the part's *name* does not.
+    ///
+    /// Together those made a false report reachable. A symlink planted at the
+    /// requested name pointing at `<parts>/<job>-<generation>.part` resolves to the
+    /// same inode as the published link, so the identity comparison said `true` and
+    /// the engine reported `At` -- and then removed the very name that symlink
+    /// pointed at, leaving the user with a dangling link at the path they were told
+    /// held their download, while the real file sat somewhere else unreported.
+    ///
+    /// With `O_NOFOLLOW` the symlink is refused instead: on Linux `O_PATH |
+    /// O_NOFOLLOW` returns a descriptor for the link itself, whose type is not a
+    /// regular file, so the answer is `Moved` -- true, and the honest one.
+    ///
+    /// The two facts the earlier rationale rested on are still true and still worth
+    /// recording, because a change to either would be a change to this decision:
+    /// the daemon is per-user, and nothing ever reads through this handle -- it
+    /// exists to be `fstat`ed and compared.
     ///
     /// **What still blocks, stated rather than implied.** `O_PATH` removes the
     /// file's own open from the path, so FIFOs, devices and leases are closed.
@@ -451,9 +473,12 @@ mod imp {
     /// location check, which is **not implemented**; section 11 of
     /// `docs/publication-contract.md` records it as an open limitation.
     ///
-    /// `O_NONBLOCK` is left set on what comes back: `read(2)` ignores it on a
-    /// regular file, and only a regular file is returned. Nothing reads through
-    /// this handle anyway -- it exists to be compared with `same_object`.
+    /// The flags stay set on what comes back, and that is harmless because nothing
+    /// reads through this handle: on Linux it is an `O_PATH` descriptor, which
+    /// `read(2)` refuses outright, and elsewhere `O_NONBLOCK` is set, which
+    /// `read(2)` ignores on a regular file. Only a regular file is returned either
+    /// way. (This paragraph said "`O_NONBLOCK` is left set" while Linux had moved
+    /// to `O_PATH` in the same commit; a security review caught it.)
     #[cfg(unix)]
     pub fn open_regular_without_blocking(
         path: &std::path::Path,
@@ -473,9 +498,9 @@ mod imp {
         // macOS has no `O_PATH`, and macOS does not publish, so `O_NONBLOCK` is
         // what it gets.
         #[cfg(target_os = "linux")]
-        let flags = libc::O_PATH | libc::O_CLOEXEC;
+        let flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         #[cfg(not(target_os = "linux"))]
-        let flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let flags = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(flags)
@@ -1535,7 +1560,19 @@ mod imp {
     ///
     /// The type is read from the open handle, not from the path.
     pub fn open_regular_without_blocking(path: &Path) -> io::Result<Option<File>> {
-        let file = match File::open(path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// Opens the reparse point itself rather than what it points at: the unix
+        /// side's `O_NOFOLLOW`, for the same reason. What publication creates is a
+        /// hard link, never a link of this kind, so one at the requested name is
+        /// not the entry the engine made -- and the part's own name is unlinked
+        /// straight after a successful publish, so believing a symbolic link would
+        /// mean reporting a path the engine is about to make dangle.
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(OPEN_REPARSE_POINT)
+            .open(path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),

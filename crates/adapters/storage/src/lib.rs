@@ -187,7 +187,12 @@ fn open_directory(path: &Path) -> Result<File, StorageError> {
         // anything that is not a directory **without blocking on it**.
         //
         // **This narrows the window; it does not close it.** Between this and the
-        // open below, a same-account writer could still put a FIFO at the name.
+        // open below, a same-account writer could still put a FIFO at the name --
+        // or, worse than a stall, **another directory**, which adoption would then
+        // take as the approved folder and deliver the file into. That is the declared
+        // ceiling (a download is protected up to the permissions of the folder you
+        // chose) rather than a new hole, and a security review asked for it to be
+        // named here, where a reader is told what the residual is.
         // Closing it needs `O_DIRECTORY` on the open itself, which needs `libc`,
         // which this crate may not have -- and the `HandleLinker` port cannot
         // carry it, because the composition root deliberately installs no linker
@@ -436,6 +441,21 @@ impl FilePart {
         let metadata_path = directory.join(format!("{name}.meta"));
         check_optional(&part_path)?;
         check_optional(&metadata_path)?;
+        // The directory handle comes first, before the two files it will hold.
+        //
+        // It used to be taken after them, and the create path then persisted the
+        // new entries with `sync_directory(&directory)` -- a blocking `File::open`
+        // by name, on a directory inside the folder the user chose. An engineering
+        // review found it: a same-account writer who swapped that name for a FIFO
+        // in the window after validation wedged the call, and this one runs on the
+        // shared `spawn_blocking` pool, which cannot be cancelled -- so it is worse
+        // than the two already closed, which each had their own thread.
+        //
+        // The commit that held this handle for `sync` and `publish` claimed there
+        // was "no name to resolve" left, and that was false here. Taking the handle
+        // before the files closes it by ordering, at no cost: one open either way.
+        #[cfg(unix)]
+        let folder = open_directory(&directory)?;
         // Create-new never truncates a surviving generation or unrelated file.
         let mut file = owner_only(OpenOptions::new().read(true).write(true))
             .create_new(create)
@@ -459,7 +479,9 @@ impl FilePart {
                 .write_all(&identity(spec, Publication::Open))
                 .map_err(io)?;
             metadata.sync_all().map_err(io)?;
-            sync_directory(&directory)?;
+            // Through the handle taken above, not the name.
+            #[cfg(unix)]
+            folder.sync_all().map_err(io)?;
             Publication::Open
         } else {
             if metadata.metadata().map_err(io)?.len() != META_LEN as u64
@@ -521,7 +543,7 @@ impl FilePart {
             metadata,
             path: part_path,
             #[cfg(unix)]
-            folder: open_directory(&directory)?,
+            folder,
             spec,
             coverage: vec![],
             protected: vec![],
@@ -1243,9 +1265,16 @@ mod tests {
             !directory.output().exists(),
             "a refused publication left the destination name behind"
         );
-        // Resolved before anything was recorded, so the part is writable again
-        // rather than stranded: that is the whole reason the decision is made in
-        // the composition root instead of inside `link`.
+        // Resolved before `Attempted` is recorded, so the part is writable again
+        // rather than stranded: that is the whole reason the decision is made in the
+        // composition root instead of inside `link`.
+        //
+        // Not "before anything was recorded", which is what this said. `mark(Sealed)`
+        // is written *and* fsynced before the linker is checked, and then lifted, so
+        // the byte below cannot tell "never sealed" from "sealed then unsealed" --
+        // an engineering review pointed out the claim was both wrong and unmeasured.
+        // What matters is that no `Attempted` was written, because that is the state
+        // nothing can decide afterwards.
         let meta = fs::read(directory.part().join("1-1.meta")).unwrap();
         assert_eq!(
             meta.get(33),

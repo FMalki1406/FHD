@@ -1384,3 +1384,113 @@ fn a_failed_location_check_after_the_link_keeps_the_seal_and_the_files() {
     assert_eq!(fs::read(parts.join("1-1.part")).unwrap(), b"AAAAAA");
     assert_eq!(fs::read(&bystander).unwrap(), b"not ours to touch");
 }
+
+/// **A symlink at the requested name pointing at the part is not `At`.**
+///
+/// The identity check compares the requested path with the part's handle, and the
+/// published file is a *hard link* to that same inode -- so a **symbolic** link
+/// planted at the requested name and pointing at `<parts>/1-1.part` resolves to
+/// the same inode and satisfied the comparison. The engine reported
+/// `Published::At`, and then the coordinator's `release_part` called `discard`,
+/// which unlinks the part's name. The symlink dangled. The user was told their
+/// download was at a path that led nowhere, while the real file sat in the
+/// displaced folder, unreported.
+///
+/// A security review found this. The fix is `O_NOFOLLOW` on the location check,
+/// justified by what publication actually creates: a hard link, never a symlink.
+/// So a symlink at that name cannot be the entry the engine made, and the honest
+/// answer is `Moved`.
+///
+/// Linux only: creating a symlink on Windows needs a privilege CI does not grant,
+/// and this file's mechanism needs Windows or Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_symlink_at_the_requested_name_pointing_at_the_part_is_not_reported_as_at() {
+    struct DisplaceThenSymlink {
+        approved: PathBuf,
+        aside: PathBuf,
+        requested: PathBuf,
+        part: PathBuf,
+        planted: Arc<AtomicBool>,
+    }
+    impl HandleLinker for DisplaceThenSymlink {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            objects_match(left, right)
+        }
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            // Published into the folder whose handle was adopted, first.
+            link_through_the_platform(file, folder, name)?;
+            // The folder is displaced and an impostor takes its name, which frees
+            // the requested path -- the window a sibling test already establishes
+            // is reachable.
+            fs::rename(&self.approved, &self.aside).expect("the folder is displaced");
+            fs::create_dir(&self.approved).expect("an impostor takes the name");
+            // And a symlink to the part is planted where the user asked for a file.
+            std::os::unix::fs::symlink(&self.part, &self.requested)
+                .expect("the symlink is planted");
+            self.planted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let directory = Directory::new("publish-symlink-to-part");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let approved = directory.0.join("approved");
+    fs::create_dir(&approved).unwrap();
+    let destination = approved.join("published.bin");
+
+    let planted = Arc::new(AtomicBool::new(false));
+    let store = FileStorage::default().with_linker(Arc::new(DisplaceThenSymlink {
+        approved: approved.clone(),
+        aside: directory.0.join("moved-away"),
+        requested: destination.clone(),
+        part: parts.join("1-1.part"),
+        planted: planted.clone(),
+    }));
+
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    let outcome = part.publish().expect("publication itself succeeded");
+    assert!(
+        planted.load(Ordering::SeqCst),
+        "the symlink was never planted, so this run tested nothing"
+    );
+    match outcome {
+        Published::Moved { .. } => (),
+        Published::At(path) => panic!(
+            "a symlink to the part was reported as the published location: {}. \
+             The part's name is unlinked right after this, so that path dangles.",
+            path.display()
+        ),
+        other => panic!("expected Moved, got {other:?}"),
+    }
+
+    // The real file is where the handle put it, and the symlink was not followed,
+    // rewritten or removed.
+    assert_eq!(
+        fs::read(directory.0.join("moved-away").join("published.bin")).unwrap(),
+        b"AAAAAA",
+        "the published bytes are not the proved bytes"
+    );
+    assert!(
+        fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink at the requested name was replaced or removed"
+    );
+}

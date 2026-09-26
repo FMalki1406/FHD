@@ -424,7 +424,7 @@ export function shellEscapeWreckage(relative, bytes) {
       );
     }
     if (bytes[index] === 0x60) backticks += 1;
-    if (bytes[index] === 0x0a) backticks = 0;
+    if (bytes[index] === 0x0a || bytes[index] === 0x0d) backticks = 0;
     if (bytes[index] !== 0x60 || !ESCAPES.has(bytes[index + 1])) continue;
     // Only a backtick that *opens* a span can begin a stray escape. A closing
     // one followed by an English suffix -- `` `fstat`ed ``, which this file's own
@@ -433,17 +433,58 @@ export function shellEscapeWreckage(relative, bytes) {
     // separates the two: the first, third, fifth open; the rest close. The
     // instance that actually shipped was the only backtick on its line, so it
     // still counts as opening and is still caught.
-    if (backticks % 2 === 0) continue;
     // Not the tail of a run of backticks. A Markdown fence with a language tag
     // -- ```text, ```rust, ```bash, ```none -- puts an escape letter directly
     // after a backtick, and there is no closing backtick on that line. Widening
     // the rule to unclosed spans turned every fenced block in `docs/` into an
     // offender, which is how this exception got measured rather than guessed.
     if (bytes[index - 1] === 0x60) continue;
-    // Does the span close before the line does?
+    // A backtick that *closes* a span, with an English suffix after it, is not a
+    // stray escape. `` `fstat`ed `` is the shape, and it appears in this crate's
+    // own comments. Two things together say "closing": a word character directly
+    // before it, and an earlier backtick on the same line for it to close. The
+    // instance that shipped had the first and not the second -- it was the only
+    // backtick on its line.
+    const before = bytes[index - 1];
+    const wordBefore =
+      (before >= 0x30 && before <= 0x39) ||
+      (before >= 0x41 && before <= 0x5a) ||
+      (before >= 0x61 && before <= 0x7a);
+    if (wordBefore) {
+      let earlier = false;
+      for (let scan = index - 1; scan >= 0; scan -= 1) {
+        if (bytes[scan] === 0x0a || bytes[scan] === 0x0d) break;
+        if (bytes[scan] === 0x60) { earlier = true; break; }
+      }
+      // A line with several strays reports the first and skips the later ones,
+      // which is enough: the gate refuses the file either way. What it must not
+      // do is report none, which the parity rule this replaced did for every even
+      // count -- measured, and a regression against the version before it.
+      if (earlier) continue;
+    }
+    // Does a plausible code span close before the line does?
+    //
+    // "Plausible" is doing work here. Asking only whether *a* backtick follows
+    // made two mistakes in turn, both measured by review. It flagged
+    // `` `fstat`ed `` -- a closing backtick with an English suffix -- and a
+    // parity rule written to fix that then **missed every even-numbered stray on
+    // a line**, because with two strays the first one's scan finds the second and
+    // calls the span closed, and the second is skipped as a closing backtick.
+    // A collapsed block produces several per line, so that was a regression
+    // against the version before it.
+    //
+    // A run of two or more spaces separates them: a one-letter code span does not
+    // contain one, and an escape that swallowed a line break is followed by the
+    // next line's indentation, which is exactly that. So an ordinary span such as
+    // the one in `docs/state-directory-permissions.md`, whose content has single
+    // spaces only, closes and passes -- while a stray escape followed by a
+    // comment marker and its indentation does not. (That example is described
+    // rather than quoted: written out, it is the pattern, and this file is
+    // scanned by it.)
     let closed = false;
     for (let scan = index + 2; scan < bytes.length; scan += 1) {
       if (bytes[scan] === 0x0a || bytes[scan] === 0x0d) break;
+      if (bytes[scan] === 0x20 && bytes[scan + 1] === 0x20) break;
       if (bytes[scan] === 0x60) { closed = true; break; }
     }
     if (!closed) {

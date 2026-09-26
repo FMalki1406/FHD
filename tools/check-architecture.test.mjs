@@ -497,6 +497,26 @@ test('refuses what a PowerShell string edit leaves behind', () => {
   const alone = `        // because Path::components${tick}n        // normalises\n`;
   assert.equal(shellEscapeWreckage('a.rs', Buffer.from(alone, 'binary')).length, 1);
 
+  // Several strays on one line must not report **none**. A parity rule written to
+  // fix the closing-backtick false positive did exactly that for every even
+  // count, which an engineering review measured as a regression against the
+  // version before it: with two strays, the first one's scan finds the second and
+  // calls the span closed, and the second is skipped as a closing backtick.
+  // Reporting the first is enough -- the gate refuses the file either way --
+  // but reporting zero is not, and a collapsed block produces several per line.
+  for (const count of [1, 2, 3, 4]) {
+    let line = '// ';
+    for (let at = 0; at < count; at += 1) line += `x${tick}n  ${at}`;
+    assert.ok(
+      shellEscapeWreckage('a.rs', Buffer.from(`${line}\n`, 'binary')).length >= 1,
+      `${count} strays on one line reported nothing`,
+    );
+  }
+
+  // A stray with no whitespace after it at all, which the first version missed.
+  const tight = `// because Path::components${tick}nnormalises\n`;
+  assert.equal(shellEscapeWreckage('a.rs', Buffer.from(tight, 'binary')).length, 1);
+
   // U+2028 and U+2029 end a line for a JavaScript parser exactly as the CR does,
   // so a comment holding one stops being a comment. Judged only where a
   // JavaScript parser reads the file.

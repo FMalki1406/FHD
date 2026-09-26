@@ -51,6 +51,7 @@ export const REQUIRED = new Map([
   // paths hold none.
   ['a_fifo_at_the_requested_path_does_not_hang_publication', ['linux']],
   ['a_parts_directory_swapped_for_a_fifo_does_not_hang_publication_after_delivery', ['linux']],
+  ['a_symlink_at_the_requested_name_pointing_at_the_part_is_not_reported_as_at', ['linux']],
   ['a_failed_location_check_after_the_link_keeps_the_seal_and_the_files', ['win32', 'linux']],
 ]);
 
@@ -65,15 +66,23 @@ export const REQUIRED = new Map([
 /// against the plain `cargo test` it replaced, in a project whose whole evidence
 /// model is reading CI steps. Returning the output instead also makes the
 /// `failed !== 0` branch reachable rather than dead.
+let nonZeroExit = 0;
 function cargo(extra) {
   const argv = ['+1.98.1', 'test', '-p', PACKAGE, '--test', TARGET, '--locked', ...extra];
   try {
     return execFileSync('cargo', argv, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch (error) {
     // A failing test run: cargo exits non-zero and its output is the finding.
+    //
+    // The exit code is remembered rather than discarded. An engineering review
+    // pointed out that reading only the parsed `test result:` line lets a run that
+    // prints a clean summary and *then* exits non-zero -- a harness abort, a crash
+    // in a global destructor, a leaked thread -- pass a gate that the plain
+    // `cargo test` it replaced would have failed.
     if (typeof error.stdout === 'string' && error.stdout) {
       process.stderr.write(error.stdout);
       if (typeof error.stderr === 'string') process.stderr.write(error.stderr);
+      nonZeroExit = error.status ?? 1;
       return error.stdout;
     }
     // No output at all means cargo never ran the tests -- missing toolchain, a
@@ -226,6 +235,12 @@ function main() {
     listed,
     summary,
   });
+  if (nonZeroExit !== 0) {
+    failures.push(
+      `cargo exited ${nonZeroExit} although the summary above was read. A run can ` +
+      'print clean counts and then abort, and the step this guards must not pass on it.',
+    );
+  }
   if (failures.length) {
     console.error(`Publication contract coverage failed on ${process.platform}:`);
     for (const failure of failures) console.error(`  ${failure}`);

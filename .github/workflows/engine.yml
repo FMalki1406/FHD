@@ -297,7 +297,8 @@ jobs:
       # tests and fails unless every property required on this platform ran and
       # passed, with none ignored. Verified by mutation: an `#[ignore]`, a
       # narrowed cfg, the whole file cfg'd off, and a test missing from the
-      # specification all fail it.
+      # specification, an undeclared test behind a multi-line attribute, a failing
+      # test, and a run that exits non-zero after a clean summary all fail it.
       - name: Test the publication contract
         run: node tools/check-contract-tests.mjs
       - name: Test the engine as a program
