@@ -436,6 +436,21 @@ mod imp {
     /// published file is a path that does reach it. What the type check refuses is
     /// answering `At` about something that is not a file at all.
     ///
+    /// Two facts make that safe, and a security review asked for them to be
+    /// written down because they are load-bearing and a change to either is a
+    /// change to this decision: **the daemon is per-user**, so a symlink reaches
+    /// only what this user could open anyway, and **nothing ever reads through
+    /// this handle** -- it exists to be `fstat`ed and compared.
+    ///
+    /// **What still blocks, stated rather than implied.** `O_PATH` removes the
+    /// file's own open from the path, so FIFOs, devices and leases are closed.
+    /// It does not remove the *name resolution*, and that can still wait without
+    /// bound on a FUSE server that never answers or a hard-mounted NFS/SMB share
+    /// whose server is gone -- and so can the `fstat` below. No open flag reaches
+    /// those. Bounding them needs a deadline or a cancellable task around the
+    /// location check, which is **not implemented**; section 11 of
+    /// `docs/publication-contract.md` records it as an open limitation.
+    ///
     /// `O_NONBLOCK` is left set on what comes back: `read(2)` ignores it on a
     /// regular file, and only a regular file is returned. Nothing reads through
     /// this handle anyway -- it exists to be compared with `same_object`.
@@ -444,9 +459,26 @@ mod imp {
         path: &std::path::Path,
     ) -> io::Result<Option<std::fs::File>> {
         use std::os::unix::fs::OpenOptionsExt;
+        // On Linux, `O_PATH`. It resolves the name and returns a descriptor
+        // **without calling the file's own open at all** -- so a FIFO cannot
+        // block, a device driver cannot block or be disturbed, and opening the
+        // read end of somebody's pipe cannot hand its blocked writer an `EPIPE`
+        // on the next write. `fstat` is served from the inode, which is all this
+        // handle is for: `same_object` compares `dev` and `ino`. A security
+        // review named this as the remedy after pointing out that `O_NONBLOCK`
+        // covers FIFOs and leases and nothing else.
+        //
+        // `O_NOFOLLOW` is still absent, deliberately -- see below.
+        //
+        // macOS has no `O_PATH`, and macOS does not publish, so `O_NONBLOCK` is
+        // what it gets.
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_PATH | libc::O_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .custom_flags(flags)
             .open(path);
         let file = match opened {
             Ok(file) => file,
@@ -1442,36 +1474,17 @@ mod imp {
     /// still unstable, which is why this lives here instead of in the storage
     /// adapter -- that crate forbids `unsafe` and may not depend on this one.
     ///
-    /// **This detects; it does not prevent.** Linking from the verified handle
-    /// is what would prevent, and it needs `NtSetInformationFile` with
-    /// `FILE_LINK_INFORMATION`: `SetFileInformationByHandle` does not accept
-    /// `FileLinkInfo`, so the documented Win32 surface has no route. Whether to
-    /// take the NT one is an open decision, and until it is taken this is the
-    /// difference between publishing the wrong bytes and refusing to.
-    /// Opens `path` for the publication location check, only when a regular file
-    /// is there.
-    ///
-    /// The unix side of this exists because a blocking open of a FIFO waits for a
-    /// writer that may never come, which hung publication after the file was
-    /// already published. Windows filesystem paths hold no FIFOs -- a named pipe
-    /// lives in its own namespace under `\\.\pipe\`, not under a directory the
-    /// user chose -- so there is no blocking case here to avoid. The type check
-    /// is kept all the same, so both platforms answer `At` on the same grounds
-    /// rather than on grounds that differ by accident.
-    ///
-    /// The type is read from the open handle, not from the path.
-    pub fn open_regular_without_blocking(path: &Path) -> io::Result<Option<File>> {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if !file.metadata()?.file_type().is_file() {
-            return Ok(None);
-        }
-        Ok(Some(file))
-    }
-
+    /// **This detects; it does not prevent** -- and preventing is now done
+    /// elsewhere. `link_into_directory` links from the verified handle with
+    /// `NtSetInformationFile` and `FILE_LINK_INFORMATION`, because
+    /// `SetFileInformationByHandle` does not accept `FileLinkInfo` and the
+    /// documented Win32 surface has no route. This paragraph used to end "whether
+    /// to take the NT one is an open decision, and until it is taken this is the
+    /// difference between publishing the wrong bytes and refusing to." That
+    /// decision was taken; a security review found the sentence still here,
+    /// describing the crate as it was two mechanisms ago. What this function is
+    /// for now is the question *after* publication: whether the path the operator
+    /// gave reaches the object that was linked.
     pub fn same_object(left: &File, right: &File) -> io::Result<bool> {
         fn identity(file: &File) -> io::Result<FILE_ID_INFO> {
             let mut info = FILE_ID_INFO {
@@ -1498,6 +1511,39 @@ mod imp {
         let right = identity(right)?;
         Ok(left.VolumeSerialNumber == right.VolumeSerialNumber
             && left.FileId.Identifier == right.FileId.Identifier)
+    }
+
+    /// Opens `path` for the publication location check, only when a regular file
+    /// is there.
+    ///
+    /// The unix side of this exists because a blocking open of a FIFO waits for a
+    /// writer that may never come, which hung publication after the file was
+    /// already published. Windows filesystem paths hold no FIFOs -- a named pipe
+    /// lives in its own namespace under `\\.\pipe\`, not under a directory the
+    /// user chose -- so there is no blocking case here to avoid.
+    ///
+    /// **The two platforms do not answer on the same grounds, and this comment
+    /// used to claim they did.** Two reviews measured it with the pinned compiler:
+    /// here a directory gives `PermissionDenied` and a device opens but fails its
+    /// `metadata`, so both take the `Err` path and report `LocationUnverified`,
+    /// while on unix both open and `fstat` cleanly and report `Moved`. Every one
+    /// of those withholds the path, which is what matters -- but they are
+    /// different answers, and `docs/publication-contract.md` now says so per
+    /// platform instead of promising uniformity. The `is_file` check below is
+    /// consequently close to unreachable on Windows; it is kept because it is the
+    /// invariant the port promises, not because this platform exercises it.
+    ///
+    /// The type is read from the open handle, not from the path.
+    pub fn open_regular_without_blocking(path: &Path) -> io::Result<Option<File>> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.file_type().is_file() {
+            return Ok(None);
+        }
+        Ok(Some(file))
     }
 
     /// STATUS_OBJECT_NAME_COLLISION.

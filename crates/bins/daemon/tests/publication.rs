@@ -111,9 +111,10 @@ fn link_through_the_platform(
 /// The location check's open, through the platform, for the same reason.
 ///
 /// A double that opened the requested path itself would be measuring its own
-/// open. In particular the FIFO case below is about `O_NONBLOCK` being set by
-/// the production implementation, which a double written in a crate without
-/// `libc` cannot reproduce.
+/// open. In particular the FIFO case below is about the flags the production
+/// implementation passes -- `O_PATH` on Linux, so the file's own open is never
+/// called at all -- which a double written in a crate without `libc` cannot
+/// reproduce.
 fn open_identity_through_the_platform(path: &Path) -> Result<Option<fs::File>, StorageError> {
     fhd_platform::open_regular_without_blocking(path)
         .map_err(|error| StorageError::Io(error.kind()))
@@ -1036,7 +1037,9 @@ fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
 /// bounded wait**, which is what the channel below is for. A hang is a timeout,
 /// not a failed assertion, so the test says which.
 ///
-/// Unix only, because only unix has a FIFO to put there.
+/// Linux only. A FIFO needs unix, and this file's publication mechanism needs
+/// Windows or Linux, so Linux is the intersection -- macOS has a FIFO and no
+/// publication. The doc used to say "unix only" while the `cfg` said Linux.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_fifo_at_the_requested_path_does_not_hang_publication() {
@@ -1119,9 +1122,22 @@ fn a_fifo_at_the_requested_path_does_not_hang_publication() {
         // The part is moved into the thread, so its seal is read here.
         let _ = send.send(outcome);
     });
-    let outcome = receive
-        .recv_timeout(Duration::from_secs(20))
-        .expect("publish did not return: the location check blocked on the FIFO");
+    // Matched, not `expect`ed. `recv_timeout` returns `Disconnected` the instant
+    // the worker panics -- `mkfifo(1)` missing from PATH, a failing rename -- and
+    // an `expect` here reported every one of those as "publish blocked on the
+    // FIFO". Two reviews pointed out that this test has never run anywhere, so
+    // its first failure would have been the one that misread itself, which is the
+    // confusion the separate thread and the bounded wait exist to prevent.
+    let outcome = match receive.recv_timeout(Duration::from_secs(20)) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("publish did not return within 20s: the location check blocked on the FIFO")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "the thread running publish panicked before answering, so this run \
+             measured nothing about blocking -- its panic is above"
+        ),
+    };
 
     let outcome = outcome.expect("publication itself succeeded before the check");
     match outcome {
@@ -1164,4 +1180,207 @@ fn a_fifo_at_the_requested_path_does_not_hang_publication() {
         Some(&fhd_app::storage::Publication::Linked.to_byte()),
         "a location check that could not find the file unsealed a part that published"
     );
+}
+
+/// **Swapping the parts directory for a FIFO after the part was opened does not
+/// hang publication, and the file is still delivered.**
+///
+/// This is the defect an engineering review found four lines above the location
+/// check, in the same function, after the first fix was already written and
+/// documented as complete. `publish` re-opened the parts directory **by name** to
+/// persist its entries -- and a blocking `File::open` of a FIFO waits for a
+/// writer that may never come. That call sits *after* `mark(Linked)`, so a
+/// same-account writer who renamed the parts directory aside and left a FIFO at
+/// its name could leave the user's file delivered and the job wedged in
+/// `Publishing` for good, with nothing able to cancel it.
+///
+/// `FilePart` now holds that directory open from the moment the part was opened,
+/// so there is no name to resolve and no flag to get right. The swap happens
+/// inside the linker call, which is the one boundary that sits after the bytes
+/// were proved and before the destination exists.
+///
+/// Linux only: it needs a FIFO, and this file's mechanism needs Windows or Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_parts_directory_swapped_for_a_fifo_does_not_hang_publication_after_delivery() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct SwapPartsForAFifo {
+        parts: PathBuf,
+        aside: PathBuf,
+        swapped: Arc<AtomicBool>,
+    }
+    impl HandleLinker for SwapPartsForAFifo {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            objects_match(left, right)
+        }
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            // Deliver first, so what follows can only affect the *report*.
+            link_through_the_platform(file, folder, name)?;
+            fs::rename(&self.parts, &self.aside).expect("the parts directory is displaced");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&self.parts)
+                .status()
+                .expect("mkfifo(1) is needed to measure that a FIFO cannot hang publication");
+            assert!(
+                made.success(),
+                "mkfifo(1) failed, so this run measures nothing"
+            );
+            self.swapped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let directory = Directory::new("publish-parts-fifo");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let downloads = directory.0.join("downloads");
+    fs::create_dir(&downloads).unwrap();
+    let destination = downloads.join("published.bin");
+    let bystander = directory.0.join("bystander.bin");
+    fs::write(&bystander, b"not ours to touch").unwrap();
+
+    let aside = directory.0.join("parts-moved-away");
+    let swapped = Arc::new(AtomicBool::new(false));
+    let store = FileStorage::default().with_linker(Arc::new(SwapPartsForAFifo {
+        parts: parts.clone(),
+        aside: aside.clone(),
+        swapped: swapped.clone(),
+    }));
+
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(part.publish());
+    });
+    let outcome = match receive.recv_timeout(Duration::from_secs(20)) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "publish did not return within 20s: persisting the parts directory \
+             blocked on the FIFO that took its name"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "the thread running publish panicked before answering, so this run \
+             measured nothing about blocking -- its panic is above"
+        ),
+    };
+
+    assert!(
+        swapped.load(Ordering::SeqCst),
+        "the swap never happened, so this run tested nothing"
+    );
+    let outcome = outcome.expect("publication was refused rather than reported");
+    // The destination is untouched by any of this, so the location check can
+    // still answer it: the file is where the user asked for it.
+    assert_eq!(
+        outcome,
+        Published::At(fs::canonicalize(&destination).unwrap()),
+        "the report changed because the parts directory was displaced"
+    );
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"AAAAAA",
+        "the published bytes are not the proved bytes"
+    );
+    // The part kept its seal, read from where the directory went.
+    let meta = fs::read(aside.join("1-1.meta")).unwrap();
+    assert_eq!(
+        meta.get(33),
+        Some(&fhd_app::storage::Publication::Linked.to_byte()),
+        "a displaced parts directory cost the part its seal"
+    );
+    assert_eq!(fs::read(&bystander).unwrap(), b"not ours to touch");
+}
+
+/// **A location check that fails after the link unseals nothing and deletes
+/// nothing.**
+///
+/// The seal is what keeps the inode a delivered file links to from being written
+/// again, so lifting it after publication would let the engine rewrite the user's
+/// file. And the refusal path *does* unseal -- correctly, because a refused link
+/// created nothing -- which is exactly why a failure in the check that runs
+/// *after* a successful link must not be routed there.
+///
+/// `a_location_check_that_cannot_be_completed_is_not_reported_as_a_move` already
+/// covers `same_object` failing. This covers the new step in front of it: the
+/// open itself failing, which is the branch the FIFO fix added.
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn a_failed_location_check_after_the_link_keeps_the_seal_and_the_files() {
+    struct LinkThenRefuseToOpen;
+    impl HandleLinker for LinkThenRefuseToOpen {
+        fn open_for_identity(&self, _: &Path) -> Result<Option<fs::File>, StorageError> {
+            // "I could not look", which is not "it is not there".
+            Err(StorageError::Io(std::io::ErrorKind::PermissionDenied))
+        }
+        fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
+            panic!("the comparison was reached though the open had failed")
+        }
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            link_through_the_platform(file, folder, name)
+        }
+    }
+
+    let directory = Directory::new("publish-check-failed");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let destination = directory.0.join("published.bin");
+    let bystander = directory.0.join("bystander.bin");
+    fs::write(&bystander, b"not ours to touch").unwrap();
+
+    let store = FileStorage::default().with_linker(Arc::new(LinkThenRefuseToOpen));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    let outcome = part.publish().expect("publication itself succeeded");
+    match outcome {
+        Published::LocationUnverified { because, .. } => assert_eq!(
+            because,
+            StorageError::Io(std::io::ErrorKind::PermissionDenied),
+            "the reason was replaced with something else"
+        ),
+        other => panic!("an unanswered question was reported as {other:?}"),
+    }
+    drop(part);
+
+    // Nothing was unsealed.
+    let meta = fs::read(parts.join("1-1.meta")).unwrap();
+    assert_eq!(
+        meta.get(33),
+        Some(&fhd_app::storage::Publication::Linked.to_byte()),
+        "a location check that could not be completed unsealed a published part"
+    );
+    // Nothing was deleted: the published file, the part, and a file belonging to
+    // somebody else are all still there, with their bytes.
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"AAAAAA",
+        "the published file was removed or rewritten"
+    );
+    assert_eq!(fs::read(parts.join("1-1.part")).unwrap(), b"AAAAAA");
+    assert_eq!(fs::read(&bystander).unwrap(), b"not ours to touch");
 }

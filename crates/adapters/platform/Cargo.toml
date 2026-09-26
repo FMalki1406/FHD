@@ -26,7 +26,14 @@ tokio = { version = "=1.51.4", features = ["net"] }
 #   * `fclonefileat` in `clone_into_directory` on macOS, which nothing calls --
 #     it exists to be measured on the platform, and macOS still refuses to
 #     publish.
-#   * `openat` with `O_NOFOLLOW` in `open_in_directory`, and `renameatx_np` with
+#   * `O_PATH` and `O_CLOEXEC` on Linux, and `O_NONBLOCK` and `O_CLOEXEC`
+#     elsewhere, as `custom_flags` in `open_regular_without_blocking`. Flags, not
+#     functions, and passed through safe std -- but they are libc items and the
+#     rule below is about what this crate takes from libc, not about which of
+#     them happen to be `unsafe`. A third review found this list stale for the
+#     third time; the omission was these.
+#   * `openat` with `O_NOFOLLOW`, `O_CLOEXEC` and `O_NONBLOCK` in
+#     `open_in_directory`, and `renameatx_np` with
 #     `RENAME_EXCL` in `move_into_directory`, both macOS and both also called by
 #     nothing: they are the second and third steps of the candidate path -- pin
 #     the clone, then move the pinned object into the adopted folder without

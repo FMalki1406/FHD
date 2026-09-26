@@ -402,6 +402,7 @@ export function checkReviewableSources(root, trees = TREES) {
 export function shellEscapeWreckage(relative, bytes) {
   const offenders = [];
   const ESCAPES = new Set([...'0abefnrtv'].map((letter) => letter.charCodeAt(0)));
+  let backticks = 0;
   const javascript = ['.mjs', '.js', '.ts'].some((extension) => relative.endsWith(extension));
   for (let index = 0; index < bytes.length; index += 1) {
     if (bytes[index] === 0x0d && bytes[index + 1] !== 0x0a) {
@@ -422,7 +423,17 @@ export function shellEscapeWreckage(relative, bytes) {
         'comment partway through. Nothing here writes one on purpose.',
       );
     }
+    if (bytes[index] === 0x60) backticks += 1;
+    if (bytes[index] === 0x0a) backticks = 0;
     if (bytes[index] !== 0x60 || !ESCAPES.has(bytes[index + 1])) continue;
+    // Only a backtick that *opens* a span can begin a stray escape. A closing
+    // one followed by an English suffix -- `` `fstat`ed ``, which this file's own
+    // comments contain -- has an escape letter after it and nothing closing it,
+    // and the rule flagged it. Counting backticks from the start of the line
+    // separates the two: the first, third, fifth open; the rest close. The
+    // instance that actually shipped was the only backtick on its line, so it
+    // still counts as opening and is still caught.
+    if (backticks % 2 === 0) continue;
     // Not the tail of a run of backticks. A Markdown fence with a language tag
     // -- ```text, ```rust, ```bash, ```none -- puts an escape letter directly
     // after a backtick, and there is no closing backtick on that line. Widening

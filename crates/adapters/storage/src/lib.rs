@@ -180,7 +180,29 @@ fn open_directory(path: &Path) -> Result<File, StorageError> {
     }
     #[cfg(not(windows))]
     {
-        File::open(path).map_err(io)
+        // `read_dir` first, and it is not a tidiness check. On unix `File::open`
+        // of a FIFO blocks for a writer that may never come, and this opens a
+        // path the operator gave (`--out /somewhere/fifo/file.bin`) or a folder
+        // that was swapped for one. `opendir` passes `O_DIRECTORY`, so it refuses
+        // anything that is not a directory **without blocking on it**.
+        //
+        // **This narrows the window; it does not close it.** Between this and the
+        // open below, a same-account writer could still put a FIFO at the name.
+        // Closing it needs `O_DIRECTORY` on the open itself, which needs `libc`,
+        // which this crate may not have -- and the `HandleLinker` port cannot
+        // carry it, because the composition root deliberately installs no linker
+        // on macOS. So what is closed here is the operator mistake and the
+        // unraced swap; the raced swap is recorded as open in the publication
+        // contract rather than papered over.
+        //
+        // The severe case -- a reopen *after* the file is delivered -- is gone
+        // instead of narrowed: `FilePart` holds this handle from then on.
+        fs::read_dir(path).map_err(io)?;
+        let opened = File::open(path).map_err(io)?;
+        if !opened.metadata().map_err(io)?.is_dir() {
+            return Err(StorageError::InvalidInput);
+        }
+        Ok(opened)
     }
 }
 /// The destination as an object plus the name the operator gave for it.
@@ -334,7 +356,23 @@ struct FilePart {
     file: File,
     metadata: File,
     path: PathBuf,
-    directory: PathBuf,
+    /// The parts directory, held open from the moment this part was.
+    ///
+    /// **Why a handle and not the path.** `sync_directory(&self.directory)`
+    /// reopened this directory by name, and on unix that is `File::open` -- which
+    /// blocks forever on a FIFO waiting for a writer that may never come. One of
+    /// those calls sits in `publish` *after* the link exists and the record says
+    /// `Linked`, so a same-account writer who put a FIFO at the parts directory's
+    /// name during the transfer could leave the file delivered and the job stuck
+    /// in `Publishing` for good, with nothing able to cancel it. An engineering
+    /// review found it four lines above the `File::open` this project had just
+    /// fixed for exactly that reason, in the same function.
+    ///
+    /// Holding the handle is not a workaround for the flag: it is the rule the
+    /// rest of this file already follows -- through the handle, not the path --
+    /// and it removes the resolution rather than making it safer.
+    #[cfg(unix)]
+    folder: File,
     spec: PartSpec,
     coverage: Vec<ByteRange>,
     protected: Vec<ByteRange>,
@@ -482,7 +520,8 @@ impl FilePart {
             file,
             metadata,
             path: part_path,
-            directory,
+            #[cfg(unix)]
+            folder: open_directory(&directory)?,
             spec,
             coverage: vec![],
             protected: vec![],
@@ -497,6 +536,18 @@ impl FilePart {
             _lock: owner,
         })
     }
+    /// Persists the parts directory's entries through the handle held since this
+    /// part was opened.
+    ///
+    /// A no-op off unix for the same reason `sync_directory` was:
+    /// `FlushFileBuffers` wants write access to a directory handle and this one
+    /// is opened for reading, so the handle is not even kept there.
+    fn sync_held_folder(&self) -> Result<(), StorageError> {
+        #[cfg(unix)]
+        self.folder.sync_all().map_err(io)?;
+        Ok(())
+    }
+
     fn healthy(&self) -> Result<(), StorageError> {
         if self.poisoned {
             Err(StorageError::InvalidState)
@@ -762,7 +813,7 @@ impl SegmentFile for FilePart {
                 Err(error) => return Err(io(error)),
             }
         }
-        sync_directory(&self.directory)
+        self.sync_held_folder()
     }
     fn abandon(&mut self) {
         self.cancelled = true;
@@ -961,7 +1012,7 @@ impl SegmentFile for FilePart {
         // one is opened for reading.
         #[cfg(unix)]
         folder.sync_all().map_err(io)?;
-        sync_directory(&self.directory)?;
+        self.sync_held_folder()?;
         self.published = true;
         self.poisoned = false;
 
@@ -1155,6 +1206,51 @@ mod tests {
         assert!(
             staged.is_empty(),
             "a staged link was left behind: {staged:?}"
+        );
+    }
+
+    /// **The configuration macOS actually ships**: no linker at all.
+    ///
+    /// The test above supplies a linker whose `link` returns `Unsupported`. That
+    /// is a *different branch* from the one macOS takes: the composition root
+    /// installs no linker there at all, deliberately, because a refusal from
+    /// inside `link` happens after `mark(Attempted)` and a crash in that gap
+    /// leaves the part in the one state nothing can decide. So `linker: None` is
+    /// production on macOS, and a security review pointed out that nothing
+    /// measured it -- the macOS CI step's evidence was an empty test binary,
+    /// which is the absence of a test rather than a test of the refusal.
+    ///
+    /// It runs on every platform, because the branch is reached by configuration
+    /// rather than by `cfg`, and because this is the claim the product makes about
+    /// macOS in `README.md` and in the publication contract.
+    #[test]
+    fn publication_refuses_with_no_linker_at_all_which_is_what_macos_runs() {
+        let directory = Directory::new();
+        let mut part = FileStorage::default()
+            .create(&directory.part(), spec(6))
+            .unwrap();
+        part.write_at(0, b"abcdef").unwrap();
+        part.sync().unwrap();
+        let record = attested(part.as_mut());
+        part.verify(None, &record).unwrap();
+
+        assert_eq!(
+            publish_to(part.as_mut(), &directory.output()),
+            Err(StorageError::Unsupported),
+            "publication found a way to name the file with no mechanism supplied"
+        );
+        assert!(
+            !directory.output().exists(),
+            "a refused publication left the destination name behind"
+        );
+        // Resolved before anything was recorded, so the part is writable again
+        // rather than stranded: that is the whole reason the decision is made in
+        // the composition root instead of inside `link`.
+        let meta = fs::read(directory.part().join("1-1.meta")).unwrap();
+        assert_eq!(
+            meta.get(33),
+            Some(&Publication::Open.to_byte()),
+            "a refusal that created nothing left the part sealed"
         );
     }
 

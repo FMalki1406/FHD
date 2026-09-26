@@ -481,6 +481,22 @@ test('refuses what a PowerShell string edit leaves behind', () => {
     assert.deepEqual(shellEscapeWreckage('a.md', Buffer.from(fence, 'binary')), [], tag);
   }
 
+  // A *closing* backtick with an English suffix after it: an escape letter
+  // follows and nothing closes it on the line. The rule flagged this in its own
+  // crate's comments, so only odd-numbered backticks on a line can open a span.
+  for (const prose of [
+    `// it exists to be ${tick}fstat${tick}ed and compared\n`,
+    `// the ${tick}Moved${tick}ness of it\n`,
+    `/// ${tick}O_PATH${tick}, then ${tick}fstat${tick}ted\n`,
+  ]) {
+    assert.deepEqual(shellEscapeWreckage('a.rs', Buffer.from(prose, 'binary')), [], prose);
+  }
+
+  // And the shape that shipped is still caught, though its backtick also has a
+  // word character before it: it is the only backtick on its line, so it opens.
+  const alone = `        // because Path::components${tick}n        // normalises\n`;
+  assert.equal(shellEscapeWreckage('a.rs', Buffer.from(alone, 'binary')).length, 1);
+
   // U+2028 and U+2029 end a line for a JavaScript parser exactly as the CR does,
   // so a comment holding one stops being a comment. Judged only where a
   // JavaScript parser reads the file.

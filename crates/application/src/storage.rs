@@ -226,9 +226,16 @@ impl std::fmt::Display for Published {
             // Never just the requested path: that is the sentence that sends an
             // operator to look somewhere the file is not, or somewhere nobody
             // checked.
+            // No cause. This said "because the folder was renamed during the
+            // transfer", which the engine never established -- and a security
+            // review pointed out that `Moved` now also covers a FIFO, a
+            // directory or a stranger's file at the requested name, for which
+            // the sentence is simply false. Telling an operator the filesystem
+            // did something nobody checked is the defect this section already
+            // fixed once, for `LocationUnverified`; the `Moved` arm was missed.
             Self::Moved { requested, name } => write!(
                 f,
-                "as {} in the folder you chose -- {} no longer reaches it,                  because the folder was renamed during the transfer",
+                "as {} in the folder you chose -- {} does not reach it now",
                 name.to_string_lossy(),
                 requested.display()
             ),
@@ -238,7 +245,7 @@ impl std::fmt::Display for Published {
                 because,
             } => write!(
                 f,
-                "as {} in the folder you chose -- whether {} still reaches it                  could not be checked ({because})",
+                "as {} in the folder you chose -- whether {} still reaches it could not be checked ({because})",
                 name.to_string_lossy(),
                 requested.display()
             ),
@@ -305,8 +312,18 @@ pub trait HandleLinker: Send + Sync {
         right: &std::fs::File,
     ) -> Result<bool, StorageError>;
 
-    /// Opens `path` for that comparison: **never blocking**, and only when a
-    /// regular file is there.
+    /// Opens `path` for that comparison, **without waiting on a peer that may
+    /// never arrive**, and only when a regular file is there.
+    ///
+    /// That obligation used to read "never blocking", which no Unix
+    /// implementation can deliver with open flags: name resolution can still wait
+    /// without bound on a FUSE server that never answers or a hard-mounted share
+    /// whose server is gone. A security review pointed out that an obligation
+    /// nothing can meet is worse than a narrower one, because it reads as though
+    /// the whole class were closed. What an implementation must actually rule out
+    /// is the case where *the file's own open* waits -- a FIFO with no writer, a
+    /// device driver, a broken lease. The residual class is recorded in section 11
+    /// of `docs/publication-contract.md`, and bounding it is not implemented.
     ///
     /// `Ok(None)` means the path does not reach a regular file -- nothing is
     /// there, or what is there is a directory, a FIFO, a socket or a device.

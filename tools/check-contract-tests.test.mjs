@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { coverageFailures, summaryOf, testsIn } from './check-contract-tests.mjs';
+import { coverageFailures, REQUIRED, summaryOf, testsIn } from './check-contract-tests.mjs';
 
 const required = new Map([
   ['on_both', ['win32', 'linux']],
@@ -141,6 +141,61 @@ test('reads every test in a source, whatever sits between the attribute and the 
   assert.deepEqual(testsIn(source), ['plain', 'behind_attributes_and_comments', 'takes_arguments']);
 });
 
+// The two shapes an engineering review got past the first version by
+// measurement. Either made a contract test invisible to the undeclared-test
+// check, and a `cfg` that also kept it off every CI platform would then have let
+// it run nowhere with this gate green.
+test('a test cannot hide behind a multi-line attribute or a trailing comment', () => {
+  const source = [
+    '#[test]',
+    '#[cfg(all(',
+    '    target_os = "linux",',
+    '    feature = "slow",',
+    '))]',
+    'fn hidden_behind_a_multiline_cfg() {}',
+    '',
+    '#[test] // a trailing comment on the attribute line',
+    'fn attribute_with_trailing_comment() {}',
+    '',
+    '#[test]',
+    '/* a block comment',
+    '   over two lines */',
+    'fn behind_a_block_comment() {}',
+    '',
+    '    #[test]',
+    '    #[cfg_attr(miri, ignore)]',
+    '    fn indented_inside_a_mod() {}',
+    '',
+    '#[test]',
+    'async fn an_async_test() {}',
+  ].join('\n');
+  assert.deepEqual(testsIn(source), [
+    'hidden_behind_a_multiline_cfg',
+    'attribute_with_trailing_comment',
+    'behind_a_block_comment',
+    'indented_inside_a_mod',
+    'an_async_test',
+  ]);
+});
+
+// And it must not start seeing things that are not tests, or the undeclared-test
+// check turns into noise nobody reads.
+test('does not read a test where there is none', () => {
+  const source = [
+    '// #[test]',
+    'fn commented_out_attribute() {}',
+    '',
+    '/* #[test]',
+    'fn inside_a_block_comment() {} */',
+    '',
+    'fn no_attribute_at_all() {}',
+    '',
+    '#[test_case(1)]',
+    'fn a_different_attribute() {}',
+  ].join('\n');
+  assert.deepEqual(testsIn(source), []);
+});
+
 test('reads the counts cargo prints, and says so when there are none', () => {
   const output = [
     'running 3 tests',
@@ -152,4 +207,57 @@ test('reads the counts cargo prints, and says so when there are none', () => {
   const failed = 'test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out;';
   assert.deepEqual(summaryOf(failed), { passed: 1, failed: 2, ignored: 0 });
   assert.equal(summaryOf('error: could not compile'), null);
+});
+
+// The real specification, on the platform that cannot be mutated from here.
+//
+// A security review pointed out that the four mutations run against this gate
+// were all run on Windows, where the Linux-only properties are not compiled --
+// so "the gate requires the FIFO tests on Linux" was correct by reading and
+// measured nowhere. This measures it at the level that can be measured from a
+// Windows machine: the real `REQUIRED` map, asked the question the gate asks.
+test('the real specification requires the Linux-only properties on Linux', () => {
+  const linuxOnly = [
+    'a_fifo_at_the_requested_path_does_not_hang_publication',
+    'a_parts_directory_swapped_for_a_fifo_does_not_hang_publication_after_delivery',
+  ];
+  for (const name of linuxOnly) {
+    assert.deepEqual(REQUIRED.get(name), ['linux'], `${name} is not declared Linux-only`);
+  }
+
+  // On Linux, each of them missing from the binary is a failure that names it.
+  const listed = [...REQUIRED.entries()]
+    .filter(([, platforms]) => platforms.includes('linux'))
+    .map(([name]) => name);
+  for (const dropped of linuxOnly) {
+    const short = listed.filter(name => name !== dropped);
+    const failures = coverageFailures({
+      platform: 'linux',
+      required: REQUIRED,
+      declared: [...REQUIRED.keys()],
+      listed: short,
+      summary: { passed: short.length, failed: 0, ignored: 0 },
+    });
+    assert.ok(
+      failures.some(one => one.startsWith(`${dropped}: required on linux`)),
+      `dropping ${dropped} on Linux was not reported: ${failures.join(' | ')}`,
+    );
+  }
+
+  // And the whole set present, with the matching count, passes.
+  assert.deepEqual(
+    coverageFailures({
+      platform: 'linux',
+      required: REQUIRED,
+      declared: [...REQUIRED.keys()],
+      listed,
+      summary: { passed: listed.length, failed: 0, ignored: 0 },
+    }),
+    [],
+  );
+
+  // Windows does not compile them, and must not be asked to.
+  for (const name of linuxOnly) {
+    assert.ok(!REQUIRED.get(name).includes('win32'), `${name} must not be required on Windows`);
+  }
 });
