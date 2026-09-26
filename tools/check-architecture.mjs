@@ -64,6 +64,18 @@ export const UNSAFE_ALLOWANCES = new Map([
   ['crates/adapters/platform/src/lib.rs', [
     // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
     'fn our_uid() -> u32 {',
+    // `link_into_directory`, twice: there are two of it, one per platform, and
+    // an entry approves one allowance. Naming both is the point of this list
+    // being a description of the tree rather than a count.
+    //
+    // Windows calls `NtSetInformationFile` with `FILE_LINK_INFORMATION`; Linux
+    // calls `linkat(2)` through the descriptor's entry under `/proc/self/fd`.
+    // Both take borrowed descriptors and a name owned by the caller for longer
+    // than the call, and both are the only route on their system from an open
+    // handle to a new name without resolving a path -- which is the property
+    // the whole publication design rests on.
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
   ]],
 ]);
 
@@ -221,12 +233,30 @@ function permitsUnsafe(text) {
 
 export function checkUnsafePolicy(root) {
   const offenders = [];
+  // Which approved items were actually found, so the list can be checked
+  // against the tree once every file has been read.
+  const seen = new Map();
   walkSources(`${root}/crates`, (full) => {
     if (!full.endsWith('.rs')) return;
     const relative = full.slice(root.length + 1).split('\\').join('/');
-    offenders.push(...unsafeOffendersIn(relative, readFileSync(full, 'utf8')));
+    const text = readFileSync(full, 'utf8');
+    offenders.push(...unsafeOffendersIn(relative, text));
+    seen.set(relative, allowedItemsIn(text));
   });
+  offenders.push(...unusedAllowances(seen));
   return offenders;
+}
+
+/// The items an approved-spelling allowance sits on in this text.
+function allowedItemsIn(text) {
+  const lines = text.split("\n").map(line => line.replace(/\r$/u, ""));
+  const items = [];
+  for (const attribute of attributesIn(text)) {
+    if (!permitsUnsafe(attribute.text) || attribute.inner) continue;
+    if (withoutComments(attribute.text).replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') continue;
+    items.push(itemBelow(lines, attribute.line - 1));
+  }
+  return items;
 }
 
 /// Source files git would treat as binary, so no diff of them is ever reviewed.
@@ -326,11 +356,31 @@ export function unsafeOffendersIn(relative, text) {
     }
     remaining.splice(at, 1);
   }
-  for (const unused of remaining) {
-    offenders.push(
-      `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
-      'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
-    );
+  return offenders;
+}
+
+/// Approved allowances that no longer exist in the tree.
+///
+/// This used to live inside `unsafeOffendersIn`, which is a predicate over one
+/// file's *text* -- so it answered "this approved item is missing" for every
+/// synthetic source a test handed it, and the tests only passed while the list
+/// happened to hold a single entry that they happened to include. Whether the
+/// list still describes the tree is a question about the tree, so it is asked
+/// where the tree is read.
+export function unusedAllowances(seen) {
+  const offenders = [];
+  for (const [relative, approved] of UNSAFE_ALLOWANCES) {
+    const remaining = [...approved];
+    for (const item of seen.get(relative) ?? []) {
+      const at = remaining.indexOf(item);
+      if (at !== -1) remaining.splice(at, 1);
+    }
+    for (const unused of remaining) {
+      offenders.push(
+        `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
+        'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
+      );
+    }
   }
   return offenders;
 }

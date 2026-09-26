@@ -317,7 +317,35 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
                 }
             })
         }
-        #[cfg(not(windows))]
+        // Linux only, and not "unix": the mechanism is `linkat` through the
+        // descriptor's entry under `/proc/self/fd`, and a system without procfs
+        // has no route from a descriptor to a new name in the documented
+        // surface. macOS is that system, and it refuses below rather than
+        // linking from a path -- which would publish whatever the part's name
+        // meant at that instant, the exact substitution handles were introduced
+        // to stop. What macOS does have is measured and written up in
+        // `docs/publication-contract.md`.
+        #[cfg(target_os = "linux")]
+        {
+            // The same mapping as Windows, from the same kinds. `Unsupported`
+            // keeps its meaning -- a system with no mechanism -- and now covers
+            // the two ways `linkat` says so: a filesystem that has no hard links
+            // at all, and a destination on another device, which no link can
+            // cross on any system.
+            fhd_platform::link_into_directory(file, directory, name).map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
+                        fhd_app::storage::StorageError::Unsupported
+                    }
+                    std::io::ErrorKind::InvalidInput => {
+                        fhd_app::storage::StorageError::InvalidInput
+                    }
+                    other => fhd_app::storage::StorageError::Io(other),
+                }
+            })
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (file, directory, name);
             Err(fhd_app::storage::StorageError::Unsupported)

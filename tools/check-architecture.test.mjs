@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
-  unsafeOffendersIn, withoutComments,
+  unsafeOffendersIn, unusedAllowances, withoutComments,
 } from './check-architecture.mjs';
 
 function metadata(graph) {
@@ -179,8 +179,11 @@ test('unsafe gate catches every spelling that can permit unsafe, not one prefix'
     assert.deepEqual(unsafeOffendersIn(file, restriction), [], restriction);
   }
 
-  // An approved item that disappears is still reported, as before.
-  assert.match(unsafeOffendersIn(file, 'fn nothing() {}\n')[0], /no longer present/u);
+  // An approved item that disappears is still reported -- by the check that can
+  // see the tree, which is where that question moved. Asking it of a string a
+  // caller passed in made every synthetic sample above answer it wrongly.
+  assert.match(unusedAllowances(new Map([[file, []]]))[0], /no longer present/u);
+  assert.deepEqual(unsafeOffendersIn(file, 'fn nothing() {}\n'), []);
 
   // A file with no approvals may not allow unsafe at all.
   assert.match(
@@ -263,14 +266,44 @@ test('unsafe gate is not talked past with a comment inside the attribute', () =>
     [],
     'a comment explaining the approved allowance is still the approved allowance',
   );
-  // The same file with the allowance moved off its approved item: two reports,
-  // one for the unapproved item and one for the approved one going missing.
-  assert.equal(
-    unsafeOffendersIn(platform, '#[allow(unsafe_code)]\nfn somewhere_else() {}\n').length,
-    2,
-  );
+  // The same file with the allowance moved off its approved item: one report,
+  // about the item that is not approved.
+  //
+  // It used to be two, the second being the approved item "no longer present" --
+  // but that question is about the tree, not about a string a caller passed in,
+  // and asking it here made every synthetic sample answer it wrongly. It moved
+  // to `unusedAllowances`, which is asked once after the real files are read,
+  // and is asserted on its own below.
+  const moved = unsafeOffendersIn(platform, '#[allow(unsafe_code)]\nfn somewhere_else() {}\n');
+  assert.equal(moved.length, 1, JSON.stringify(moved));
+  assert.match(moved[0], /is not approved/u);
+});
 
-  // Restrictions are the policy, not a breach of it.
+// The list has to keep describing the tree, which is a question about the tree.
+test('an approved allowance that no longer exists in the tree is reported', () => {
+  const platform = 'crates/adapters/platform/src/lib.rs';
+  // Nothing found at all: every approved entry for that file is reported.
+  const none = unusedAllowances(new Map());
+  assert.ok(none.length >= 1, JSON.stringify(none));
+  assert.ok(none.every(one => /no longer present/u.test(one)), JSON.stringify(none));
+
+  // Found once, approved twice -- which is the shape of a platform-specific
+  // item with one implementation per system -- still reports the missing one.
+  const linker =
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
+  const once = unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker]]]));
+  assert.equal(once.length, 1, JSON.stringify(once));
+  assert.match(once[0], /link_into_directory/u);
+
+  // And everything present reports nothing.
+  assert.deepEqual(
+    unusedAllowances(new Map([[platform, ['fn our_uid() -> u32 {', linker, linker]]])),
+    [],
+  );
+});
+
+test('a restriction is the policy, not a breach of it', () => {
+  const clean = 'crates/adapters/storage/src/lib.rs';
   for (const restriction of [
     '#![forbid(unsafe_code)]\n',
     '#![deny(unsafe_code)]\n',

@@ -8,12 +8,18 @@
 //!
 //! Every `unsafe` block here states what makes the call sound. Nothing in this
 //! crate decides policy: it reports what the system says and hands back handles.
-// `deny` rather than `forbid` off Windows, so that exactly one place can lift
-// it: `our_uid`, which calls `geteuid(2)`. `forbid` cannot be overridden at all,
-// which sounds stronger and in practice pushed the answer into a probe file that
-// had to guess a unique name and failed closed at random when two callers
-// guessed the same one. A single reviewed call is the smaller risk. Every other
-// `unsafe` off Windows still fails the build.
+// `deny` rather than `forbid` off Windows, so that named places can lift it and
+// nothing else can. `forbid` cannot be overridden at all, which sounds stronger
+// and in practice pushed the answer into a probe file that had to guess a unique
+// name and failed closed at random when two callers guessed the same one.
+// Reviewed calls are the smaller risk. Every other `unsafe` off Windows still
+// fails the build, and every allowance is named in `tools/check-architecture.mjs`
+// against the item it sits on.
+//
+// There are three: `our_uid` calls `geteuid(2)`; `link_into_directory` calls
+// `linkat(2)`, which is the only way to publish into a directory handle without
+// resolving a path; and `source_name` calls `fcntl(F_GETPATH)` on the systems
+// with no `/proc`, which is how a descriptor is named there at all.
 #![cfg_attr(not(windows), deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -119,10 +125,102 @@ impl ForeignWriters {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    use std::path::Path;
 
     /// Not available without a platform call this crate does not yet make.
     pub fn process_cpu() -> Option<std::time::Duration> {
         None
+    }
+
+    /// Creates `name` inside `directory` as another name for the file this
+    /// handle holds.
+    ///
+    /// **The source is the open file description, not a path**, which is the
+    /// whole reason this exists rather than `std::fs::hard_link`. `hard_link`
+    /// resolves two paths when it runs, so between proving some bytes and
+    /// publishing them either end can be made to mean something else. The
+    /// Windows side of this crate fixes both ends with handles; this is the
+    /// same guarantee where the system offers one.
+    ///
+    /// **Linux.** `linkat(AT_FDCWD, "/proc/self/fd/N", dirfd, name,
+    /// AT_SYMLINK_FOLLOW)`. The magic symlink under `/proc/self/fd` resolves to
+    /// the inode the descriptor holds, and `AT_SYMLINK_FOLLOW` makes `linkat`
+    /// follow it to that inode rather than linking the symlink -- so the object
+    /// published is the object verified, even if every name it ever had has
+    /// since been taken over. The destination is `dirfd` plus one component, so
+    /// no path is resolved there either.
+    ///
+    /// `AT_EMPTY_PATH` would say this more directly and is not usable: for
+    /// `linkat` the kernel requires `CAP_DAC_READ_SEARCH` for it, which a
+    /// download manager does not have and should not want. The procfs route is
+    /// the unprivileged equivalent and is what `O_TMPFILE` users are told to
+    /// use. Its cost is a dependency on `/proc` being mounted; where it is not,
+    /// this fails rather than falling back to a path.
+    ///
+    /// **macOS.** There is no `/proc` and no `AT_EMPTY_PATH`, so no route from a
+    /// descriptor to a new name exists in the documented surface. `F_GETPATH`
+    /// answers with a path, which is the thing being avoided -- it is a name the
+    /// file had a moment ago, not the object. So this call is `linkat` from that
+    /// path, and **the identity of what was created is proved afterwards** by
+    /// comparing the destination against this descriptor; the port already has
+    /// `same_object` for that, and publication already refuses to claim a path
+    /// it cannot verify. What cannot be claimed on macOS is that the window
+    /// between reading the path and linking it does not exist; what is claimed
+    /// is that a file landing there that is not ours is detected rather than
+    /// published as ours.
+    ///
+    /// **Never replaces.** `linkat` fails with `EEXIST` on an occupied name on
+    /// both systems, which surfaces as `AlreadyExists`, exactly as the Windows
+    /// call does with `ReplaceIfExists = false`.
+    ///
+    /// **A failure creates nothing.** `linkat` is one system call: it either
+    /// creates the name or reports why it did not. The port's contract requires
+    /// that, because a refused link is recorded as "nothing was made" and the
+    /// part is unsealed on that basis.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
+        // A relative name under a directory is exactly one component. Any
+        // separator would reopen the path resolution this call exists to avoid,
+        // and an interior NUL cannot cross the C boundary at all.
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => (),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a link name must be a single path component",
+                ));
+            }
+        }
+        let leaf = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a link name holds a NUL"))?;
+        let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a descriptor with a NUL"))?;
+
+        // SAFETY: both descriptors are borrowed from open `File`s and outlive
+        // the call; `source` and `leaf` are NUL-terminated and stay alive for
+        // its duration. `linkat` reads them and returns a status, taking no
+        // ownership of either. `AT_SYMLINK_FOLLOW` is what makes the procfs
+        // entry resolve to the object the descriptor holds rather than to the
+        // magic symlink itself.
+        let created = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        if created == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
     }
 
     /// Unix identifies the peer by credentials on the socket itself, so the name
@@ -1187,6 +1285,7 @@ mod imp {
     ///
     /// `directory` must be opened with `FILE_FLAG_BACKUP_SEMANTICS`, which is
     /// how a directory is opened at all on Windows.
+    #[allow(unsafe_code)]
     pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
         // A relative name under a root directory is exactly one component. Any
         // separator, and any drive or root spelling, would reopen the path
@@ -1491,6 +1590,8 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use imp::link_into_directory;
 #[cfg(windows)]
 pub use imp::{
     acceptable_descriptor, create_pipe, link_into_directory, open_directory, open_pipe, same_object,
