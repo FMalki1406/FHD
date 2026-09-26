@@ -256,8 +256,8 @@ mod imp {
     /// back the object it created so the comparison is against that -- which is
     /// the sentence the publication code already uses, and does not yet do.
     ///
-    /// It needs APFS. On any other filesystem it fails rather than copying, and
-    /// a copy is not what publication may quietly fall back to.
+    /// It needs a volume that supports file cloning. Other filesystems were
+    /// not measured here; a byte-copy fallback is not permitted by this API.
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
     pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
