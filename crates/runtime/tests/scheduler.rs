@@ -801,12 +801,36 @@ async fn a_failed_save_for_a_queued_command_is_not_reported_as_invalid_input() {
     match answered.expect("the cancel was never answered, so a caller waits for ever") {
         // Dropped: unknown, which is the honest answer when the record cannot say.
         Err(_) => (),
-        Ok(Applied::Yes) => assert_eq!(
-            recorded.state(),
-            JobState::Cancelled,
-            "the cancel was reported done and the record says {:?}",
-            recorded.state()
-        ),
+        Ok(Applied::Yes) => {
+            assert_eq!(
+                recorded.state(),
+                JobState::Cancelled,
+                "the cancel was reported done and the record says {:?}",
+                recorded.state()
+            );
+            // **And `run`'s answer must agree with the other two.** The retry that
+            // made the reply true happens after the first save failed, and the
+            // failure was still pushed as this job's outcome -- so the caller was
+            // told `Done`, the record said `Cancelled`, and `run` reported a
+            // failure. A review found that third disagreement on the very path
+            // that fixes the other two.
+            let mine: Vec<_> = outcomes
+                .iter()
+                .filter(|outcome| outcome.id == JobId::new(2).unwrap())
+                .collect();
+            assert_eq!(mine.len(), 1, "the job came back {} times", mine.len());
+            let job = mine[0].job.as_ref().expect(
+                "the outcome carries no job, so the run reported a failure for a \
+                 cancel it had just confirmed",
+            );
+            assert_eq!(
+                job.state(),
+                JobState::Cancelled,
+                "the run reported {:?} for a job the record and the caller both call \
+                 Cancelled",
+                job.state()
+            );
+        }
         Ok(Applied::No) => panic!(
             "a failed save was reported as a refused command, which the IPC layer \
              turns into ENGINE-INVALID-INPUT. The record says {:?}, so the outcome \
@@ -1070,4 +1094,197 @@ async fn a_command_after_a_session_settled_agrees_with_the_record_and_the_outcom
         "the run reported {:?} for a job the record and the caller both call Cancelled",
         job.state()
     );
+}
+
+/// Refuses job 1 at the probe and parks job 2 inside `fetch`.
+///
+/// The two behaviours exist so a test can prove *when* the scheduler reaped the
+/// first session, without reading its private state: see
+/// `a_command_after_the_copy_is_parked_agrees_with_the_record_and_the_outcome`.
+struct RefuseOneParkTwo {
+    inner: ScriptedTransport,
+    origin: OriginId,
+    reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+impl Transport for RefuseOneParkTwo {
+    fn origin(&self, _: SourceRef) -> OriginId {
+        self.origin
+    }
+    fn probe(&self, source: SourceRef) -> PortFuture<'_, Result<Probe, TransportError>> {
+        if source == SourceRef::new(1).unwrap() {
+            return Box::pin(
+                async move { Err(TransportError::UserAction(StopReason::Authentication)) },
+            );
+        }
+        self.inner.probe(source)
+    }
+    fn fetch(
+        &self,
+        _: SourceRef,
+        _: ByteRange,
+        _: Option<[u8; 32]>,
+    ) -> PortFuture<'_, Result<Box<dyn ByteStream>, TransportError>> {
+        Box::pin(async move {
+            if let Some(reached) = self.reached.lock().unwrap().take() {
+                let _ = reached.send(());
+            }
+            if let Some(gate) = self.gate.lock().await.take() {
+                let _ = gate.await;
+            }
+            Err(TransportError::UserAction(StopReason::Authentication))
+        })
+    }
+}
+
+/// **A command that arrives after the scheduler parked the job's copy: the reply,
+/// the record and `run`'s outcome all agree.**
+///
+/// The earlier version of this test waited for the record to say `NeedsAction` and
+/// called that deterministic. A review pointed out that it is not: the record is
+/// written by the session, and the scheduler parks its copy in `done` afterwards,
+/// in the run loop. So the command could arrive before the parking and take a
+/// different path, and the test would pass without visiting the place it is about.
+///
+/// **This proves arrival instead of assuming it.** The engine is given one
+/// connection in total, so the second job cannot start until the first job's grant
+/// is released -- and that release happens in `finish`, in the same breath as the
+/// parking. The second job signals from inside `fetch`. Once that signal arrives,
+/// the first job's copy is in `done` as a matter of the scheduler's own order, not
+/// of timing.
+///
+/// Then the cancel is sent, and the three answers must agree.
+#[tokio::test]
+async fn a_command_after_the_copy_is_parked_agrees_with_the_record_and_the_outcome() {
+    let directory = std::env::temp_dir().join(format!(
+        "fhd-parked-copy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let (reached, second_started) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let transport = Arc::new(RefuseOneParkTwo {
+        inner: ScriptedTransport::new(body(64 * 1024), true, 4096),
+        origin: OriginId::new([13; 16]),
+        reached: Mutex::new(Some(reached)),
+        gate: tokio::sync::Mutex::new(Some(gate)),
+    });
+
+    let repo = Arc::new(MemoryTransfers::default());
+    for id in 1..=2u64 {
+        let spec = JobSpec::new(
+            SourceRef::new(id).unwrap(),
+            DestinationRef::new(id).unwrap(),
+            None,
+            Priority::Normal,
+            1 << 30,
+        )
+        .unwrap();
+        repo.admit(&Job::new(JobId::new(id).unwrap(), spec));
+    }
+
+    let governor = Arc::new(OriginGovernor::new(OriginLimits::default()).unwrap());
+    let coordinator = Arc::new(
+        Coordinator::new(
+            Ports {
+                repository: repo.clone(),
+                store: Arc::new(MemoryStore::default()),
+                transport: transport.clone(),
+                destinations: Arc::new(PerJob(directory.clone())),
+            },
+            BufferPool::new(4 * 1024 * 1024).unwrap(),
+            Arc::new(TestClock::default()),
+            CoordinatorConfig {
+                connections: 1,
+                max_segments: 64,
+                min_segment: 4096,
+                checkpoint_bytes: 32 * 1024,
+                writer_capacity: 8,
+                retry: RetryPolicy::new(4, 1000, 10_000).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_governor(governor.clone()),
+    );
+    let scheduler = Scheduler::new(
+        coordinator,
+        governor,
+        SchedulerConfig {
+            max_active: 1,
+            // One connection in the whole engine: the second job cannot start
+            // until the first one's grant comes back, which is what proves the
+            // first one was reaped and parked.
+            connections: 1,
+            per_job: 1,
+            resident: true,
+        },
+    )
+    .unwrap();
+
+    let mut jobs = repo.load_jobs().await.unwrap();
+    jobs.sort_by_key(|job| job.id().get());
+    let (commands, receiver) = mpsc::channel(4);
+    let run = tokio::spawn(async move { scheduler.run(jobs, receiver).await });
+
+    // **The proof.** Job 2 is inside `fetch`, so job 1's grant was released in
+    // `finish` -- and `finish` is where job 1's copy was parked in `done`.
+    tokio::time::timeout(std::time::Duration::from_secs(30), second_started)
+        .await
+        .expect("the second job never started, so nothing proves the first was parked")
+        .expect("the transport was dropped");
+
+    let first = JobId::new(1).unwrap();
+    assert_eq!(
+        repo.state(first),
+        Some(JobState::NeedsAction),
+        "the first job did not settle where this test needs it"
+    );
+
+    let (reply, applied) = tokio::sync::oneshot::channel();
+    commands
+        .send(Command::Cancel(first, Some(reply)))
+        .await
+        .expect("the scheduler is still accepting commands");
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(30), applied)
+        .await
+        .expect("the cancel was never answered")
+        .expect("the scheduler dropped the reply");
+    assert_eq!(answered, Applied::Yes, "a resting job refused a cancel");
+    assert_eq!(
+        repo.state(first),
+        Some(JobState::Cancelled),
+        "the cancel was reported done and the record disagrees"
+    );
+
+    let _ = release.send(());
+    commands
+        .send(Command::Shutdown)
+        .await
+        .expect("the scheduler takes a shutdown");
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("the scheduler did not finish")
+        .expect("the scheduler panicked");
+
+    let mine: Vec<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.id == first)
+        .collect();
+    assert_eq!(mine.len(), 1, "the job came back {} times", mine.len());
+    let job = mine[0]
+        .job
+        .as_ref()
+        .expect("the outcome carries the job it settled as");
+    assert_eq!(
+        job.state(),
+        JobState::Cancelled,
+        "the run reported {:?} for a job the record and the caller both call Cancelled",
+        job.state()
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }

@@ -695,6 +695,21 @@ impl Scheduler {
                 match self.coordinator.confirm_command(id, command).await {
                     Ok(Some(job)) if reached(&job, command) => {
                         answer(reply, Applied::Yes);
+                        // **And the outcome is the record's, not the first
+                        // attempt's.** Pushing `Outcome::failed` below would leave
+                        // `run` reporting a failure for a job the caller was told was
+                        // cancelled and the record calls `Cancelled` -- the same three
+                        // disagreeing answers this whole change exists to remove,
+                        // reintroduced on the path that fixes one of them. A review
+                        // caught it here after the earlier ones were closed.
+                        //
+                        // The first attempt's error is not lost: the retry is what
+                        // decided the job, so the job is what is reported.
+                        queue.take(Entry {
+                            job,
+                            origin: entry.origin,
+                        });
+                        return false;
                     }
                     Ok(_) => {
                         emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
