@@ -1,8 +1,8 @@
 //! Single-owner positional storage. Blocking methods belong on the writer thread.
 #![forbid(unsafe_code)]
 use fhd_app::storage::{
-    HandleLinker, Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore,
-    StorageError,
+    HandleLinker, Occupant, PartSpec, Publication, PublishRefused, Published, SegmentFile,
+    SegmentStore, StorageError,
 };
 use fhd_domain::ByteRange;
 use sha2::{Digest, Sha256};
@@ -872,7 +872,89 @@ impl SegmentFile for FilePart {
         Ok(())
     }
 
-    fn publish(&mut self) -> Result<Published, StorageError> {
+    /// **Refusing says whether a name was created, and the split says which.**
+    ///
+    /// `prepare_publication` runs entirely before the linking call -- it does not
+    /// even have the linker until it returns one -- so every refusal it can produce
+    /// happens where no directory entry can exist. `deliver` runs entirely after
+    /// the link returned `Ok`, so every refusal it can produce is one for a name
+    /// that does exist. The two answers are therefore decided by which function
+    /// returned, not by a reader tracking which side of a long body a statement was
+    /// on, and moving a line from one to the other is visible in a diff.
+    ///
+    /// A review asked for this: the evidence had been inferred from the
+    /// `StorageError`, and several of the failures after the link -- recording the
+    /// new state, syncing the file, syncing the folder -- return errors
+    /// indistinguishable from the ones before it.
+    fn publish(&mut self) -> Result<Published, PublishRefused> {
+        let (linker, folder, leaf, destination) = match self.prepare_publication() {
+            Ok(ready) => ready,
+            Err(error) => return Err(PublishRefused::none_created(error)),
+        };
+        // Durable before the attempt, durable after it. A crash between these
+        // two is the one case nothing can decide afterwards, and writing them
+        // is what keeps every other case decidable: without the first, a crash
+        // during the link is indistinguishable from one before it, and every
+        // interrupted publication has to be treated as possibly delivered.
+        //
+        // Failing here is still `none_created`: the linker has not been called.
+        self.mark(Publication::Attempted)
+            .map_err(PublishRefused::none_created)?;
+        let linked = linker.link(&self.file, &folder, leaf.as_os_str());
+        if let Err(error) = linked {
+            // The linker returned, so the attempt is over and its answer is
+            // known: no file was made. That is the state a retry can act on,
+            // and it is written before anything else unwinds.
+            // Recorded before the unwind, so a crash in the gap leaves a part a
+            // retry can act on rather than one nothing can decide.
+            //
+            // Its own failure must not replace the linker's answer: the reason
+            // a publication was refused -- a taken name, a full disk -- is what
+            // an operator acts on, and an I/O error here would hide it. The
+            // part stays as it is and the original error travels.
+            //
+            // **And neither failure changes what is known about the name.** The
+            // linker refused, which is the one answer that establishes no entry
+            // was created; a failure to record that locally does not un-refuse
+            // it. What the engine must not do is *act* on this answer without
+            // having saved it, and that is decided in the layer that owns the
+            // durable record, not here.
+            if self.mark(Publication::Sealed).is_err() {
+                return Err(PublishRefused::none_created(error));
+            }
+            self.poisoned = false;
+            // Nothing was published, so the seal describes nothing. Lifting it
+            // is what keeps a taken name, a full disk or a platform with no
+            // mechanism a job the operator can retry rather than one that can
+            // never move again.
+            //
+            // Its own failure does not replace the linker's answer either. A
+            // part left sealed is conservative and a later run can still read
+            // it; what an operator acts on is why the publication was refused,
+            // and an I/O error from the unseal hides that. Found by injecting a
+            // sync failure here, after a review pointed out this case had no
+            // test.
+            let _ = self.unseal();
+            // The bytes are sound; only the name was refused -- taken, a full
+            // disk, or no mechanism here. Nothing needs downloading again.
+            return Err(PublishRefused::none_created(error));
+        }
+        // Past this line a name exists, so nothing below may claim otherwise.
+        self.deliver(&*linker, folder, leaf, destination)
+            .map_err(PublishRefused::unknown)
+    }
+}
+
+/// The two halves of publication, split so that "was a name created?" is
+/// answered by which half returned. Inherent rather than part of the port: the
+/// port asks for one publication, and how it is divided inside is this adapter's.
+impl FilePart {
+    /// Everything publication checks before a name could exist, ending with the
+    /// linker, the adopted folder's handle, the name to give it there, and the path
+    /// the operator asked for.
+    fn prepare_publication(
+        &mut self,
+    ) -> Result<(Arc<dyn HandleLinker>, File, std::ffi::OsString, PathBuf), StorageError> {
         self.healthy()?;
         // Once is all. A published part is finished, and asking again is not a
         // retry -- the bytes are already somebody's file.
@@ -983,48 +1065,24 @@ impl SegmentFile for FilePart {
                 return Err(StorageError::Unsupported);
             }
         };
-        // Durable before the attempt, durable after it. A crash between these
-        // two is the one case nothing can decide afterwards, and writing them
-        // is what keeps every other case decidable: without the first, a crash
-        // during the link is indistinguishable from one before it, and every
-        // interrupted publication has to be treated as possibly delivered.
-        self.mark(Publication::Attempted)?;
-        let linked = linker.link(&self.file, &folder, leaf.as_os_str());
-        if let Err(error) = linked {
-            // The linker returned, so the attempt is over and its answer is
-            // known: no file was made. That is the state a retry can act on,
-            // and it is written before anything else unwinds.
-            // Recorded before the unwind, so a crash in the gap leaves a part a
-            // retry can act on rather than one nothing can decide.
-            //
-            // Its own failure must not replace the linker's answer: the reason
-            // a publication was refused -- a taken name, a full disk -- is what
-            // an operator acts on, and an I/O error here would hide it. The
-            // part stays as it is and the original error travels.
-            if self.mark(Publication::Sealed).is_err() {
-                return Err(error);
-            }
-            self.poisoned = false;
-            // Nothing was published, so the seal describes nothing. Lifting it
-            // is what keeps a taken name, a full disk or a platform with no
-            // mechanism a job the operator can retry rather than one that can
-            // never move again.
-            //
-            // Its own failure does not replace the linker's answer either. A
-            // part left sealed is conservative and a later run can still read
-            // it; what an operator acts on is why the publication was refused,
-            // and an I/O error from the unseal hides that. Found by injecting a
-            // sync failure here, after a review pointed out this case had no
-            // test.
-            let _ = self.unseal();
-            // The bytes are sound; only the name was refused -- taken, a full
-            // disk, or no mechanism here. Nothing needs downloading again.
-            //
-            // Lifting the seal on the way out belongs here too and lives on the
-            // recovery branch, so whichever lands second brings it across. Two
-            // copies of it would be worse than one rebase.
-            return Err(error);
-        }
+        Ok((linker, folder, leaf, destination))
+    }
+
+    /// Everything after the link returned `Ok`. A name exists from the first line,
+    /// so every refusal from here leaves the destination's entry in place and
+    /// nothing may conclude that none was made.
+    fn deliver(
+        &mut self,
+        linker: &dyn HandleLinker,
+        folder: File,
+        leaf: std::ffi::OsString,
+        destination: PathBuf,
+    ) -> Result<Published, StorageError> {
+        // Only Unix syncs a directory through its handle. Elsewhere the adopted
+        // folder's duplicate has done its work by getting the link made, and this
+        // closes it rather than leaving the parameter looking forgotten.
+        #[cfg(not(unix))]
+        drop(folder);
         self.mark(Publication::Linked)?;
         self.file.sync_all().map_err(io)?;
         // Through the handle, not the path: syncing `destination.parent()` would
@@ -1096,6 +1154,7 @@ impl SegmentFile for FilePart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fhd_app::storage::NameEvidence;
     use fhd_domain::{Generation, JobId};
     use std::{
         sync::atomic::{AtomicU64, Ordering},
@@ -1473,12 +1532,28 @@ mod tests {
     /// identity is decided; these tests do both at the end because what they
     /// are about is publication, and the tests that are about the moment itself
     /// call them apart.
+    ///
+    /// **And every refusal here is asserted to say no name was created.** Each one
+    /// of these tests refuses on a path that has not reached the linker or on the
+    /// linker's own refusal, so the claim holds for all of them and is made once
+    /// rather than in fourteen assertions -- a refusal that stopped saying it would
+    /// fail whichever test produced it. The failures *after* a name exists are not
+    /// reachable from here: they are driven through the coordinator, where what the
+    /// answer is for can be measured. A test that needs one of those needs its own
+    /// helper, which is the point of asserting rather than converting.
     fn publish_to(
         part: &mut dyn SegmentFile,
         destination: &Path,
     ) -> Result<Published, StorageError> {
         part.adopt_destination(destination)?;
-        part.publish()
+        part.publish().map_err(|refused| {
+            assert_eq!(
+                refused.name(),
+                NameEvidence::NoneCreated,
+                "a refusal on a path where no name can exist yet said otherwise"
+            );
+            refused.error()
+        })
     }
 
     fn attested(part: &mut dyn SegmentFile) -> Vec<(ByteRange, [u8; 32])> {
@@ -2078,6 +2153,65 @@ mod tests {
         let mut data = fs::read(&meta).expect("the metadata is there");
         data[33] = state.to_byte();
         fs::write(&meta, data).expect("the metadata is writable");
+    }
+
+    /// A failure **after** the name exists says nobody can tell, not "no name".
+    ///
+    /// This is the inference the design refuses to make, measured on the one write
+    /// whose failure leaves a delivered file and a returning error: the link
+    /// succeeds, the destination entry is on disk, and recording the outcome then
+    /// fails. `publish` returns `Err` -- and a caller reading that error to mean
+    /// "nothing was created" would be authorised to remove the part, which is the
+    /// only local evidence that the user may already hold this file.
+    ///
+    /// So the assertion is not about the error at all. It is that the refusal says
+    /// `Unknown`, with the file sitting there to show what `NoneCreated` would have
+    /// been wrong about.
+    ///
+    /// The double links by name, which is all this crate can reach; what it stands
+    /// for here is only "the call returned `Ok` and an entry exists", and that is
+    /// the whole premise.
+    #[test]
+    fn a_failure_after_the_link_says_nobody_can_tell_rather_than_no_name() {
+        let directory = Directory::new();
+        let linker: Arc<dyn HandleLinker> = Arc::new(LinkByName {
+            source: directory.part().join("1-1.part"),
+            folder: directory.0.clone(),
+        });
+        let mut part =
+            FilePart::open_inner(&directory.part(), spec(6), true, None, Some(linker)).unwrap();
+        part.write_at(0, b"AAAAAA").unwrap();
+        part.sync().unwrap();
+        let record = attested(&mut part);
+        part.verify(None, &record).unwrap();
+
+        // The third recording is the outcome, after the link has returned: seal,
+        // attempt, outcome. This is the only one of the three that can fail with a
+        // name already on disk.
+        part.fault = Some(Fault::Mark(2));
+        part.adopt_destination(&directory.output()).unwrap();
+        let refused = part
+            .publish()
+            .expect_err("the outcome could not be recorded, so publication cannot report success");
+
+        assert!(
+            directory.output().exists(),
+            "the premise failed: the link did not create the name, so this test \
+             measures nothing"
+        );
+        assert_eq!(
+            refused.name(),
+            NameEvidence::Unknown,
+            "a publication that returned an error with the file already created \
+             reported that no name was made"
+        );
+        // And the part's own record is conservative for the same reason: the outcome
+        // write is what failed, so it still says an attempt was begun.
+        assert_eq!(
+            part.publication(),
+            Publication::Attempted,
+            "the record moved past the attempt although its outcome was never written"
+        );
     }
 
     /// The state write after a refused link fails, and nothing is lost by it.

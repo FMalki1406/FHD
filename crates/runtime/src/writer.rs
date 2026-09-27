@@ -1,5 +1,5 @@
 use crate::{buffers::Buffer, CancellationToken};
-use fhd_app::storage::{PartSpec, SegmentFile, StorageError};
+use fhd_app::storage::{NameEvidence, PartSpec, SegmentFile, StorageError};
 use fhd_domain::ByteRange;
 use tokio::sync::{mpsc, oneshot};
 
@@ -13,6 +13,45 @@ pub enum WriterError {
     WorkerFailed,
     Storage(StorageError),
 }
+/// A refused publication as the lane reports it: why, and whether a name was
+/// created at the destination.
+///
+/// The lane has answers of its own to add to the adapter's. Failing to hand the
+/// command over means the linker was never reached. **Losing the reply does not**:
+/// an accepted command runs to completion, so a reply that never arrives means the
+/// lane died while publishing, and whether the link was made is then exactly what
+/// nobody can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishFailure {
+    error: WriterError,
+    name: NameEvidence,
+}
+impl PublishFailure {
+    pub fn none_created(error: WriterError) -> Self {
+        Self {
+            error,
+            name: NameEvidence::NoneCreated,
+        }
+    }
+    pub fn unknown(error: WriterError) -> Self {
+        Self {
+            error,
+            name: NameEvidence::Unknown,
+        }
+    }
+    pub fn error(self) -> WriterError {
+        self.error
+    }
+    pub fn name(self) -> NameEvidence {
+        self.name
+    }
+}
+impl From<PublishFailure> for WriterError {
+    fn from(failure: PublishFailure) -> Self {
+        failure.error
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, WriterError>>;
 enum Command {
     Write {
@@ -27,7 +66,7 @@ enum Command {
         Vec<(ByteRange, [u8; 32])>,
         Reply<[u8; 32]>,
     ),
-    Publish(Reply<fhd_app::storage::Published>),
+    Publish(oneshot::Sender<Result<fhd_app::storage::Published, PublishFailure>>),
     Discard {
         abandon: bool,
         reply: Reply<()>,
@@ -52,6 +91,10 @@ impl Writer {
             .name("fhd-writer".into())
             .spawn(move || {
                 let mut failure = None;
+                // Set when a publication could not say whether it linked. It
+                // outlives that command, because every later answer this lane
+                // gives about a name has to stay ignorant too.
+                let mut published_unknown = false;
                 let mut pending = None;
                 while let Some(command) = pending.take().or_else(|| receiver.blocking_recv()) {
                     match command {
@@ -138,13 +181,27 @@ impl Writer {
                         // A destination conflict is a verdict, not a broken lane.
                         Command::Publish(reply) => {
                             let result = match failure {
-                                Some(error) => Err(error),
-                                None => file.publish().map_err(WriterError::Storage),
-                            };
-                            if let Err(error) = result.as_ref() {
-                                if *error != WriterError::Storage(StorageError::Conflict) {
-                                    failure = Some(*error);
+                                // This command never reached the file, so this
+                                // attempt made no name -- and the poison it is
+                                // refusing on did not either, unless it came from
+                                // a publication that could not say. Remembered
+                                // rather than assumed: a caller must not be told
+                                // "nothing was created" because an earlier
+                                // unanswerable publication left the lane broken.
+                                Some(error) if published_unknown => {
+                                    Err(PublishFailure::unknown(error))
                                 }
+                                Some(error) => Err(PublishFailure::none_created(error)),
+                                None => file.publish().map_err(|refused| PublishFailure {
+                                    error: WriterError::Storage(refused.error()),
+                                    name: refused.name(),
+                                }),
+                            };
+                            if let Err(failed) = result.as_ref() {
+                                if failed.error != WriterError::Storage(StorageError::Conflict) {
+                                    failure = Some(failed.error);
+                                }
+                                published_unknown |= failed.name == NameEvidence::Unknown;
                             }
                             let _ = reply.send(result);
                         }
@@ -253,13 +310,22 @@ impl Writer {
     /// existed -- by the session that opened the part -- so there is no command
     /// on this lane that can introduce one, and nothing can be published
     /// anywhere the session did not fix in advance.
+    /// Refusing says whether a name was created; see `PublishFailure`.
     pub async fn publish(
         &self,
         cancel: &CancellationToken,
-    ) -> Result<fhd_app::storage::Published, WriterError> {
+    ) -> Result<fhd_app::storage::Published, PublishFailure> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::Publish(reply), cancel).await?;
-        result.await.map_err(|_| WriterError::WorkerFailed)?
+        // Nothing has been handed over yet, so nothing can have been linked: a
+        // closed lane or a cancelled send is a refusal before the attempt.
+        self.send(Command::Publish(reply), cancel)
+            .await
+            .map_err(PublishFailure::none_created)?;
+        // And here the command was accepted, so a lost reply is the one case
+        // nobody can answer rather than a refusal.
+        result
+            .await
+            .map_err(|_| PublishFailure::unknown(WriterError::WorkerFailed))?
     }
     /// Removes the part file: after publication, or with `abandon` for a cancelled job.
     pub async fn discard(

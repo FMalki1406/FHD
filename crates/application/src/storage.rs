@@ -365,6 +365,81 @@ pub trait SegmentStore: Send + Sync {
     ) -> Result<Box<dyn SegmentFile>, StorageError>;
     fn open(&self, directory: &Path, spec: PartSpec) -> Result<Box<dyn SegmentFile>, StorageError>;
 }
+/// Why a publication was refused, and whether it left a name behind.
+///
+/// **Two answers, because they come from different places.** `error` is why the
+/// publication was refused, which is what an operator acts on. `name` is whether a
+/// directory entry was created at the destination, which is what a cleanup is
+/// allowed to act on -- and it cannot be read off `error`. Publication does
+/// several things after the link returns: it records the new state, syncs the
+/// file, syncs the folder. A failure in any of them produces an error for a name
+/// that exists, so treating "publish returned `Err`" as "nothing was created"
+/// would authorise removing the only local evidence of a file the user already
+/// has. A review caught exactly that inference being made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishRefused {
+    error: StorageError,
+    name: NameEvidence,
+}
+impl PublishRefused {
+    /// For a refusal that happened where a name could not yet have been made:
+    /// before the linking call, or from the linking call's own refusal.
+    ///
+    /// The caller is asserting something about control flow, which is why this
+    /// is a separate constructor rather than a flag: the assertion is made at the
+    /// one line that can make it and is visible in the diff.
+    pub fn none_created(error: StorageError) -> Self {
+        Self {
+            error,
+            name: NameEvidence::NoneCreated,
+        }
+    }
+    /// For everything else, including every failure after the link returned.
+    pub fn unknown(error: StorageError) -> Self {
+        Self {
+            error,
+            name: NameEvidence::Unknown,
+        }
+    }
+    pub fn error(self) -> StorageError {
+        self.error
+    }
+    pub fn name(self) -> NameEvidence {
+        self.name
+    }
+}
+impl std::fmt::Display for PublishRefused {
+    /// The error's own words. The evidence about the name is for the engine, not
+    /// for a message: an operator acts on why the publication was refused.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+impl From<PublishRefused> for StorageError {
+    fn from(refused: PublishRefused) -> Self {
+        refused.error
+    }
+}
+
+/// Whether a refused publication created a name at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameEvidence {
+    /// **No name was created, and that is established rather than assumed.** It
+    /// is claimed only from a refusal returned by the call that would have
+    /// created the name -- `HandleLinker::link`, whose contract is that a
+    /// directory entry either exists when it returns `Ok` or was never made --
+    /// or from a refusal on a path that had not reached that call yet.
+    ///
+    /// This is the one answer that permits a later cleanup to remove the part.
+    NoneCreated,
+    /// **Nobody can say.** The linking call may have created a name and the
+    /// failure came afterwards, or the attempt was interrupted before it could
+    /// answer. A part in this state is kept: it may be a second name for a file
+    /// the user already has, and removing it destroys the only local evidence
+    /// that publication may have happened.
+    Unknown,
+}
+
 /// Single-owner handle. Successful write is not a durable extent receipt.
 pub trait SegmentFile: Send {
     fn spec(&self) -> PartSpec;
@@ -442,7 +517,11 @@ pub trait SegmentFile: Send {
     /// Requires a synchronized, verified file, an adopted destination, and a
     /// durable PublishIntent in the repository. Atomic no-replace is mandatory;
     /// unsupported filesystems fail.
-    fn publish(&mut self) -> Result<Published, StorageError>;
+    ///
+    /// **A refusal says whether a name was created**, and the implementation must
+    /// answer that from where the name would have been made rather than from the
+    /// error it is returning. See `PublishRefused`.
+    fn publish(&mut self) -> Result<Published, PublishRefused>;
     /// Removes this generation's part file. Legitimate only after publication (the
     /// published name holds the bytes) or after `abandon`. The handle is unusable
     /// afterwards, so the caller drops it.

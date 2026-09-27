@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { coverageFailures, REQUIRED, summaryOf, testsIn } from './check-contract-tests.mjs';
+import {
+  coverageFailures,
+  REQUIRED,
+  SUITES,
+  summaryOf,
+  testsIn,
+  WITNESS_REQUIRED,
+} from './check-contract-tests.mjs';
+import { readFileSync } from 'node:fs';
 
 const required = new Map([
   ['on_both', ['win32', 'linux']],
@@ -139,6 +147,72 @@ test('reads every test in a source, whatever sits between the attribute and the 
     'fn takes_arguments(_: u8) {}',
   ].join('\n');
   assert.deepEqual(testsIn(source), ['plain', 'behind_attributes_and_comments', 'takes_arguments']);
+});
+
+/// An async contract test is read, however its attribute is spelled.
+///
+/// The first suite is all plain `#[test]`, so the scanner was written for that and
+/// nothing noticed. A second suite written with `#[tokio::test]` would have been
+/// entirely invisible to the half of this gate that catches a property added and
+/// never declared -- and a `cfg` keeping it off every platform would then have left
+/// it running nowhere while the gate stayed green. That is the same failure the file
+/// exists for, one spelling further out.
+test('an async test is read, with and without arguments on its attribute', () => {
+  const source = [
+    '#[tokio::test]',
+    'async fn plain_async() {}',
+    '',
+    '#[tokio::test(flavor = "multi_thread", worker_threads = 4)]',
+    'async fn with_arguments() {}',
+    '',
+    '#[tokio::test]',
+    '#[cfg(windows)]',
+    'async fn behind_an_attribute() {}',
+    '',
+    '// #[tokio::test] in a comment is not one',
+    'fn helper() {}',
+    '',
+    '#[tokio::main]',
+    'async fn not_a_test() {}',
+  ].join('\n');
+  assert.deepEqual(testsIn(source), ['plain_async', 'with_arguments', 'behind_an_attribute']);
+});
+
+/// Both suites are specified, and each one's source says the same thing this file
+/// does.
+///
+/// Read off disk rather than asserted as a count, because a count is what somebody
+/// updates without looking. A name in one list and not the other is the failure.
+test('every suite declares exactly the tests its source contains', () => {
+  assert.equal(SUITES.length, 2, 'a suite was added or removed without updating this test');
+  for (const suite of SUITES) {
+    const declared = [...testsIn(readFileSync(suite.source, 'utf8'))].sort();
+    const specified = [...suite.required.keys()].sort();
+    assert.deepEqual(
+      declared,
+      specified,
+      `${suite.source} and its specification name different tests`,
+    );
+    for (const [name, platforms] of suite.required) {
+      assert.ok(platforms.length > 0, `${name} is required nowhere`);
+      assert.ok(!platforms.includes('darwin'), `${name} cannot be required on macOS`);
+    }
+  }
+});
+
+/// The witness suite runs on both platforms that publish.
+///
+/// Not "on some platform": every one of these needs a real part file and a real
+/// database, and both of those exist wherever publication does. A platform quietly
+/// dropped from this map is a platform where the delivery witness is unmeasured.
+test('the delivery witness is required wherever publication is supported', () => {
+  for (const [name, platforms] of WITNESS_REQUIRED) {
+    assert.deepEqual(
+      [...platforms].sort(),
+      ['linux', 'win32'],
+      `${name} is not required on both platforms that publish`,
+    );
+  }
 });
 
 // The two shapes an engineering review got past the first version by

@@ -2,7 +2,8 @@
 //! plus fault injection. Deterministic and test-only.
 use fhd_app::{
     storage::{
-        Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore, StorageError,
+        Occupant, PartSpec, Publication, PublishRefused, Published, SegmentFile, SegmentStore,
+        StorageError,
     },
     transport::{ByteStream, OriginId, Probe, Transport, TransportError},
     AppError, CommitError, Destinations, DurableExtent, PortFuture, PublishIntent,
@@ -43,6 +44,9 @@ struct Stored {
     record: JobRecord,
     extents: Vec<DurableExtent>,
     intent: Option<PublishIntent>,
+    /// The delivery witness: the generation, how many publication attempts began
+    /// for it, and how many were shown to have created no name.
+    attempts: Option<(Generation, u32, u32)>,
 }
 #[derive(Default)]
 pub struct MemoryTransfers {
@@ -73,6 +77,7 @@ impl MemoryTransfers {
                 record,
                 extents: vec![],
                 intent: None,
+                attempts: None,
             },
         );
     }
@@ -87,6 +92,11 @@ impl MemoryTransfers {
     }
     pub fn state(&self, job: JobId) -> Option<JobState> {
         self.jobs.lock().unwrap().get(&job).map(|s| s.record.state)
+    }
+    /// Reads the witness's counters, for a test that wants to say which of the two
+    /// answers the record is giving rather than only whether a doubt stands.
+    pub fn attempts(&self, job: JobId) -> Option<(Generation, u32, u32)> {
+        self.jobs.lock().unwrap().get(&job).and_then(|s| s.attempts)
     }
 }
 impl TransferRepository for MemoryTransfers {
@@ -149,6 +159,9 @@ impl TransferRepository for MemoryTransfers {
             if replaced {
                 stored.extents.clear();
                 stored.intent = None;
+                // Different bytes, a different part: the old part's doubt is not
+                // carried into the new one.
+                stored.attempts = None;
             }
             let r = &mut stored.record;
             r.version = event.version();
@@ -161,6 +174,8 @@ impl TransferRepository for MemoryTransfers {
             r.attempts = o.attempts;
             if event.command() == JobCommand::PublishCommitted {
                 stored.intent = None;
+                // The outcome is known, so there is nothing left to doubt.
+                stored.attempts = None;
             }
             let r = &mut stored.record;
             r.plan = plan;
@@ -249,6 +264,64 @@ impl TransferRepository for MemoryTransfers {
     ) -> PortFuture<'_, Result<Option<PublishIntent>, AppError>> {
         Box::pin(async move { Ok(self.jobs.lock().unwrap().get(&job).and_then(|s| s.intent)) })
     }
+    /// The same rule as the SQLite repository: a different generation replaces the
+    /// record, the same generation adds to it.
+    fn begin_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<(), CommitError>> {
+        Box::pin(async move {
+            if self.outage() {
+                return Err(CommitError::Unavailable);
+            }
+            let mut jobs = self.jobs.lock().unwrap();
+            let stored = jobs.get_mut(&job).ok_or(CommitError::Conflict)?;
+            if stored.record.generation != generation {
+                return Err(CommitError::Conflict);
+            }
+            stored.attempts = Some(match stored.attempts {
+                Some((old, started, resolved)) if old == generation => {
+                    (generation, started.saturating_add(1), resolved)
+                }
+                _ => (generation, 1, 0),
+            });
+            Ok(())
+        })
+    }
+    /// Advances only when the attempt before it is already answered, which is the
+    /// whole of the design: an unanswered older attempt keeps its doubt.
+    fn resolve_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<(), CommitError>> {
+        Box::pin(async move {
+            if self.outage() {
+                return Err(CommitError::Unavailable);
+            }
+            let mut jobs = self.jobs.lock().unwrap();
+            let stored = jobs.get_mut(&job).ok_or(CommitError::Conflict)?;
+            if let Some((old, started, resolved)) = stored.attempts {
+                if old == generation && resolved.saturating_add(1) == started {
+                    stored.attempts = Some((old, started, started));
+                }
+            }
+            Ok(())
+        })
+    }
+    fn unresolved_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            Ok(self.jobs.lock().unwrap().get(&job).is_some_and(|s| {
+                s.attempts
+                    .is_some_and(|(old, started, resolved)| old == generation && started > resolved)
+            }))
+        })
+    }
     fn durable_extents(&self, job: JobId) -> PortFuture<'_, Result<Vec<DurableExtent>, AppError>> {
         Box::pin(async move {
             Ok(self
@@ -275,6 +348,19 @@ pub struct StoreFaults {
     /// there. Self-clearing, so a test injects one failure rather than a state
     /// it then has to remember to undo.
     pub fail_create: bool,
+    /// `publish` refuses with **no answer about the destination's name**.
+    ///
+    /// The one outcome this double cannot otherwise produce: it creates a name on a
+    /// single line, so every refusal of its own happens where none can exist. What
+    /// the real adapter has and this does not is the steps *after* the link returns
+    /// -- recording the outcome, syncing the file, syncing the folder -- any of
+    /// which can fail with a name already on disk.
+    ///
+    /// It is here so the coordinator's own branch can be measured: an answer of
+    /// "nobody can say" must not be recorded as "no name was created". Where that
+    /// answer comes from is measured on real files, in the storage adapter's
+    /// `a_failure_after_the_link_says_nobody_can_tell_rather_than_no_name`.
+    pub publish_unknown: bool,
 }
 /// `live` is what reads see; `durable` is what survives `MemoryStore::crash`.
 #[derive(Default)]
@@ -571,18 +657,36 @@ impl SegmentFile for MemoryFile {
     /// Atomic no-replace: an occupied destination is a conflict, never an overwrite.
     /// Like the real adapter, only a verified, synced, complete file that has
     /// adopted a destination may be published.
-    fn publish(&mut self) -> Result<Published, StorageError> {
-        self.usable()?;
-        if !self.complete() || !self.synced || !self.verified {
-            return Err(StorageError::InvalidState);
+    ///
+    /// **Every refusal here is `none_created`, and that is a property of the double
+    /// rather than a convenience.** The only line that creates a name is the insert
+    /// below; there is no step between the name appearing and the `Ok`, so no
+    /// refusal can leave one behind. The real adapter has several such steps, which
+    /// is why it decides the answer structurally instead.
+    ///
+    /// **So a test using this double cannot exercise `Unknown` at all**, and cannot
+    /// say anything about a part record on disk. That is the bound a review named,
+    /// and the tests for the delivery witness run against the real part store.
+    fn publish(&mut self) -> Result<Published, PublishRefused> {
+        self.usable().map_err(PublishRefused::none_created)?;
+        if self.faults.lock().unwrap().publish_unknown {
+            return Err(PublishRefused::unknown(StorageError::Io(
+                std::io::ErrorKind::StorageFull,
+            )));
         }
-        let destination = self.destination.clone().ok_or(StorageError::InvalidState)?;
+        if !self.complete() || !self.synced || !self.verified {
+            return Err(PublishRefused::none_created(StorageError::InvalidState));
+        }
+        let destination = self
+            .destination
+            .clone()
+            .ok_or_else(|| PublishRefused::none_created(StorageError::InvalidState))?;
         if self.blocked.lock().unwrap().contains(&destination) {
-            return Err(StorageError::Conflict);
+            return Err(PublishRefused::none_created(StorageError::Conflict));
         }
         let mut published = self.published.lock().unwrap();
         if published.contains_key(&destination) {
-            return Err(StorageError::Conflict);
+            return Err(PublishRefused::none_created(StorageError::Conflict));
         }
         published.insert(destination.clone(), self.data.lock().unwrap().live.clone());
         self.published_once = true;

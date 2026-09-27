@@ -27,6 +27,8 @@ import { fileURLToPath } from 'node:url';
 const SOURCE = 'crates/bins/daemon/tests/publication.rs';
 const PACKAGE = 'fhd-daemon';
 const TARGET = 'publication';
+const WITNESS_SOURCE = 'crates/bins/daemon/tests/delivery_witness.rs';
+const WITNESS_TARGET = 'delivery_witness';
 
 /// name -> the platforms it must run and pass on.
 ///
@@ -55,6 +57,38 @@ export const REQUIRED = new Map([
   ['a_failed_location_check_after_the_link_keeps_the_seal_and_the_files', ['win32', 'linux']],
 ]);
 
+/// The delivery witness, which is a second suite with the same exposure.
+///
+/// It is `cfg`'d off where there is no publication mechanism, for the same reason
+/// and with the same consequence: a CI step named after it goes green having run
+/// **nothing**, which is the failure this file exists for. So it is specified here
+/// rather than given a step of its own.
+///
+/// Every one of these needs a real part file, a real `.meta` byte and SQLite. The
+/// in-memory doubles cannot carry them -- a review said so for an earlier attempt
+/// that was measured against doubles written from the code they were checking.
+export const WITNESS_REQUIRED = new Map([
+  ['a_refusal_that_proves_no_name_was_made_lets_the_part_go', ['win32', 'linux']],
+  [
+    'an_unanswered_attempt_keeps_the_part_and_is_not_answered_by_a_later_refusal',
+    ['win32', 'linux'],
+  ],
+  ['an_answer_that_could_not_be_saved_leaves_the_doubt_standing', ['win32', 'linux']],
+  ['a_corrupted_publication_byte_does_not_bypass_the_witness', ['win32', 'linux']],
+  ['a_witness_that_cannot_be_read_keeps_the_part', ['win32', 'linux']],
+]);
+
+/// The suites this gate runs, in order.
+export const SUITES = [
+  { source: SOURCE, target: TARGET, label: 'Publication contract', required: REQUIRED },
+  {
+    source: WITNESS_SOURCE,
+    target: WITNESS_TARGET,
+    label: 'Delivery witness',
+    required: WITNESS_REQUIRED,
+  },
+];
+
 /// Runs cargo and returns its output whether it succeeded or not.
 ///
 /// `execFileSync` throws on a non-zero exit, and the throw carried cargo's
@@ -67,8 +101,8 @@ export const REQUIRED = new Map([
 /// model is reading CI steps. Returning the output instead also makes the
 /// `failed !== 0` branch reachable rather than dead.
 let nonZeroExit = 0;
-function cargo(extra) {
-  const argv = ['+1.98.1', 'test', '-p', PACKAGE, '--test', TARGET, '--locked', ...extra];
+function cargo(target, extra) {
+  const argv = ['+1.98.1', 'test', '-p', PACKAGE, '--test', target, '--locked', ...extra];
   try {
     return execFileSync('cargo', argv, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch (error) {
@@ -123,8 +157,14 @@ export function testsIn(text) {
     }
     return out;
   };
+  // `#[test]` and `#[tokio::test]`, the latter with or without its arguments. The
+  // second spelling was not recognised, and the first suite happens to use none of
+  // it -- so the day a contract suite was written with async tests, every one of
+  // them would have been invisible to the half of this gate that catches a property
+  // added and never declared. Found while adding such a suite.
+  const attribute = /^#\[(?:test|tokio::test(?:\(.*\))?)\]$/u;
   for (let index = 0; index < lines.length; index += 1) {
-    if (strip(lines[index]).trim() !== '#[test]') continue;
+    if (!attribute.test(strip(lines[index]).trim())) continue;
     // Walk forward over attributes -- however many lines each one spans -- and
     // blank or comment-only lines, to the item they sit on.
     let brackets = 0;
@@ -147,7 +187,15 @@ export function testsIn(text) {
 }
 
 /// The failures, as messages. Exported so the shape is testable without cargo.
-export function coverageFailures({ platform, required, declared, listed, summary }) {
+export function coverageFailures({
+  platform,
+  required,
+  declared,
+  listed,
+  summary,
+  source = SOURCE,
+  label = 'publication-contract',
+}) {
   const failures = [];
   const wanted = [...required.entries()]
     .filter(([, platforms]) => platforms.includes(platform))
@@ -157,7 +205,7 @@ export function coverageFailures({ platform, required, declared, listed, summary
   for (const name of declared) {
     if (!required.has(name)) {
       failures.push(
-        `${name}: a #[test] in ${SOURCE} that tools/check-contract-tests.mjs does not ` +
+        `${name}: a #[test] in ${source} that tools/check-contract-tests.mjs does not ` +
         'name. Add it to REQUIRED with the platforms it must run on.',
       );
     }
@@ -168,7 +216,7 @@ export function coverageFailures({ platform, required, declared, listed, summary
     // assumed: if one ever compiles here, say so rather than pass.
     if (listed.length !== 0) {
       failures.push(
-        `macOS compiled ${listed.length} publication-contract tests (${listed.join(', ')}). ` +
+        `macOS compiled ${listed.length} ${label} tests (${listed.join(', ')}). ` +
         'macOS refuses publication with Unsupported, so this list is expected to be ' +
         'empty. Decide what these measure before letting the step go green.',
       );
@@ -177,7 +225,7 @@ export function coverageFailures({ platform, required, declared, listed, summary
   }
 
   if (wanted.length === 0) {
-    failures.push(`no publication-contract test is required on ${platform}, which cannot be right`);
+    failures.push(`no ${label} test is required on ${platform}, which cannot be right`);
     return failures;
   }
   for (const name of wanted) {
@@ -219,39 +267,50 @@ export function summaryOf(output) {
 }
 
 function main() {
-  const declared = testsIn(readFileSync(SOURCE, 'utf8'));
-  const listed = cargo(['--', '--list'])
-    .split('\n')
-    .map((line) => /^([a-z0-9_:]+): test$/u.exec(line.trim()))
-    .filter(Boolean)
-    .map((found) => found[1].replace(/^tests::/u, ''));
-  // On macOS the binary has no tests, so running it proves nothing and the
-  // listing is the whole check.
-  const summary = process.platform === 'darwin' ? null : summaryOf(cargo([]));
-  const failures = coverageFailures({
-    platform: process.platform,
-    required: REQUIRED,
-    declared,
-    listed,
-    summary,
-  });
-  if (nonZeroExit !== 0) {
-    failures.push(
-      `cargo exited ${nonZeroExit} although the summary above was read. A run can ` +
-      'print clean counts and then abort, and the step this guards must not pass on it.',
+  // Both suites, each reported by name. One step covering two targets is here
+  // because the alternative -- a step per target -- is what went green running zero
+  // tests, and adding a second target without adding it here would have repeated
+  // that exactly.
+  for (const suite of SUITES) {
+    // Reset per suite: a non-zero exit from the first must not condemn the second,
+    // and must not be forgotten either, which is why it is read before the next run.
+    nonZeroExit = 0;
+    const declared = testsIn(readFileSync(suite.source, 'utf8'));
+    const listed = cargo(suite.target, ['--', '--list'])
+      .split('\n')
+      .map((line) => /^([a-z0-9_:]+): test$/u.exec(line.trim()))
+      .filter(Boolean)
+      .map((found) => found[1].replace(/^tests::/u, ''));
+    // On macOS the binary has no tests, so running it proves nothing and the
+    // listing is the whole check.
+    const summary = process.platform === 'darwin' ? null : summaryOf(cargo(suite.target, []));
+    const failures = coverageFailures({
+      platform: process.platform,
+      required: suite.required,
+      declared,
+      listed,
+      summary,
+      source: suite.source,
+      label: suite.label,
+    });
+    if (nonZeroExit !== 0) {
+      failures.push(
+        `cargo exited ${nonZeroExit} although the summary above was read. A run can ` +
+        'print clean counts and then abort, and the step this guards must not pass on it.',
+      );
+    }
+    if (failures.length) {
+      console.error(`${suite.label} coverage failed on ${process.platform}:`);
+      for (const failure of failures) console.error(`  ${failure}`);
+      process.exitCode = 1;
+      return;
+    }
+    const count = process.platform === 'darwin' ? 0 : summary.passed;
+    console.log(
+      `${suite.label}: ${count} of ${count} required tests ran and passed on ` +
+      `${process.platform}, 0 ignored.`,
     );
   }
-  if (failures.length) {
-    console.error(`Publication contract coverage failed on ${process.platform}:`);
-    for (const failure of failures) console.error(`  ${failure}`);
-    process.exitCode = 1;
-    return;
-  }
-  const count = process.platform === 'darwin' ? 0 : summary.passed;
-  console.log(
-    `Publication contract: ${count} of ${count} required tests ran and passed on ` +
-    `${process.platform}, 0 ignored.`,
-  );
 }
 
 // The same guard `check-architecture.mjs` uses: a suffix test would also match

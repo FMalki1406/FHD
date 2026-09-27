@@ -120,8 +120,12 @@ impl SegmentFile for FakeFile {
     fn adopt_destination(&mut self, _: &Path) -> Result<(), StorageError> {
         Ok(())
     }
-    fn publish(&mut self) -> Result<fhd_app::storage::Published, StorageError> {
-        Err(StorageError::Unsupported)
+    fn publish(&mut self) -> Result<fhd_app::storage::Published, fhd_app::storage::PublishRefused> {
+        // This double has no destination and no linker, so nothing here reaches a
+        // call that could make a name.
+        Err(fhd_app::storage::PublishRefused::none_created(
+            StorageError::Unsupported,
+        ))
     }
     fn discard(&mut self) -> Result<(), StorageError> {
         self.observe(Operation::Discard);

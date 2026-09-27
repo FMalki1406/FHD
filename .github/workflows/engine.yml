@@ -299,7 +299,11 @@ jobs:
       # narrowed cfg, the whole file cfg'd off, and a test missing from the
       # specification, an undeclared test behind a multi-line attribute, a failing
       # test, and a run that exits non-zero after a clean summary all fail it.
-      - name: Test the publication contract
+      # Two suites now, and deliberately under one step: the delivery witness is
+      # `cfg`'d off where there is no publication mechanism, so a step of its own
+      # would have gone green having run nothing -- the very failure above. The
+      # script names each suite and its count separately.
+      - name: Test the publication contract and the delivery witness
         run: node tools/check-contract-tests.mjs
       - name: Test the engine as a program
         run: cargo +1.98.1 test -p fhd-daemon --locked --test process

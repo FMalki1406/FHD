@@ -31,7 +31,8 @@
 mod harness;
 
 use fhd_app::storage::{
-    HandleLinker, PartSpec, Published, SegmentFile, SegmentStore, StorageError,
+    HandleLinker, NameEvidence, PartSpec, PublishRefused, Published, SegmentFile, SegmentStore,
+    StorageError,
 };
 use fhd_domain::{ByteRange, Generation, JobId};
 use fhd_storage::FileStorage;
@@ -41,6 +42,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// A refused publication's reason, asserting on the way through that the refusal
+/// also says **no name was created**.
+///
+/// Used where that is the property under test: the real linking call refusing, or a
+/// path that never reaches it. The engine is permitted to remove a part on this
+/// answer and on no other, so a refusal that stopped carrying it would authorise
+/// removing the only local evidence of a file that may have been delivered. Asserted
+/// rather than discarded for that reason.
+fn refused(result: Result<Published, PublishRefused>) -> Result<Published, StorageError> {
+    result.map_err(|refused| {
+        assert_eq!(
+            refused.name(),
+            NameEvidence::NoneCreated,
+            "the linking call refused and the refusal did not say so"
+        );
+        refused.error()
+    })
+}
 
 /// Takes the source name away, then links through the real mechanism.
 ///
@@ -505,10 +525,10 @@ fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
     );
 
     assert_eq!(
-        {
+        refused({
             part.adopt_destination(&destination).unwrap();
             part.publish()
-        },
+        }),
         Err(StorageError::Unsupported),
         "publication found another way to name the file"
     );
@@ -703,7 +723,7 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
 
     part.adopt_destination(&destination).unwrap();
     assert_eq!(
-        part.publish(),
+        refused(part.publish()),
         Err(StorageError::Unsupported),
         "publication found another way to name the file"
     );
@@ -896,7 +916,7 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
     assert!(!destination.exists());
 
     assert_eq!(
-        part.publish(),
+        refused(part.publish()),
         Err(StorageError::InvalidState),
         "a part that has published was allowed to publish again"
     );

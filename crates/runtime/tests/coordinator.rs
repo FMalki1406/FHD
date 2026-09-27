@@ -537,6 +537,48 @@ async fn crash_between_rename_and_commit_completes_without_republishing() {
     assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
 }
 
+/// A publication that cannot say what became of the name is not an answer.
+///
+/// **The one thing the engine must never do with "nobody can say" is file it as "no
+/// name was created".** The second permits removing the part; the first forbids it.
+/// They arrive through the same `Err`, which is why the answer is carried beside the
+/// error rather than read off it -- and why a test has to pin the branch that tells
+/// them apart, or the branch can be deleted and every other test stays green.
+///
+/// **What this measures and what it does not.** The coordinator's branch: given an
+/// answer of "nobody can say", the record goes on saying an attempt is unanswered,
+/// and the job rests on the reason that blocks a resume without offering to fetch
+/// the file again. Where that answer comes from is a question about real files, and
+/// it is measured on them -- the storage adapter's
+/// `a_failure_after_the_link_says_nobody_can_tell_rather_than_no_name` fails the
+/// outcome write with the destination's entry already on disk. What the part store
+/// then does about keeping the part is measured on real files too, in the daemon's
+/// `delivery_witness.rs`; this double has no `.meta` file to speak for.
+#[tokio::test]
+async fn a_publication_that_cannot_say_leaves_the_attempt_unanswered() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    rig.store.set_faults(StoreFaults {
+        publish_unknown: true,
+        ..StoreFaults::default()
+    });
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    let job = rig.job().await;
+    assert_eq!(
+        job.reason(),
+        Some(StopReason::Unconfirmed),
+        "a publication with no answer was reported as an ordinary storage failure"
+    );
+    assert_eq!(
+        rig.repo.attempts(rig.id),
+        Some((job.generation(), 1, 0)),
+        "an answer of \"nobody can say\" was recorded as \"no name was created\""
+    );
+}
+
 #[tokio::test]
 async fn foreign_file_at_the_destination_is_never_overwritten() {
     let content = body(15_000);

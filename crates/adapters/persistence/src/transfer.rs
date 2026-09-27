@@ -283,10 +283,20 @@ impl SqliteRepository {
             if replaced {
                 tx.execute("DELETE FROM extents WHERE job_id=?1", [id])?;
                 tx.execute("DELETE FROM publish_intents WHERE job_id=?1", [id])?;
+                // A new representation is different bytes and a different part, so
+                // the doubt about the old one's attempts is not carried into it.
+                // `begin_attempt` also replaces a row of another generation; this
+                // covers a replacement that is never followed by an attempt.
+                tx.execute("DELETE FROM publish_attempts WHERE job_id=?1", [id])?;
             }
             // A published job needs no intent; the record itself says Completed.
             if event.command() == JobCommand::PublishCommitted {
                 tx.execute("DELETE FROM publish_intents WHERE job_id=?1", [id])?;
+                // And no witness: the outcome is known, which is the one thing the
+                // witness exists to say is not. This is the only ordinary way the
+                // record is cleared, and it is what stops a completed job carrying
+                // a permanent refusal to clean up after itself.
+                tx.execute("DELETE FROM publish_attempts WHERE job_id=?1", [id])?;
             }
             let durable: u64 = extents(&tx, id, generation)?
                 .iter()
@@ -452,6 +462,79 @@ impl SqliteRepository {
             )?;
             tx.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Durable before the link. The row is replaced when the generation differs,
+    /// because a different representation is a different part.
+    async fn begin_attempt(&self, job: JobId, generation: Generation) -> Result<()> {
+        self.run(move |inner| {
+            let id = signed_id(job)?;
+            let tx = inner
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // An attempt on a generation the record has moved past cannot be
+            // beginning now. Refused rather than recorded, so nothing raises a
+            // count that no part on disk belongs to.
+            if current(&tx, id)?.generation != stored(generation.get())? {
+                return Err(PersistenceError::Conflict);
+            }
+            tx.execute(
+                concat!(
+                    "INSERT INTO publish_attempts(job_id,generation,started,resolved) ",
+                    "VALUES(?1,?2,1,0) ON CONFLICT(job_id) DO UPDATE SET ",
+                    "started=CASE WHEN publish_attempts.generation=excluded.generation ",
+                    "THEN publish_attempts.started+1 ELSE 1 END,",
+                    "resolved=CASE WHEN publish_attempts.generation=excluded.generation ",
+                    "THEN publish_attempts.resolved ELSE 0 END,",
+                    "generation=excluded.generation"
+                ),
+                params![id, stored(generation.get())?],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Advances the answered count, and **only if the attempt before it is already
+    /// answered**: `resolved + 1 = started` says the attempt being resolved is the
+    /// latest one and every earlier one is accounted for. When that does not hold
+    /// the statement changes nothing, which is the correct durable outcome -- an
+    /// older unanswered attempt's doubt survives this attempt's refusal.
+    async fn resolve_attempt(&self, job: JobId, generation: Generation) -> Result<()> {
+        self.run(move |inner| {
+            let id = signed_id(job)?;
+            inner.db.execute(
+                concat!(
+                    "UPDATE publish_attempts SET resolved=resolved+1 ",
+                    "WHERE job_id=?1 AND generation=?2 AND resolved+1=started"
+                ),
+                params![id, stored(generation.get())?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `true` when an attempt of this generation was begun and never shown to have
+    /// created no name. A missing row means no attempt was ever begun.
+    async fn unresolved_attempt(&self, job: JobId, generation: Generation) -> Result<bool> {
+        self.run(move |inner| {
+            let id = signed_id(job)?;
+            let row: Option<(i64, i64)> = inner
+                .db
+                .query_row(
+                    concat!(
+                        "SELECT started,resolved FROM publish_attempts ",
+                        "WHERE job_id=?1 AND generation=?2"
+                    ),
+                    params![id, stored(generation.get())?],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(started, resolved)| started > resolved))
         })
         .await
     }
@@ -622,6 +705,39 @@ impl TransferRepository for SqliteRepository {
     }
     fn load_jobs(&self) -> PortFuture<'_, std::result::Result<Vec<Job>, AppError>> {
         Box::pin(async move { self.jobs().await.map_err(app_error) })
+    }
+    fn begin_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, std::result::Result<(), CommitError>> {
+        Box::pin(async move {
+            self.begin_attempt(job, generation)
+                .await
+                .map_err(commit_error)
+        })
+    }
+    fn resolve_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, std::result::Result<(), CommitError>> {
+        Box::pin(async move {
+            self.resolve_attempt(job, generation)
+                .await
+                .map_err(commit_error)
+        })
+    }
+    fn unresolved_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, std::result::Result<bool, AppError>> {
+        Box::pin(async move {
+            self.unresolved_attempt(job, generation)
+                .await
+                .map_err(app_error)
+        })
     }
 }
 

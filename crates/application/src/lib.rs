@@ -337,6 +337,58 @@ pub trait TransferRepository: Send + Sync {
     ) -> PortFuture<'_, Result<(), CommitError>>;
     fn publish_intent(&self, job: JobId)
         -> PortFuture<'_, Result<Option<PublishIntent>, AppError>>;
+    /// Records that a publication attempt is **beginning**, before the call that
+    /// could create a name at the destination.
+    ///
+    /// **Why a count and not a flag.** A flag set before the first attempt and
+    /// cleared on success cannot tell "this attempt was refused" from "some earlier
+    /// attempt may have delivered the file": clearing it on a refusal forgets the
+    /// earlier doubt, and not clearing it keeps a part after every ordinary
+    /// refusal. Two counters keep both answers at once -- see
+    /// `unresolved_publish_attempt`.
+    ///
+    /// The count belongs to a generation. A different generation is different
+    /// bytes, so it replaces the record rather than adding to it.
+    fn begin_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<(), CommitError>>;
+    /// Records that the attempt most recently begun **created no name**.
+    ///
+    /// The caller may only call this on the evidence of
+    /// `storage::NameEvidence::NoneCreated`, which comes from the linking call
+    /// itself. It must never be called because a publication returned an error.
+    ///
+    /// **It advances the record only if every earlier attempt is already
+    /// resolved.** That is by design and not an error to report: an attempt that
+    /// crashed before it could answer leaves a doubt this attempt's refusal says
+    /// nothing about, and the record must go on saying so.
+    fn resolve_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<(), CommitError>>;
+    /// Whether an attempt exists for this generation that was never shown to have
+    /// created no name -- begun and never answered, or answered where the answer
+    /// could not be saved.
+    ///
+    /// **`true` forbids removing the part and its record, forbids opening the part
+    /// for writing, and forbids linking again.** The part may be a second name for
+    /// a file the user already has: writing to it would change that file, linking
+    /// again would leave a second copy somewhere, and removing it would destroy the
+    /// only local evidence that any of this happened. `true` is never a licence to
+    /// unseal.
+    ///
+    /// Neither the number of attempts nor the absence of a file at the requested
+    /// path is an answer to this question. The first counts, it does not decide;
+    /// the second is not evidence of non-delivery, because a folder can be renamed
+    /// after a file is put in it.
+    fn unresolved_publish_attempt(
+        &self,
+        job: JobId,
+        generation: Generation,
+    ) -> PortFuture<'_, Result<bool, AppError>>;
 }
 
 pub trait JobRepository: Send + Sync {

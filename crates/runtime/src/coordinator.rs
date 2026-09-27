@@ -9,7 +9,8 @@ use crate::{
 };
 use fhd_app::{
     storage::{
-        Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore, StorageError,
+        NameEvidence, Occupant, PartSpec, Publication, Published, SegmentFile, SegmentStore,
+        StorageError,
     },
     transport::{OriginId, Transport, TransportError},
     CommitError, Destinations, DurableExtent, PortFuture, PublishIntent, TransferRepository,
@@ -258,32 +259,65 @@ impl Coordinator {
         let Some((total, _)) = job.plan() else {
             return;
         };
-        // **The publish intent cannot decide this, and the reason is worth keeping.**
+        // **The durable witness is asked first, before anything is opened.**
         //
-        // The guard below reads the part's own state byte. A corrupted byte -- 3
-        // (`Sealed | Attempted`) flipping to 0 (`Open`) is still a legal value, so
-        // the part opens and the guard reads "nothing was begun" -- would let a
-        // cancel remove a part that may be a second name for a delivered file. That
-        // destroys the local evidence for recovery. It does not remove the user's
-        // file: a hard link means the destination name survives either way.
+        // The guard inside the blocking closure below reads the part's own state
+        // byte, and that byte is one unauthenticated value in a directory beside the
+        // user's download folder. A 3 (`Sealed | Attempted`) flipped to 0 (`Open`)
+        // is still a legal value, so the part opens and the guard reads "nothing was
+        // begun" -- and a cancel would remove a part that may be a second name for a
+        // delivered file. Removing it does not take the user's file away, a hard
+        // link survives either way; it destroys the only local evidence that
+        // publication may have happened, which is the input to deciding what became
+        // of it.
         //
-        // The obvious answer is to consult the saved publish intent, the way
-        // `Session::may_be_published` does, and that was tried. **It does not work,
-        // because the intent is not cleared when publication is definitively
-        // refused** -- only on `PublishCommitted` or a generation replacement. So an
-        // intent is present both when the outcome is unknown *and* when the linker
-        // reported that no name was created, and the two cannot be told apart by it.
-        // Keeping the part whenever an intent exists therefore leaks one after every
-        // ordinary refusal, which
-        // `a_stopped_job_can_be_cancelled_and_an_unknown_one_is_refused` measures:
-        // "a cancelled job left parts behind".
+        // **The publish intent cannot answer this, and the history is worth
+        // keeping.** Consulting it was tried, the way `Session::may_be_published`
+        // does, and it leaks: the intent is not cleared when publication is
+        // definitively refused -- only on `PublishCommitted` or a generation
+        // replacement -- so it is present both when the outcome is unknown *and*
+        // when the linker reported that no name was created. Keeping the part
+        // whenever an intent existed therefore left one behind after every ordinary
+        // refusal, which `a_stopped_job_can_be_cancelled_and_an_unknown_one_is_refused`
+        // measures as "a cancelled job left parts behind".
         //
-        // Closing this needs the intent dropped when a refusal is definite, so that
-        // its presence means "unknown" -- a change to the durable record and to both
-        // repository implementations -- or an integrity check over the part record,
-        // which is already recorded as an open item. Neither is done here, and the
-        // risk to recovery evidence stays open in `docs/execution-status.md` rather
-        // than being papered over with a guard that leaks.
+        // What answers it is a witness that separates the two: an attempt is counted
+        // when it begins and answered only when the linking call itself reported
+        // that no name was created. "An attempt exists that was never answered" is
+        // then a durable fact about *this* part, and a later attempt's refusal
+        // cannot talk over an earlier attempt's silence.
+        //
+        // **Asked only for the cleanup that could be wrong.** After a publication this
+        // run confirmed there is nothing to doubt, and reading the witness there would
+        // only add a way to fail: a transient repository error would leave `.part` and
+        // `.meta` behind on a completed job, which is exactly the leak `PartCleanup`
+        // exists to prevent. So the question is put where its answer can matter.
+        if why == PartCleanup::Unknown {
+            let unresolved = self
+                .ports
+                .repository
+                .unresolved_publish_attempt(job.id(), job.generation())
+                .await;
+            let keep = match unresolved {
+                Ok(unresolved) => unresolved,
+                // Not heard from. Nothing may be removed on the strength of a question
+                // that went unanswered, and a part left behind is something the
+                // operator should be able to find out about, so both facts are told.
+                Err(_) => {
+                    emit(
+                        Event::new(Code::StorageFailed)
+                            .for_job(job.id().get(), job.generation().get()),
+                    );
+                    true
+                }
+            };
+            if keep {
+                emit(
+                    Event::new(Code::PartRetained).for_job(job.id().get(), job.generation().get()),
+                );
+                return;
+            }
+        }
         let Ok(spec) = PartSpec::new(job.id(), job.generation(), total) else {
             return;
         };
@@ -816,7 +850,7 @@ impl Session<'_> {
             StorageError::Integrity => StopReason::Integrity,
             _ => StopReason::Storage,
         });
-        let unknown = match found {
+        let by_part = match found {
             Some(state) => matches!(state, Publication::Attempted | Publication::Linked),
             // No state was read. The job record is consulted only where the
             // reason would otherwise be answered by **fetching the file again**,
@@ -838,6 +872,19 @@ impl Session<'_> {
                     && self.may_be_published().await?
             }
         };
+        // **And the part's own byte is not the only witness.**
+        //
+        // A part record whose publication byte was corrupted from 3 to 0 reads
+        // `Open`, which is a legal value, so `by_part` says nothing was ever begun
+        // and this open would go on to make the part writable -- and the part may be
+        // a hard link to a file the user already has, which writing to it would
+        // change. The durable witness is in the job record rather than beside the
+        // download, it is not derived from that byte, and it is asked here for
+        // exactly the case where the byte cannot be believed.
+        //
+        // Asked on every open, unlike `may_be_published`: one query when a session
+        // opens its part, against a file the engine may be about to write.
+        let unknown = by_part || self.delivery_unresolved().await?;
         let file = match opened {
             // A part this run found part-way through publication, or one whose
             // record cannot be read while the job record says a publication was
@@ -1342,6 +1389,25 @@ impl Session<'_> {
         Ok(intent.is_some_and(|intent| intent.generation() == self.job.generation()))
     }
 
+    /// Whether a publication attempt for these bytes was begun and never answered.
+    ///
+    /// **What `true` forbids:** opening the part for writing, linking again, and
+    /// removing the part or its record. The part may be a second name for a file the
+    /// user already has. It is not a licence to unseal, and it is not a claim that
+    /// the file was delivered -- it is the absence of an answer, which is a
+    /// different thing from either answer.
+    ///
+    /// A repository that cannot be read is not a `false`. Every caller either
+    /// propagates that or keeps the part.
+    async fn delivery_unresolved(&self) -> Result<bool, RunError> {
+        self.c
+            .ports
+            .repository
+            .unresolved_publish_attempt(self.job.id(), self.job.generation())
+            .await
+            .map_err(|_| RunError::Repository)
+    }
+
     /// Records the intent, then renames without replacing. A conflict or a crash is
     /// reconciled against the destination, never by overwriting it.
     async fn publish(&mut self, digest: [u8; 32]) -> Result<SessionEnd, RunError> {
@@ -1424,6 +1490,20 @@ impl Session<'_> {
             Some(_) => return self.publish_blocked(StopReason::Destination).await,
             None => {}
         }
+        // **Before a writable part is opened, and before a second name is made.**
+        //
+        // An unanswered attempt means this part may already be a name for the user's
+        // file. Re-proving the bytes reads it, which is harmless; opening it for
+        // writing and linking it again are not, and both are below this line. The
+        // way out is the reconciliation just above -- a file at the destination with
+        // the recorded size and digest commits the publication and clears the
+        // witness. Reaching here means that did not happen, and the absence of a
+        // file at the requested path is not evidence of non-delivery: the folder can
+        // have been renamed after the file was put in it, which is what
+        // `Unconfirmed` exists to say.
+        if self.delivery_unresolved().await? {
+            return self.publish_blocked(StopReason::Unconfirmed).await;
+        }
         // A handle opened in this session never verified these bytes; a handle
         // reopened after a crash must prove them again before any rename.
         let reopened = self.writer.is_none();
@@ -1456,6 +1536,23 @@ impl Session<'_> {
                 Err(_) => return self.publish_blocked(StopReason::Storage).await,
             }
         }
+        // Durable before the link, and the count is what makes a crash decidable:
+        // without it, an interrupted publication is indistinguishable from one that
+        // never began, and every one of them would have to be treated as possibly
+        // delivered.
+        if self
+            .c
+            .ports
+            .repository
+            .begin_publish_attempt(self.job.id(), self.job.generation())
+            .await
+            .is_err()
+        {
+            // Refusing to record that an attempt is beginning is refusing to begin
+            // it. Linking with nothing durable saying an attempt was under way would
+            // create exactly the silence this record exists to break.
+            return self.publish_blocked(StopReason::Storage).await;
+        }
         match writer.publish(&self.io).await {
             Ok(outcome) => {
                 self.step(JobCommand::PublishCommitted).await?;
@@ -1463,11 +1560,45 @@ impl Session<'_> {
                 report(&self.job, Code::JobCompleted, intent.size(), Duration::ZERO);
                 Ok(SessionEnd::Published(outcome))
             }
-            // Lost a race for the name, or an unrelated file appeared meanwhile.
-            Err(WriterError::Storage(StorageError::Conflict)) => {
-                self.publish_blocked(StopReason::Destination).await
+            Err(failed) => {
+                // **Answered only from the linking call's own answer.** `NoneCreated`
+                // is set where the name would have been made -- the linker refused,
+                // or the path never reached it -- and never inferred from the error
+                // being returned, because publication records a state, syncs the
+                // file and syncs the folder *after* the link returns, and a failure
+                // in any of those is an error for a name that exists.
+                if failed.name() == NameEvidence::NoneCreated {
+                    if let Err(error) = self
+                        .c
+                        .ports
+                        .repository
+                        .resolve_publish_attempt(self.job.id(), self.job.generation())
+                        .await
+                    {
+                        // The answer was reached and could not be saved, so the
+                        // record goes on saying an attempt is unanswered. That is
+                        // the conservative side and it is the correct one: nothing
+                        // may act on an answer only this process ever knew, and this
+                        // process is about to stop.
+                        let _ = error;
+                        report(&self.job, Code::StorageFailed, 0, Duration::ZERO);
+                    }
+                }
+                match (failed.name(), failed.error()) {
+                    // Nobody can say whether a name was made. Not a storage failure
+                    // to retry and not a reason to fetch the file again: the one
+                    // reason that blocks a resume without offering a replacement.
+                    (NameEvidence::Unknown, _) => {
+                        self.publish_blocked(StopReason::Unconfirmed).await
+                    }
+                    // Lost a race for the name, or an unrelated file appeared
+                    // meanwhile.
+                    (_, WriterError::Storage(StorageError::Conflict)) => {
+                        self.publish_blocked(StopReason::Destination).await
+                    }
+                    _ => self.publish_blocked(StopReason::Storage).await,
+                }
             }
-            Err(_) => self.publish_blocked(StopReason::Storage).await,
         }
     }
 
@@ -1497,6 +1628,22 @@ impl Session<'_> {
     /// and for a cancelled job they are not wanted. Best effort: a part left behind
     /// is recorded, never fatal, and the orphan stays visible to the repository.
     async fn release_part(&mut self, abandon: bool, why: PartCleanup) {
+        // **The witness governs both ways of removing a part.** `drop_part` asks for
+        // itself, and that is the path with no live writer; this is the other one,
+        // where the lane still holds the file and would otherwise discard it with
+        // nothing consulted. A cancel arriving while a session is still up takes
+        // exactly this path.
+        //
+        // A repository that cannot answer keeps the part: not being able to ask
+        // whether a file may already be the user's is not permission to remove the
+        // evidence that it might be.
+        if why == PartCleanup::Unknown && self.delivery_unresolved().await.unwrap_or(true) {
+            emit(
+                Event::new(Code::PartRetained)
+                    .for_job(self.job.id().get(), self.job.generation().get()),
+            );
+            return;
+        }
         // The lane owns the file while it lives, so it must do the releasing;
         // only a session without one falls back to a standalone handle.
         let Some(writer) = self.writer.clone() else {
