@@ -798,10 +798,24 @@ async fn a_failed_save_for_a_queued_command_is_not_reported_as_invalid_input() {
         .find(|job| job.id() == JobId::new(2).unwrap())
         .expect("the job is in the record");
 
-    match answered.expect("the cancel was never answered, so a caller waits for ever") {
-        // Dropped: unknown, which is the honest answer when the record cannot say.
-        Err(_) => (),
-        Ok(Applied::Yes) => {
+    // **Required, not merely permitted.** `fail_next(1)` fails exactly one
+    // repository operation -- the cancel's first save -- so the retry inside
+    // `confirm_command` has a working repository and must carry the command through.
+    // An earlier version of this test also accepted a dropped reply as honest, which
+    // it is in general but not here: it left a way to pass with the retry having done
+    // no work at all. A review asked for the three answers to be demanded together.
+    let answered = answered
+        .expect("the cancel was never answered, so a caller waits for ever")
+        .expect(
+            "the reply was dropped. Only one operation was made to fail, so the retry              had a working repository and should have reached a definite answer",
+        );
+    assert_eq!(
+        answered,
+        Applied::Yes,
+        "the retry after a failed save did not carry the cancel through"
+    );
+    {
+        {
             assert_eq!(
                 recorded.state(),
                 JobState::Cancelled,
@@ -831,12 +845,6 @@ async fn a_failed_save_for_a_queued_command_is_not_reported_as_invalid_input() {
                 job.state()
             );
         }
-        Ok(Applied::No) => panic!(
-            "a failed save was reported as a refused command, which the IPC layer \
-             turns into ENGINE-INVALID-INPUT. The record says {:?}, so the outcome \
-             was unknown rather than invalid",
-            recorded.state()
-        ),
     }
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -1148,10 +1156,15 @@ impl Transport for RefuseOneParkTwo {
 ///
 /// **This proves arrival instead of assuming it.** The engine is given one
 /// connection in total, so the second job cannot start until the first job's grant
-/// is released -- and that release happens in `finish`, in the same breath as the
-/// parking. The second job signals from inside `fetch`. Once that signal arrives,
-/// the first job's copy is in `done` as a matter of the scheduler's own order, not
-/// of timing.
+/// comes back. The order is: `finish` releases the grant, then the run loop parks
+/// the copy in `done` on the next line, and only a later turn of the loop admits
+/// the second job. So the parking strictly precedes the second job starting. (An
+/// earlier version of this comment said the release and the parking happen "in the
+/// same breath"; they are adjacent, not simultaneous, and a review asked for the
+/// order to be stated as it is. The proof is unchanged.)
+///
+/// The second job signals from inside `fetch`. Once that signal arrives, the first
+/// job's copy is in `done` as a matter of the scheduler's own order, not of timing.
 ///
 /// Then the cancel is sent, and the three answers must agree.
 #[tokio::test]
@@ -1231,8 +1244,9 @@ async fn a_command_after_the_copy_is_parked_agrees_with_the_record_and_the_outco
     let (commands, receiver) = mpsc::channel(4);
     let run = tokio::spawn(async move { scheduler.run(jobs, receiver).await });
 
-    // **The proof.** Job 2 is inside `fetch`, so job 1's grant was released in
-    // `finish` -- and `finish` is where job 1's copy was parked in `done`.
+    // **The proof.** Job 2 is inside `fetch`, so job 1's grant had already come
+    // back -- released in `finish`, after which the loop parked job 1's copy in
+    // `done` before any later turn could admit job 2.
     tokio::time::timeout(std::time::Duration::from_secs(30), second_started)
         .await
         .expect("the second job never started, so nothing proves the first was parked")
