@@ -360,15 +360,22 @@ pub trait TransferRepository: Send + Sync {
     /// `storage::NameEvidence::NoneCreated`, which comes from the linking call
     /// itself. It must never be called because a publication returned an error.
     ///
-    /// **It advances the record only if every earlier attempt is already
-    /// resolved.** That is by design and not an error to report: an attempt that
-    /// crashed before it could answer leaves a doubt this attempt's refusal says
-    /// nothing about, and the record must go on saying so.
+    /// **It advances the record only if every earlier attempt is already resolved**,
+    /// and it answers which happened. An attempt that crashed before it could report
+    /// leaves a doubt this attempt's refusal says nothing about, so the record must go
+    /// on saying so -- and the caller has to know, because a job whose record still
+    /// holds a doubt must come to rest on the reason that says so rather than on the
+    /// reason this refusal would otherwise suggest.
+    ///
+    /// `true` means the record now accounts for every attempt begun. `false` means it
+    /// does not, and nothing was changed. An engineering review pointed out that
+    /// answering `Ok(())` for both was the one place in this design where a port
+    /// reported success for a question it had not settled.
     fn resolve_publish_attempt(
         &self,
         job: JobId,
         generation: Generation,
-    ) -> PortFuture<'_, Result<(), CommitError>>;
+    ) -> PortFuture<'_, Result<bool, CommitError>>;
     /// Whether an attempt exists for this generation that was never shown to have
     /// created no name -- begun and never answered, or answered where the answer
     /// could not be saved.

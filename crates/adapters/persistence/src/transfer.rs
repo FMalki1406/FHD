@@ -209,7 +209,17 @@ fn restored_segments(mut durable: Vec<ByteRange>, total: u64) -> usize {
     count + usize::from(cursor < total)
 }
 
-/// Open-time check: extents belong to the job's current, planned generation.
+/// Open-time check: extents belong to the job's current, planned generation, and
+/// each delivery witness is a row that could have been written by this schema.
+///
+/// **The witness is checked here because `CHECK` is not a read-time control.** SQLite
+/// validates a constraint when the row is written and never again: another writer can
+/// set `PRAGMA ignore_check_constraints`, and nothing re-validates a page or a `-wal`
+/// frame that rotted. A row saying `resolved > started` would then be read by
+/// `unresolved_attempt` as "nothing to doubt", which is the answer that grants
+/// permission -- so a malformed row must stop the repository from opening rather than
+/// answer a question about a file the user may already have. A security review
+/// pointed out that the migration's comment claimed more than `CHECK` delivers.
 pub(super) fn consistent(db: &Connection) -> Result<bool> {
     let bad: i64 = db.query_row(
         "SELECT count(*) FROM extents e LEFT JOIN job_state s ON s.job_id=e.job_id \
@@ -217,7 +227,18 @@ pub(super) fn consistent(db: &Connection) -> Result<bool> {
         [],
         |r| r.get(0),
     )?;
-    Ok(bad == 0)
+    if bad != 0 {
+        return Ok(false);
+    }
+    let witness: i64 = db.query_row(
+        concat!(
+            "SELECT count(*) FROM publish_attempts ",
+            "WHERE started < 1 OR resolved < 0 OR resolved > started OR generation < 1"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(witness == 0)
 }
 
 impl SqliteRepository {
@@ -503,17 +524,19 @@ impl SqliteRepository {
     /// latest one and every earlier one is accounted for. When that does not hold
     /// the statement changes nothing, which is the correct durable outcome -- an
     /// older unanswered attempt's doubt survives this attempt's refusal.
-    async fn resolve_attempt(&self, job: JobId, generation: Generation) -> Result<()> {
+    async fn resolve_attempt(&self, job: JobId, generation: Generation) -> Result<bool> {
         self.run(move |inner| {
             let id = signed_id(job)?;
-            inner.db.execute(
+            let changed = inner.db.execute(
                 concat!(
                     "UPDATE publish_attempts SET resolved=resolved+1 ",
                     "WHERE job_id=?1 AND generation=?2 AND resolved+1=started"
                 ),
                 params![id, stored(generation.get())?],
             )?;
-            Ok(())
+            // Zero rows is the guard refusing, not a failure: an older attempt is
+            // still unanswered, so this answer cannot account for it.
+            Ok(changed == 1)
         })
         .await
     }
@@ -534,7 +557,15 @@ impl SqliteRepository {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            Ok(row.is_some_and(|(started, resolved)| started > resolved))
+            // `!=`, not `>`. The two agree on every row this schema can write, and
+            // they disagree on a row it cannot: `resolved > started` reads as
+            // "nothing to doubt" under `>`, which is the answer that permits
+            // removing a part that may be the user's file. A row nobody could have
+            // written honestly is not evidence of safety, so it reads as a doubt.
+            // `consistent` refuses to open such a database at all; this is the same
+            // answer given twice, on purpose, because the failure it guards against
+            // is a record that changed after it was checked.
+            Ok(row.is_some_and(|(started, resolved)| started != resolved))
         })
         .await
     }
@@ -721,7 +752,7 @@ impl TransferRepository for SqliteRepository {
         &self,
         job: JobId,
         generation: Generation,
-    ) -> PortFuture<'_, std::result::Result<(), CommitError>> {
+    ) -> PortFuture<'_, std::result::Result<bool, CommitError>> {
         Box::pin(async move {
             self.resolve_attempt(job, generation)
                 .await

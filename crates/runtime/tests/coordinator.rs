@@ -579,6 +579,82 @@ async fn a_publication_that_cannot_say_leaves_the_attempt_unanswered() {
     );
 }
 
+/// A part that may already be the user's file is not replaced, whatever the job is
+/// resting on.
+///
+/// **The domain refuses this for `Unconfirmed`, and that is one record agreeing with
+/// another.** Every path that leaves a publication attempt unanswered does come to
+/// rest on `Unconfirmed` today -- a security review checked each producer and so did
+/// I -- so the refusal holds. What it does not do is *depend* on the witness: a new
+/// `RequireAction` reason that forgets to join the list, or a reordering that records
+/// the reason before the witness, reopens the route with no test failing. The review
+/// said so, and this is the assertion that makes it a rule instead of a coincidence.
+///
+/// What the route costs: a new generation is a new part, **and the witness row is
+/// dropped with it**. So a replacement erases the doubt and the only record of it in
+/// one step, after which nothing stands between the old part -- which may be a second
+/// name for a delivered file -- and removal.
+///
+/// The reason here is deliberately *not* `Unconfirmed`: it is `Destination`, which
+/// blocks nothing, so the domain would allow the command and only the witness stops
+/// it.
+#[tokio::test]
+async fn an_unanswered_attempt_refuses_a_replacement_whatever_the_reason_says() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    let stranger = body(4_000);
+    rig.store.place(rig.destination.clone(), stranger);
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    let job = rig.job().await;
+    assert_eq!(
+        job.reason(),
+        Some(StopReason::Destination),
+        "the premise failed: a reason that blocks a replacement would prove nothing"
+    );
+    // **The premise, asked without spending it.** A replacement has to be available
+    // in this state, or the refusal below would prove nothing -- and an earlier
+    // version of this test established that by *performing* one, which moved the job
+    // to `Queued` under a new generation. `ReplaceRepresentation` is not a command
+    // `Queued` accepts, so the second call was then refused by the state machine and
+    // the assertion passed with the guard deleted. The mutation run found it.
+    //
+    // `decide` answers the same question and commits nothing, on a copy loaded for
+    // the purpose and dropped here.
+    assert!(
+        rig.job()
+            .await
+            .decide(JobCommand::ReplaceRepresentation)
+            .is_ok(),
+        "the premise failed: the domain refuses a replacement in this state anyway, \
+         so the guard cannot be what refuses it"
+    );
+
+    // The state a crash between the two writes leaves.
+    rig.repo
+        .begin_publish_attempt(rig.id, job.generation())
+        .await
+        .expect("the attempt is recorded");
+    let refused = rig
+        .coordinator
+        .command(job, JobCommand::ReplaceRepresentation)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a part that may be the user's file was replaced, which drops the witness \
+         and leaves nothing to stop the part being removed"
+    );
+    assert!(
+        rig.repo
+            .unresolved_publish_attempt(rig.id, rig.job().await.generation())
+            .await
+            .unwrap(),
+        "the refused command changed the record anyway"
+    );
+}
+
 #[tokio::test]
 async fn foreign_file_at_the_destination_is_never_overwritten() {
     let content = body(15_000);

@@ -9,8 +9,14 @@
 -- which is what the earlier single flag could not express: a refusal of the
 -- current attempt is not evidence about an earlier one.
 --
--- `resolved <= started` is enforced here as well as in the update, because the
--- constraint is what makes the comparison meaningful.
+-- `resolved <= started` is declared here as well as enforced in the update. It is
+-- **not** a read-time control and must not be relied on as one: SQLite validates a
+-- CHECK when the row is written and never again, another writer can disable them,
+-- and a rotted page is never re-checked. So the reader treats `started != resolved`
+-- as a doubt rather than asking `>`, and `consistent()` refuses to open a database
+-- holding a row this constraint would have rejected. A security review pointed out
+-- that an earlier version of this comment claimed the constraint made the
+-- comparison meaningful, which put the weight in the wrong place.
 CREATE TABLE publish_attempts (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     generation INTEGER NOT NULL CHECK(generation > 0),

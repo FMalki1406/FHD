@@ -424,11 +424,26 @@ impl From<PublishRefused> for StorageError {
 /// Whether a refused publication created a name at the destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameEvidence {
-    /// **No name was created, and that is established rather than assumed.** It
-    /// is claimed only from a refusal returned by the call that would have
-    /// created the name -- `HandleLinker::link`, whose contract is that a
-    /// directory entry either exists when it returns `Ok` or was never made --
-    /// or from a refusal on a path that had not reached that call yet.
+    /// **No name was created, and that is established rather than assumed.** It is
+    /// claimed from a refusal on a path that never reached the linking call, or from
+    /// the linking call's own refusal *together with a check that the requested name
+    /// does not lead to the object being published*.
+    ///
+    /// **The check is there because "the call refused" is not the same as "no entry
+    /// exists".** On a local filesystem the link is one system call and the two are
+    /// the same. Over NFS the two come apart: `link(2)` NOTES records that a client
+    /// retry after a lost reply returns `EEXIST` although the link was made, and it
+    /// is the caller's own link. SMB is the same class of risk. So an implementation
+    /// may claim this only when nothing it can see contradicts it, and must answer
+    /// `Unknown` when the name leads to the object it holds.
+    ///
+    /// **What the check cannot settle**, and therefore what this answer still
+    /// carries: a name created inside the adopted folder while the requested path no
+    /// longer reaches that folder, and a name the platform could not compare. Both
+    /// read as `NoneCreated`, because the alternative -- treating an unanswerable
+    /// comparison as a doubt -- keeps a part after every ordinary refusal, which is
+    /// the leak this whole mechanism exists to avoid. The residual is stated rather
+    /// than closed.
     ///
     /// This is the one answer that permits a later cleanup to remove the part.
     NoneCreated,

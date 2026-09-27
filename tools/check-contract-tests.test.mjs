@@ -178,6 +178,35 @@ test('an async test is read, with and without arguments on its attribute', () =>
   assert.deepEqual(testsIn(source), ['plain_async', 'with_arguments', 'behind_an_attribute']);
 });
 
+/// An attribute that rustfmt has broken across lines is still read.
+///
+/// The fix that taught the scanner `#[tokio::test]` anchored on the whole attribute
+/// being one line. rustfmt breaks the argument list as soon as it grows, so that fix
+/// was one line break from reopening the hole it closed: a suite of invisible tests
+/// and a green gate. An engineering review said so, and this is the shape it named.
+test('a test attribute broken across lines is read', () => {
+  const source = [
+    '#[tokio::test(',
+    '    flavor = "multi_thread",',
+    '    worker_threads = 4,',
+    ')]',
+    'async fn broken_across_lines() {}',
+    '',
+    '#[tokio::test(',
+    '    flavor = "current_thread",',
+    ')]',
+    '#[cfg(windows)]',
+    '/// and a doc comment after it',
+    'async fn and_another_attribute_after_it() {}',
+    '',
+    '#[tokio::main(',
+    '    worker_threads = 2,',
+    ')]',
+    'async fn not_a_test() {}',
+  ].join('\n');
+  assert.deepEqual(testsIn(source), ['broken_across_lines', 'and_another_attribute_after_it']);
+});
+
 /// Both suites are specified, and each one's source says the same thing this file
 /// does.
 ///

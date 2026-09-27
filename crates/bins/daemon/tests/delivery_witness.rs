@@ -44,7 +44,7 @@ use rusqlite::OptionalExtension;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -185,22 +185,39 @@ impl Destinations for Beside {
 /// database are real, and they do not happen on request.
 struct Interfering {
     inner: Arc<SqliteRepository>,
-    /// Fails the next save of a refusal's answer, then stops.
-    refuse_to_save: AtomicBool,
-    /// Fails every read of the witness while set, because the decision under test
-    /// makes exactly one and a self-clearing fault would not reach it.
-    refuse_to_answer: AtomicBool,
+    /// How many saves of a refusal's answer to fail. `0` fails none; `usize::MAX`
+    /// fails every one. A count rather than a flag because the coordinator retries
+    /// this write: a fault that clears itself measures the retry, and one that never
+    /// clears measures what happens when the answer is never saved at all. They are
+    /// different claims and both are required.
+    refuse_to_save: AtomicUsize,
+    /// Reads counted, so a test can fail the *n*th one. The witness is read at more
+    /// than one point in a session, and which one fails changes what has to happen:
+    /// failing the read before the part is opened has to stop the job, and so does
+    /// failing the one before the link, and they are different lines.
+    reads: AtomicUsize,
+    /// The read index from which reads fail. `usize::MAX` never fails.
+    refuse_from: AtomicUsize,
 }
 impl Interfering {
-    fn new(inner: Arc<SqliteRepository>, refuse_to_save: bool) -> Self {
+    fn new(inner: Arc<SqliteRepository>, refuse_to_save: usize) -> Self {
         Self {
             inner,
-            refuse_to_save: AtomicBool::new(refuse_to_save),
-            refuse_to_answer: AtomicBool::new(false),
+            refuse_to_save: AtomicUsize::new(refuse_to_save),
+            reads: AtomicUsize::new(0),
+            refuse_from: AtomicUsize::new(usize::MAX),
         }
     }
+    /// Every read from now on fails.
     fn stop_answering(&self) {
-        self.refuse_to_answer.store(true, Ordering::SeqCst);
+        self.refuse_from.store(0, Ordering::SeqCst);
+    }
+    /// The next `allowed` reads succeed and every read after them fails.
+    fn stop_answering_after(&self, allowed: usize) {
+        self.refuse_from.store(
+            self.reads.load(Ordering::SeqCst) + allowed,
+            Ordering::SeqCst,
+        );
     }
 }
 impl TransferRepository for Interfering {
@@ -244,8 +261,14 @@ impl TransferRepository for Interfering {
         &self,
         job: JobId,
         generation: Generation,
-    ) -> PortFuture<'_, Result<(), CommitError>> {
-        if self.refuse_to_save.swap(false, Ordering::SeqCst) {
+    ) -> PortFuture<'_, Result<bool, CommitError>> {
+        if self
+            .refuse_to_save
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Box::pin(async { Err(CommitError::Unavailable) });
         }
         self.inner.resolve_publish_attempt(job, generation)
@@ -255,7 +278,7 @@ impl TransferRepository for Interfering {
         job: JobId,
         generation: Generation,
     ) -> PortFuture<'_, Result<bool, AppError>> {
-        if self.refuse_to_answer.load(Ordering::SeqCst) {
+        if self.reads.fetch_add(1, Ordering::SeqCst) >= self.refuse_from.load(Ordering::SeqCst) {
             return Box::pin(async { Err(AppError::PersistenceUnavailable) });
         }
         self.inner.unresolved_publish_attempt(job, generation)
@@ -343,7 +366,11 @@ impl Wired {
         // test that arms nothing is running the same code as one that does.
         let interference = Arc::new(Interfering::new(
             sqlite.clone(),
-            matches!(repository, Repository::FailsToSaveTheAnswer),
+            match repository {
+                Repository::Real => 0,
+                Repository::FailsToSaveTheAnswerOnce => 1,
+                Repository::FailsToSaveTheAnswer => usize::MAX,
+            },
         ));
         let ports = Ports {
             repository: interference.clone(),
@@ -452,12 +479,14 @@ impl Wired {
         .expect("the witness is readable")
     }
 
-    async fn resolve_attempt(&self) {
+    /// Records a definite refusal, and answers whether the record now accounts for
+    /// every attempt begun.
+    async fn resolve_attempt(&self) -> bool {
         let generation = self.reload().await.generation();
         self.repository
             .resolve_publish_attempt(self.job, generation)
             .await
-            .expect("the answer is accepted");
+            .expect("the answer is accepted")
     }
 
     /// Runs the job from whatever the record says it is, with no control channel.
@@ -535,6 +564,9 @@ impl Wired {
 
 enum Repository {
     Real,
+    /// The save fails once and then works, which is what a busy database looks like.
+    FailsToSaveTheAnswerOnce,
+    /// The save never works.
     FailsToSaveTheAnswer,
 }
 
@@ -639,7 +671,10 @@ async fn an_unanswered_attempt_keeps_the_part_and_is_not_answered_by_a_later_ref
     // caught the mistake in the test rather than in the code.
     wired.begin_attempt().await;
     assert_eq!(wired.counters().await, Some((3, 1)));
-    wired.resolve_attempt().await;
+    assert!(
+        !wired.resolve_attempt().await,
+        "the record claimed to account for an attempt it says nothing about"
+    );
     assert_eq!(
         wired.counters().await,
         Some((3, 1)),
@@ -711,6 +746,17 @@ async fn an_answer_that_could_not_be_saved_leaves_the_doubt_standing() {
         wired.unresolved().await,
         "the refusal's answer was never saved, and the record claims it was"
     );
+    // **And the job rests on the reason the record justifies, not on the one this
+    // refusal suggests.** The linker refused because the name was taken, which reads
+    // as `Destination` -- an operator moves the file, resumes, and meets a job that
+    // still refuses to move, because the record holds a doubt. Reporting the doubt is
+    // what makes the state and the reason agree.
+    assert_eq!(
+        wired.reason().await,
+        Some(StopReason::Unconfirmed),
+        "a job whose record holds an unanswered attempt was reported as something an \
+         operator can fix at the destination"
+    );
 
     wired.cancel().await;
     assert_eq!(wired.state().await, JobState::Cancelled);
@@ -718,6 +764,107 @@ async fn an_answer_that_could_not_be_saved_leaves_the_doubt_standing() {
         wired.part().exists() && wired.meta().exists(),
         "a cancel removed a part whose attempt has no saved answer"
     );
+}
+
+/// A part record that says an attempt was begun is refused on that record alone.
+///
+/// **This is the other half of the corrupted-byte claim.** The test above shows that
+/// a record reading `Open` is refused by the witness; without this one, nothing said
+/// that a record reading `Attempted` is refused at all -- so "a flip from 3 to 0
+/// hands over permission" would have been an assertion about the code rather than a
+/// measurement. Here the witness is deliberately *clear*, and the byte is the only
+/// thing that refuses.
+///
+/// The byte is written directly, the way `crashed_at` writes it in the storage
+/// adapter's own tests: what a restart sees is the bytes, and these are the bytes.
+/// Interrupting a real attempt would need a hook in the code under test, and a hook
+/// is a place a production build can stop at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_that_says_an_attempt_was_begun_is_refused_on_its_own_record() {
+    let state = Directory::new("witness-byte");
+    let body = content(512 * 1024 + 3);
+    let wired = Wired::open(&state, &body, Repository::Real).await;
+
+    let _ = wired.run().await;
+    assert_eq!(wired.state().await, JobState::NeedsAction);
+    // The witness says there is nothing outstanding, and stays saying it.
+    assert_eq!(wired.counters().await, Some((1, 1)));
+    assert!(!wired.unresolved().await);
+
+    // The record a crash between the two writes leaves.
+    wired.set_publication_byte(3);
+    wired.allow_linking();
+    let before = std::fs::read(wired.part()).expect("the part is readable");
+
+    wired.resume().await;
+    let outcome = wired.run().await;
+    assert_eq!(
+        wired.reason().await,
+        Some(StopReason::Unconfirmed),
+        "a part whose record says an attempt was begun was run on anyway: {outcome:?}"
+    );
+    assert!(
+        !wired.destination.exists(),
+        "publication linked again over a record that says an attempt was begun"
+    );
+    assert_eq!(
+        std::fs::read(wired.part()).expect("the part is readable"),
+        before,
+        "the part was written to although its own record says an attempt was begun"
+    );
+    assert_eq!(
+        wired.publication_byte(),
+        3,
+        "opening the part rewrote the record that was refusing"
+    );
+
+    wired.cancel().await;
+    assert_eq!(wired.state().await, JobState::Cancelled);
+    assert!(
+        wired.part().exists() && wired.meta().exists(),
+        "a cancel removed a part whose own record says an attempt was begun"
+    );
+}
+
+/// A witness that cannot be read stops the job; it does not fail the session.
+///
+/// **The difference is whether an operator has anything left to do.** A session that
+/// returns an error leaves the job durably `Transferring`, `Verifying` or
+/// `Publishing` with no session behind it -- and the domain refuses `Pause` and
+/// `Cancel` while a publication is in progress, so nothing can move it until the
+/// daemon restarts. A busy database on one job start would have been enough. An
+/// engineering review traced it through the scheduler's failure arm, and this is the
+/// assertion that the conservative answer is the one taken.
+///
+/// Both reads in a session are covered, because they are two lines and a fix for one
+/// is not a fix for the other: the one before the part is opened, and the one before
+/// the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_witness_that_cannot_be_read_stops_the_job_rather_than_the_session() {
+    for allowed in [0, 1] {
+        let state = Directory::new(&format!("witness-unaskable-{allowed}"));
+        let body = content(512 * 1024 + 3);
+        let wired = Wired::open(&state, &body, Repository::Real).await;
+        wired.interference.stop_answering_after(allowed);
+
+        let outcome = wired.run().await;
+        assert!(
+            outcome.is_ok(),
+            "read {allowed}: the session failed instead of stopping the job, which \
+             leaves it running with nothing behind it: {outcome:?}"
+        );
+        assert_eq!(
+            wired.state().await,
+            JobState::NeedsAction,
+            "read {allowed}: the job was left in a running state"
+        );
+        assert_eq!(
+            wired.reason().await,
+            Some(StopReason::Unconfirmed),
+            "read {allowed}: a question that went unanswered was reported as something \
+             an operator can retry"
+        );
+    }
 }
 
 /// A witness that cannot be read is not a `false`.
@@ -763,20 +910,74 @@ async fn a_witness_that_cannot_be_read_keeps_the_part() {
     );
 }
 
-/// The part's own byte does not decide this, and corrupting it changes nothing.
+/// A save that fails once is retried, and the doubt does not survive it.
 ///
-/// `Sealed | Attempted` is 3. Flipping it to 0 gives `Open`, which is a legal value,
-/// so the part opens and its record reads "nothing was ever begun". That byte is one
-/// unauthenticated value in a directory beside the user's download folder, and before
-/// the witness it was the only thing consulted: a single bit was enough to authorise
-/// writing to a part that may be a name for the user's file, linking a second one,
-/// and removing the evidence of either.
+/// **Without the retry a transient error is a permanent one.** One busy database on
+/// the write that records an ordinary refusal would leave the doubt standing for
+/// ever: the part is kept for ever, and both ways out are closed -- reconciliation
+/// cannot succeed because nothing was linked, and a replacement is refused while a
+/// doubt stands. An engineering review traced that, and pointed at the extent commit
+/// on the same path, which has retried an unavailable repository for as long as it
+/// has existed.
 ///
-/// All three are asserted, because they are three refusals in three different places
-/// and a fix for one is not a fix for the others. The linking call is allowed to
-/// succeed here too, so the middle one is a real opportunity to publish.
+/// The companion test above is the case where the save never works, and the doubt
+/// then stands by design. This is the case where it works on the second try, and the
+/// job must end up exactly where it would have without the failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_corrupted_publication_byte_does_not_bypass_the_witness() {
+async fn a_save_that_fails_once_is_retried_and_settles_the_attempt() {
+    let state = Directory::new("witness-retried");
+    let body = content(512 * 1024 + 3);
+    let wired = Wired::open(&state, &body, Repository::FailsToSaveTheAnswerOnce).await;
+
+    let outcome = wired.run().await;
+    assert_eq!(
+        wired.state().await,
+        JobState::NeedsAction,
+        "the refused link did not stop the job: {outcome:?}"
+    );
+    assert_eq!(
+        wired.counters().await,
+        Some((1, 1)),
+        "the retry did not save the answer, so one busy database is permanent"
+    );
+    assert!(!wired.unresolved().await);
+    assert_eq!(
+        wired.reason().await,
+        Some(StopReason::Destination),
+        "the record accounts for every attempt, so the reason should be the one the \
+         refusal actually carried"
+    );
+
+    wired.cancel().await;
+    assert_eq!(wired.state().await, JobState::Cancelled);
+    assert!(
+        !wired.part().exists() && !wired.meta().exists(),
+        "a transient failure to save an answer kept the part anyway"
+    );
+}
+
+/// A part whose own record says nothing was begun is still refused by the witness.
+///
+/// **This is the corrupted byte, and the pair below it is what makes that claim
+/// mean something.** `Sealed | Attempted` is 3; flipping it to 0 gives `Open`, a
+/// value every build accepts, and the part then reads as one nothing was ever tried
+/// on. The companion test shows that a record reading 3 is refused on that record
+/// alone -- so the flip really does hand over permission, and what is left standing
+/// here is the witness and nothing else.
+///
+/// **The premise is the byte, read before anything touches it.** An earlier version
+/// of this test wrote 3, asserted it had written 3, and wrote 0 back: a no-op on
+/// disk, and an assertion about its own write that could not fail. An engineering
+/// review found that, and found that the suite therefore never held a part whose
+/// record said `Attempted` while the witness decided -- which is what the companion
+/// test is for.
+///
+/// Writing, linking again and removing are all asserted, because they are three
+/// refusals in three different places and a fix for one is not a fix for the others.
+/// The linking call is allowed to succeed, so the middle one is a real opportunity to
+/// publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_part_that_says_nothing_was_begun_is_still_refused_by_the_witness() {
     let state = Directory::new("witness-corrupt");
     let body = content(512 * 1024 + 3);
     let wired = Wired::open(&state, &body, Repository::Real).await;
@@ -785,19 +986,17 @@ async fn a_corrupted_publication_byte_does_not_bypass_the_witness() {
     assert_eq!(wired.state().await, JobState::NeedsAction);
     wired.begin_attempt().await;
 
-    // The part record a crash mid-attempt leaves, set the way `crashed_at` sets it in
-    // the storage adapter's own tests: what a restart sees is the bytes, and these
-    // are the bytes. Interrupting a real attempt would need a hook in the code under
-    // test, and a hook is a place a production build can stop at.
-    wired.set_publication_byte(3);
+    // **The premise, read off the disk rather than written there.** The refused
+    // publication left the part unsealed, so its record says `Open` -- the same value
+    // a 3 corrupted to 0 reads as, and the value the companion test shows is the
+    // difference between refusing and proceeding. Nothing below writes this byte: the
+    // part's own record gives permission, and only the witness refuses.
     assert_eq!(
         wired.publication_byte(),
-        3,
-        "the record does not say an attempt was begun, so corrupting it says nothing"
+        0,
+        "the part's own record already refuses, so the witness is not what is being \
+         measured here"
     );
-
-    // And now the corruption: one byte, to a value every build accepts.
-    wired.set_publication_byte(0);
     wired.allow_linking();
     let before = std::fs::read(wired.part()).expect("the part is readable");
 

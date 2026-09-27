@@ -1,5 +1,5 @@
 use super::*;
-use fhd_app::{AddDownload, Authorizer, EntitlementGate, Principal};
+use fhd_app::{AddDownload, Authorizer, EntitlementGate, Principal, TransferRepository};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Directory(PathBuf);
@@ -233,6 +233,76 @@ async fn corrupt_checksum_and_receipt_pair_fail_closed() {
         SqliteRepository::open(directory.0.clone(), Limits::default()).await,
         Err(PersistenceError::Corrupt)
     ));
+}
+
+/// A witness row this schema could not have written is a doubt, and then a refusal.
+///
+/// **`CHECK` is not a read-time control**, which is the whole reason this test
+/// exists. SQLite validates a constraint when the row is written and never again:
+/// another writer can set `PRAGMA ignore_check_constraints`, and a rotted page or
+/// `-wal` frame is never re-checked. So `resolved > started` can be read back, and
+/// under a `started > resolved` test it reads as **"nothing to doubt"** -- the answer
+/// that permits removing a part which may be a second name for the user's file.
+///
+/// Two answers are required of it, and they are different answers. A repository
+/// already open must treat the row as a doubt, because it cannot re-open to complain.
+/// A repository being opened must refuse the database, because a row nobody could
+/// have written honestly is not something to keep working around. A security review
+/// asked for both, and pointed out that the migration's own comment put the weight on
+/// the constraint.
+#[tokio::test]
+async fn a_witness_row_that_could_not_have_been_written_is_a_doubt_then_a_refusal() {
+    let directory = Directory::new();
+    let repo = SqliteRepository::open(directory.0.clone(), Limits::default())
+        .await
+        .unwrap();
+    add(&repo, 1).await.unwrap();
+    let job = fhd_domain::JobId::new(1).unwrap();
+    let generation = fhd_domain::Generation::initial();
+    // Written through the port, so the row starts as an honest one.
+    repo.run(move |inner| {
+        inner.db.execute(
+            "INSERT INTO publish_attempts(job_id,generation,started,resolved) VALUES(1,1,1,1)",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        !TransferRepository::unresolved_publish_attempt(&repo, job, generation)
+            .await
+            .unwrap(),
+        "the premise failed: an accounted-for attempt already reads as a doubt"
+    );
+
+    // And now a row the constraint would have rejected, which is what tampering or
+    // rot leaves behind.
+    repo.run(|inner| {
+        inner.db.execute("PRAGMA ignore_check_constraints=1", [])?;
+        inner
+            .db
+            .execute("UPDATE publish_attempts SET resolved=started+1", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        TransferRepository::unresolved_publish_attempt(&repo, job, generation)
+            .await
+            .unwrap(),
+        "a row this schema could not have written was read as nothing to doubt, which \
+         is the answer that permits removing the part"
+    );
+
+    drop(repo);
+    assert!(
+        matches!(
+            SqliteRepository::open(directory.0.clone(), Limits::default()).await,
+            Err(PersistenceError::Corrupt)
+        ),
+        "a database holding a row the constraint would have rejected was opened"
+    );
 }
 
 #[test]

@@ -43,6 +43,10 @@ export const REQUIRED = new Map([
   ['publication_never_replaces_a_file_that_is_already_there', ['win32', 'linux']],
   ['the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode', ['win32', 'linux']],
   ['a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else', ['win32', 'linux']],
+  [
+    'a_link_that_was_made_and_then_reported_refused_is_not_reported_as_making_nothing',
+    ['win32', 'linux'],
+  ],
   ['a_refused_publication_leaves_the_part_writable_on_the_next_run', ['win32', 'linux']],
   ['a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window', ['win32', 'linux']],
   ['a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_else', ['win32', 'linux']],
@@ -74,8 +78,20 @@ export const WITNESS_REQUIRED = new Map([
     ['win32', 'linux'],
   ],
   ['an_answer_that_could_not_be_saved_leaves_the_doubt_standing', ['win32', 'linux']],
-  ['a_corrupted_publication_byte_does_not_bypass_the_witness', ['win32', 'linux']],
+  ['a_save_that_fails_once_is_retried_and_settles_the_attempt', ['win32', 'linux']],
+  [
+    'a_part_that_says_nothing_was_begun_is_still_refused_by_the_witness',
+    ['win32', 'linux'],
+  ],
+  [
+    'a_part_that_says_an_attempt_was_begun_is_refused_on_its_own_record',
+    ['win32', 'linux'],
+  ],
   ['a_witness_that_cannot_be_read_keeps_the_part', ['win32', 'linux']],
+  [
+    'a_witness_that_cannot_be_read_stops_the_job_rather_than_the_session',
+    ['win32', 'linux'],
+  ],
 ]);
 
 /// The suites this gate runs, in order.
@@ -157,17 +173,32 @@ export function testsIn(text) {
     }
     return out;
   };
-  // `#[test]` and `#[tokio::test]`, the latter with or without its arguments. The
-  // second spelling was not recognised, and the first suite happens to use none of
-  // it -- so the day a contract suite was written with async tests, every one of
-  // them would have been invisible to the half of this gate that catches a property
-  // added and never declared. Found while adding such a suite.
-  const attribute = /^#\[(?:test|tokio::test(?:\(.*\))?)\]$/u;
+  // `#[test]` and `#[tokio::test]`, **matched as a prefix and however many lines it
+  // spans.** The second spelling was not recognised at all, and the first suite
+  // happens to use none of it -- so the day a contract suite was written with async
+  // tests, every one of them was invisible to the half of this gate that catches a
+  // property added and never declared. Found while adding such a suite.
+  //
+  // The first fix for that anchored on the whole attribute being one line, which an
+  // engineering review pointed out is one line break from reopening the same hole:
+  // rustfmt breaks `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`
+  // across lines as soon as the argument list grows. So the attribute's own brackets
+  // seed the walk below, which already knows how to cross a multi-line attribute.
+  const attribute = /^#\[(?:test|tokio::test)\b/u;
+  const count = (line) => {
+    let depth = 0;
+    for (const character of line) {
+      if (character === '[' || character === '(') depth += 1;
+      if (character === ']' || character === ')') depth -= 1;
+    }
+    return depth;
+  };
   for (let index = 0; index < lines.length; index += 1) {
-    if (!attribute.test(strip(lines[index]).trim())) continue;
+    const opening = strip(lines[index]).trim();
+    if (!attribute.test(opening)) continue;
     // Walk forward over attributes -- however many lines each one spans -- and
     // blank or comment-only lines, to the item they sit on.
-    let brackets = 0;
+    let brackets = Math.max(count(opening), 0);
     for (let scan = index + 1; scan < lines.length; scan += 1) {
       const line = strip(lines[scan]).trim();
       if (!line) continue;
@@ -302,12 +333,25 @@ function main() {
     if (failures.length) {
       console.error(`${suite.label} coverage failed on ${process.platform}:`);
       for (const failure of failures) console.error(`  ${failure}`);
+      // **Reported, and then the next suite is still run.** Returning here meant a
+      // failure in the first suite left the second neither run nor mentioned, so a
+      // regression in one could hide whether the other was checked at all -- in a
+      // step whose whole output is what somebody reads instead of a log. An
+      // engineering review pointed it out when the second suite arrived.
       process.exitCode = 1;
-      return;
+      continue;
     }
-    const count = process.platform === 'darwin' ? 0 : summary.passed;
+    // Two numbers, because one printed twice cannot disagree with itself: what ran
+    // and what this file requires. They are equal when the gate passes, and saying
+    // so is the point.
+    const ran = process.platform === 'darwin' ? 0 : summary.passed;
+    const required =
+      process.platform === 'darwin'
+        ? 0
+        : [...suite.required.values()].filter((platforms) => platforms.includes(process.platform))
+            .length;
     console.log(
-      `${suite.label}: ${count} of ${count} required tests ran and passed on ` +
+      `${suite.label}: ${ran} of ${required} required tests ran and passed on ` +
       `${process.platform}, 0 ignored.`,
     );
   }

@@ -183,10 +183,21 @@ mod imp {
     /// **Never replaces.** `linkat` fails with `EEXIST` on an occupied name,
     /// which surfaces as `AlreadyExists`.
     ///
-    /// **A failure creates nothing.** `linkat` is one system call: it either
-    /// creates the name or reports why it did not. The port's contract requires
-    /// that, because a refused link is recorded as "nothing was made" and the
-    /// part is unsealed on that basis.
+    /// **A failure creates nothing -- on a local filesystem.** `linkat` is one
+    /// system call: the kernel either creates the name or reports why it did not.
+    ///
+    /// **This is not true over a network filesystem, and the difference matters
+    /// here.** `link(2)` NOTES documents it for NFS: if the reply to a successful
+    /// link is lost, the client retries and the retry returns `EEXIST` although the
+    /// link exists -- and it is *our own* link. The Windows twin goes through the
+    /// SMB redirector, which is the same class of risk with less documentation. A
+    /// caller that reads `EEXIST` as "nothing was made" would then unseal a part
+    /// that is a second name for a file it just delivered.
+    ///
+    /// So the port does **not** promise it, and the storage adapter does not assume
+    /// it: after a refusal it asks whether the requested name leads to the object it
+    /// holds, and reports "nobody can say" when it does. A security review found
+    /// this claim stated here as a contract and relied on as one.
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {

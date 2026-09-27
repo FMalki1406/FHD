@@ -295,7 +295,7 @@ impl TransferRepository for MemoryTransfers {
         &self,
         job: JobId,
         generation: Generation,
-    ) -> PortFuture<'_, Result<(), CommitError>> {
+    ) -> PortFuture<'_, Result<bool, CommitError>> {
         Box::pin(async move {
             if self.outage() {
                 return Err(CommitError::Unavailable);
@@ -305,9 +305,10 @@ impl TransferRepository for MemoryTransfers {
             if let Some((old, started, resolved)) = stored.attempts {
                 if old == generation && resolved.saturating_add(1) == started {
                     stored.attempts = Some((old, started, started));
+                    return Ok(true);
                 }
             }
-            Ok(())
+            Ok(false)
         })
     }
     fn unresolved_publish_attempt(
@@ -316,6 +317,13 @@ impl TransferRepository for MemoryTransfers {
         generation: Generation,
     ) -> PortFuture<'_, Result<bool, AppError>> {
         Box::pin(async move {
+            // The same injected outage its siblings honour. Without it the failure
+            // direction of every witness *read* was unreachable from a test using
+            // this double, which an engineering review pointed out -- and reads are
+            // where a wrong answer grants permission.
+            if self.outage() {
+                return Err(AppError::PersistenceUnavailable);
+            }
             Ok(self.jobs.lock().unwrap().get(&job).is_some_and(|s| {
                 s.attempts
                     .is_some_and(|(old, started, resolved)| old == generation && started > resolved)

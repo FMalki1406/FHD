@@ -487,6 +487,116 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
 /// together. This composes them: no mechanism, so publication refuses, and the
 /// part must still be writable after being reopened from disk -- which is where
 /// the seal lives.
+/// A link that was made and then reported as refused says "nobody can say".
+///
+/// **This is the NFS retry, and it is documented rather than hypothetical.**
+/// `link(2)` NOTES: if the reply to a successful link is lost, the client retries and
+/// the retry returns `EEXIST` -- for the caller's own link. SMB goes through the
+/// redirector and is the same class of risk. The parts directory lives inside the
+/// destination folder by design, so a destination on a share puts the linking call on
+/// the network path by construction.
+///
+/// The double reproduces exactly that shape: the real mechanism links, and then the
+/// call reports `Conflict`. No timing, no fake filesystem.
+///
+/// Two things must hold, and before this change neither did. The refusal must say
+/// `Unknown`, because `NoneCreated` is what permits a cleanup to remove the part --
+/// and the part is now a second name for a file the user has. And **the seal must
+/// stay on**: the ordinary refusal path lifts it so the job can be retried, and
+/// lifting it here would make the user's just-delivered file writable through the
+/// part. A security review found the "a failure creates nothing" claim stated as a
+/// contract in the platform port and relied on here.
+#[test]
+fn a_link_that_was_made_and_then_reported_refused_is_not_reported_as_making_nothing() {
+    struct LinkThenReportConflict;
+    impl HandleLinker for LinkThenReportConflict {
+        fn open_for_identity(&self, path: &Path) -> Result<Option<fs::File>, StorageError> {
+            open_identity_through_the_platform(path)
+        }
+        fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
+            objects_match(left, right)
+        }
+        fn link(
+            &self,
+            file: &fs::File,
+            folder: &fs::File,
+            name: &OsStr,
+        ) -> Result<(), StorageError> {
+            link_through_the_platform(file, folder, name)?;
+            // The reply was lost; the retry found the name taken -- by us.
+            Err(StorageError::Conflict)
+        }
+    }
+
+    let directory = Directory::new("publish-lost-reply");
+    let parts = directory.0.join("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let destination = directory.0.join("published.bin");
+
+    let store = FileStorage::default().with_linker(Arc::new(LinkThenReportConflict));
+    let mut part = store.create(&parts, spec(6)).unwrap();
+    part.write_at(0, b"AAAAAA").unwrap();
+    part.sync().unwrap();
+    let record = attested(part.as_mut());
+    part.verify(None, &record).unwrap();
+    part.adopt_destination(&destination).unwrap();
+
+    let refusal = part
+        .publish()
+        .expect_err("the linking call reported a refusal, so publication cannot report success");
+    assert!(
+        destination.exists(),
+        "the premise failed: the link was not made, so this measures nothing"
+    );
+    assert_eq!(
+        refusal.name(),
+        NameEvidence::Unknown,
+        "a refusal for a name that exists reported that nothing was made"
+    );
+    assert_eq!(
+        refusal.error(),
+        StorageError::Conflict,
+        "the linker's reason was replaced on the way out"
+    );
+    drop(part);
+
+    // Straight off the disk, so a failure here says whether the seal was lifted
+    // rather than whether reopening refuses for some other reason. 3 is
+    // `Sealed | Attempted`: sealed, and an attempt whose outcome was never recorded.
+    assert_eq!(
+        fs::read(parts.join("1-1.meta")).unwrap().get(33),
+        Some(&3u8),
+        "the seal was lifted on a part that is a second name for the user's file"
+    );
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"AAAAAA",
+        "the published bytes are not the ones that were proved"
+    );
+
+    // And the reopened part is refused for writing and for publishing, which is what
+    // the seal is for.
+    let mut again = store.open(&parts, spec(6)).unwrap();
+    assert_eq!(
+        again.publication(),
+        fhd_app::storage::Publication::Attempted,
+        "the reopened part does not say an attempt was begun"
+    );
+    assert_eq!(
+        again.write_at(0, b"Z").unwrap_err(),
+        StorageError::InvalidState,
+        "a part that may be the user's file was writable after reopening"
+    );
+    assert!(
+        refused({
+            again.adopt_destination(&destination).unwrap();
+            again.publish()
+        })
+        .is_err(),
+        "a part whose outcome nothing can decide was published again"
+    );
+}
+
 #[test]
 fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
     struct NoMechanism;

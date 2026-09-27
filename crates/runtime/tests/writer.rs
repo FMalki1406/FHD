@@ -1,4 +1,4 @@
-use fhd_app::storage::{PartSpec, SegmentFile, StorageError};
+use fhd_app::storage::{NameEvidence, PartSpec, SegmentFile, StorageError};
 use fhd_domain::{ByteRange, Generation, JobId};
 use fhd_runtime::{
     buffers::{BufferPool, MAX_BUFFER},
@@ -20,15 +20,18 @@ enum Operation {
     Write(u64, usize),
     Sync,
     Hash,
+    Publish,
     Discard,
     Drop,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
     Write,
     Sync,
     Panic,
+    /// `publish` refuses and cannot say whether it created a name.
+    PublishUnknown,
 }
 #[derive(Default)]
 struct Gate {
@@ -121,8 +124,14 @@ impl SegmentFile for FakeFile {
         Ok(())
     }
     fn publish(&mut self) -> Result<fhd_app::storage::Published, fhd_app::storage::PublishRefused> {
-        // This double has no destination and no linker, so nothing here reaches a
-        // call that could make a name.
+        self.observe(Operation::Publish);
+        if self.fault == Fault::PublishUnknown {
+            return Err(fhd_app::storage::PublishRefused::unknown(StorageError::Io(
+                std::io::ErrorKind::StorageFull,
+            )));
+        }
+        // Otherwise: this double has no destination and no linker, so nothing here
+        // reaches a call that could make a name.
         Err(fhd_app::storage::PublishRefused::none_created(
             StorageError::Unsupported,
         ))
@@ -462,4 +471,58 @@ async fn queued_adjacent_writes_coalesce_without_crossing_sync_barrier() {
     let bytes = data.lock().unwrap();
     assert_eq!(&bytes[..expected.len()], expected.as_slice());
     assert!(bytes[expected.len()..].iter().all(|byte| *byte == 0));
+}
+
+/// A lane that could not say whether it linked goes on not saying so.
+///
+/// **The one answer a broken lane must not give is "nothing was created".** A
+/// publication that cannot report its outcome poisons the lane, and every later
+/// command on it is refused with that poison. If the refusal claimed no name was
+/// made, the engine would be authorised to remove a part that may be a second name
+/// for the user's file -- on the strength of a command that never ran.
+///
+/// So the lane remembers, and this measures the remembering rather than trusting the
+/// comment. An engineering review pointed out that the memory had no test and, in
+/// today's coordinator, no reachable caller either: a session ends after a failed
+/// publication, so nothing publishes twice on one lane. It is kept because the
+/// alternative is a default that is wrong, and it is measured here because an
+/// unreachable branch with no test is how a later caller inherits a defect.
+#[tokio::test]
+async fn a_lane_poisoned_by_an_unanswerable_publication_keeps_saying_it_cannot_say() {
+    let (file, log) = fixture(Fault::PublishUnknown);
+    let writer = Writer::start(Box::new(file), 1).unwrap();
+    let cancel = CancellationToken::new();
+
+    let first = writer
+        .publish(&cancel)
+        .await
+        .expect_err("the double refuses every publication");
+    assert_eq!(
+        first.name(),
+        NameEvidence::Unknown,
+        "the lane replaced the file's answer about the name"
+    );
+
+    // The same lane again. This command never reaches the file -- the lane is
+    // poisoned -- and the honest answer about the name is still "nobody can say".
+    let second = writer
+        .publish(&cancel)
+        .await
+        .expect_err("a poisoned lane accepted a publication");
+    assert_eq!(
+        second.name(),
+        NameEvidence::Unknown,
+        "a poisoned lane reported that no name was created, which permits removing a          part that may be the user's file"
+    );
+
+    // And the premise: the second command really did not reach the file.
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.0 == Operation::Publish)
+            .count(),
+        1,
+        "the second command reached the file, so the poisoned arm was not measured"
+    );
 }

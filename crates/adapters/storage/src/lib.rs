@@ -902,6 +902,46 @@ impl SegmentFile for FilePart {
             .map_err(PublishRefused::none_created)?;
         let linked = linker.link(&self.file, &folder, leaf.as_os_str());
         if let Err(error) = linked {
+            // **"The call refused" is not by itself "no entry exists".**
+            //
+            // On a local filesystem it is: the link is one system call. Over NFS it
+            // is not -- `link(2)` NOTES records that a client retry after a lost
+            // reply returns `EEXIST` although the link was made, and the link is
+            // ours. SMB is the same class. And the parts directory lives inside the
+            // destination folder by design, so a destination on a share puts this
+            // call on the network path by construction.
+            //
+            // What that would have cost: the unwind below lifts the seal, and the
+            // seal is the only thing stopping a reopened part from writing to the
+            // inode the published file is a link to. So a lost reply on a share
+            // would have made the user's just-delivered file writable again, and
+            // then let a cancel remove the evidence that any of it happened. A
+            // security review found the claim stated as a contract in the platform
+            // port and relied on here.
+            //
+            // So the name is asked about, through the same non-blocking port the
+            // location check uses. Only a positive identification changes the
+            // answer: the name leads to the object being published, therefore the
+            // link happened and this refusal is a report of something else.
+            let ours = match linker.open_for_identity(&destination) {
+                // Nothing there, or not a regular file. Also the case where the
+                // folder was renamed and the path no longer reaches it -- an entry
+                // could exist inside the adopted folder and be invisible here, which
+                // is the residual `NameEvidence::NoneCreated` names and does not
+                // close.
+                Ok(None) => false,
+                Ok(Some(found)) => linker.same_object(&self.file, &found).unwrap_or(false),
+                Err(_) => false,
+            };
+            if ours {
+                // The part is a second name for a file the user now has. **The seal
+                // stays on**, because lifting it is what would make that file
+                // writable, and the record stays at `Attempted`, which is what it
+                // is: an attempt whose outcome this run cannot report. The engine
+                // keeps the part and the next run reconciles against the
+                // destination, where the bytes and their digest settle it.
+                return Err(PublishRefused::unknown(error));
+            }
             // The linker returned, so the attempt is over and its answer is
             // known: no file was made. That is the state a retry can act on,
             // and it is written before anything else unwinds.

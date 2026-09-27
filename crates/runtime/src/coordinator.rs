@@ -170,6 +170,34 @@ async fn step(
     job: &mut Job,
     command: JobCommand,
 ) -> Result<(), RunError> {
+    // **A part that may already be the user's file is not replaced, and that does not
+    // depend on which reason the job is resting on.**
+    //
+    // The domain refuses this command for `Unconfirmed`, and every path that leaves an
+    // attempt unanswered does come to rest on `Unconfirmed` -- a security review
+    // checked each producer and so did I. But that is two records agreeing, not one
+    // rule: a new `RequireAction` reason that forgets to join the list, or a
+    // reordering that records the reason before the witness, reopens it with no test
+    // failing. The review said exactly that, and it is the kind of coupling this
+    // project has been caught by before.
+    //
+    // What makes it a rule is asking the witness itself, here, where every caller of
+    // every command passes. A new generation is a new part **and the witness row goes
+    // with it**, so a replacement would erase the doubt together with the only record
+    // of it -- and then nothing stands between the old part and removal.
+    //
+    // A repository that cannot answer refuses the replacement. Not being able to ask
+    // whether a part may be the user's file is not permission to start over it.
+    if command == JobCommand::ReplaceRepresentation
+        && repository
+            .unresolved_publish_attempt(job.id(), job.generation())
+            .await
+            .unwrap_or(true)
+    {
+        // The same answer the domain gives for `Unconfirmed`, so no caller needs a
+        // new case: this command is not available for this job.
+        return Err(RunError::Domain(DomainError::InvalidTransition));
+    }
     for event in job.decide(command).map_err(RunError::Domain)? {
         repository
             .commit_transition(event.clone())
@@ -746,6 +774,22 @@ impl Session<'_> {
     }
 
     /// Creates the part, or reopens it and re-proves every durable extent by digest.
+    /// Comes to rest on the reason that says a publication may have happened and
+    /// nothing can say whether it did.
+    ///
+    /// Shared by the two places that reach it, because they must agree: one asks
+    /// before the part is opened, the other after the part's own record is read.
+    async fn stop_unconfirmed(&mut self) -> Result<(), RunError> {
+        let command = JobCommand::RequireAction {
+            reason: StopReason::Unconfirmed,
+        };
+        if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {
+            self.step(command).await
+        } else {
+            self.stop_with(command).await
+        }
+    }
+
     async fn open_part(&mut self) -> Result<(), RunError> {
         let (total, _) = self
             .job
@@ -778,6 +822,30 @@ impl Session<'_> {
             .destinations
             .resolve(self.job.spec().destination())
             .map_err(|_| RunError::Repository)?;
+        // **The durable witness is asked before the part is opened at all**, and a
+        // failure to read it stops the job rather than failing the session.
+        //
+        // Two findings put it here rather than after the open, and an independent
+        // engineering review found both.
+        //
+        // *Opening rewrites the other witness.* A part found `Sealed` is unsealed by
+        // `open_inner`, which writes the publication byte and syncs it. So a byte
+        // corrupted from 3 to 1 -- also a legal value -- would be overwritten with 0
+        // by the act of opening, and the part-local evidence destroyed before
+        // anything consulted the record. Two independent witnesses that can be
+        // reduced to one by opening the file are one witness.
+        //
+        // *And `?` here was a way to strand a job.* Propagating
+        // `RunError::Repository` out of a session leaves the job durably
+        // `Transferring`, `Verifying` or `Publishing` with no session and no
+        // operator command able to move it -- the domain refuses `Pause` and
+        // `Cancel` while publishing -- until the daemon restarts. One busy database,
+        // on every job start, for a question whose conservative answer already
+        // exists. Every other site treats "cannot ask" as "assume the worst", and
+        // now so does this one.
+        if self.delivery_unresolved().await.unwrap_or(true) {
+            return self.stop_unconfirmed().await;
+        }
         // The publication state is read first, and carried out even when what
         // follows fails.
         //
@@ -850,7 +918,7 @@ impl Session<'_> {
             StorageError::Integrity => StopReason::Integrity,
             _ => StopReason::Storage,
         });
-        let by_part = match found {
+        let unknown = match found {
             Some(state) => matches!(state, Publication::Attempted | Publication::Linked),
             // No state was read. The job record is consulted only where the
             // reason would otherwise be answered by **fetching the file again**,
@@ -864,27 +932,21 @@ impl Session<'_> {
             // is never replaced, so it needs no second witness; asking anyway
             // only moved resumable jobs into a state with no way out.
             //
-            // Asked here rather than for every open, because `dyn SegmentFile`
-            // is not `Sync` and cannot be held across an await -- and because a
-            // record read is not free.
+            // Asked here rather than for every open because a record read is not
+            // free. An earlier version of this comment also said `dyn SegmentFile`
+            // "is not `Sync` and cannot be held across an await", which is false:
+            // `SegmentFile: Send`, and the await below holds `opened` across it and
+            // compiles. An engineering review pointed out that a comment this much
+            // of the design rests on has to be exact. Cost is the whole reason.
             None => {
                 refusal.is_some_and(|reason| reason.needs_new_representation())
                     && self.may_be_published().await?
             }
         };
-        // **And the part's own byte is not the only witness.**
-        //
-        // A part record whose publication byte was corrupted from 3 to 0 reads
-        // `Open`, which is a legal value, so `by_part` says nothing was ever begun
-        // and this open would go on to make the part writable -- and the part may be
-        // a hard link to a file the user already has, which writing to it would
-        // change. The durable witness is in the job record rather than beside the
-        // download, it is not derived from that byte, and it is asked here for
-        // exactly the case where the byte cannot be believed.
-        //
-        // Asked on every open, unlike `may_be_published`: one query when a session
-        // opens its part, against a file the engine may be about to write.
-        let unknown = by_part || self.delivery_unresolved().await?;
+        // The durable witness has already spoken, above, before this part was
+        // opened: reaching here means it said there was nothing outstanding, so what
+        // is left to decide is what the part's own record says. A byte corrupted to
+        // `Open` gets past *this* question and is stopped by that one.
         let file = match opened {
             // A part this run found part-way through publication, or one whose
             // record cannot be read while the job record says a publication was
@@ -908,15 +970,7 @@ impl Session<'_> {
                             .for_job(self.job.id().get(), self.job.generation().get()),
                     );
                 }
-                let command = JobCommand::RequireAction {
-                    reason: StopReason::Unconfirmed,
-                };
-                if matches!(self.job.state(), JobState::Verifying | JobState::Publishing) {
-                    self.step(command).await?;
-                } else {
-                    self.stop_with(command).await?;
-                }
-                return Ok(());
+                return self.stop_unconfirmed().await;
             }
             Ok(file) => file,
             Err(_) => {
@@ -1501,7 +1555,12 @@ impl Session<'_> {
         // file at the requested path is not evidence of non-delivery: the folder can
         // have been renamed after the file was put in it, which is what
         // `Unconfirmed` exists to say.
-        if self.delivery_unresolved().await? {
+        //
+        // A read that fails is a doubt, not a failed session: `?` here left the job
+        // durably `Publishing` with nothing able to move it, which an engineering
+        // review traced and which the line 40 below already gets right for the
+        // witness's other operation.
+        if self.delivery_unresolved().await.unwrap_or(true) {
             return self.publish_blocked(StopReason::Unconfirmed).await;
         }
         // A handle opened in this session never verified these bytes; a handle
@@ -1567,22 +1626,55 @@ impl Session<'_> {
                 // being returned, because publication records a state, syncs the
                 // file and syncs the folder *after* the link returns, and a failure
                 // in any of those is an error for a name that exists.
-                if failed.name() == NameEvidence::NoneCreated {
-                    if let Err(error) = self
-                        .c
-                        .ports
-                        .repository
-                        .resolve_publish_attempt(self.job.id(), self.job.generation())
-                        .await
-                    {
-                        // The answer was reached and could not be saved, so the
-                        // record goes on saying an attempt is unanswered. That is
-                        // the conservative side and it is the correct one: nothing
-                        // may act on an answer only this process ever knew, and this
-                        // process is about to stop.
-                        let _ = error;
-                        report(&self.job, Code::StorageFailed, 0, Duration::ZERO);
+                // Whether the record now accounts for every attempt begun. Until it
+                // does, the job must rest on the reason that says a publication may
+                // have happened -- not on the reason this refusal would suggest.
+                let settled = if failed.name() == NameEvidence::NoneCreated {
+                    // **Retried, like every other write on this path.** One busy
+                    // database would otherwise make an ordinary refusal permanent:
+                    // the doubt stands for ever, the part is kept for ever, and the
+                    // two ways out are both closed -- reconciliation cannot succeed
+                    // because nothing was linked, and a replacement is refused while
+                    // a doubt stands. An engineering review traced that, and
+                    // the extent commit twenty lines up already does this.
+                    //
+                    // Safe to repeat: the statement advances the count only from one
+                    // below the number begun to that number, so a retry after an
+                    // ambiguous failure either does the same thing or nothing.
+                    let mut attempt = 0;
+                    loop {
+                        match self
+                            .c
+                            .ports
+                            .repository
+                            .resolve_publish_attempt(self.job.id(), self.job.generation())
+                            .await
+                        {
+                            Ok(settled) => break settled,
+                            Err(CommitError::Unavailable) if attempt < 2 => {
+                                attempt += 1;
+                                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                            }
+                            Err(_) => {
+                                // The answer was reached and could not be saved, so
+                                // the record goes on saying an attempt is unanswered.
+                                // That is the conservative side and the correct one:
+                                // nothing may act on an answer only this process ever
+                                // knew, and this process is about to stop.
+                                report(&self.job, Code::StorageFailed, 0, Duration::ZERO);
+                                break false;
+                            }
+                        }
                     }
+                } else {
+                    false
+                };
+                if !settled {
+                    // The record holds a doubt, whatever this attempt's answer was.
+                    // Reporting the destination or the disk here would send an
+                    // operator to fix something and come back to a job that still
+                    // refuses to move, which is the state this reason exists to name.
+                    return self.publish_blocked(StopReason::Unconfirmed).await;
                 }
                 match (failed.name(), failed.error()) {
                     // Nobody can say whether a name was made. Not a storage failure
@@ -1637,12 +1729,28 @@ impl Session<'_> {
         // A repository that cannot answer keeps the part: not being able to ask
         // whether a file may already be the user's is not permission to remove the
         // evidence that it might be.
-        if why == PartCleanup::Unknown && self.delivery_unresolved().await.unwrap_or(true) {
-            emit(
-                Event::new(Code::PartRetained)
-                    .for_job(self.job.id().get(), self.job.generation().get()),
-            );
-            return;
+        if why == PartCleanup::Unknown {
+            let keep = match self.delivery_unresolved().await {
+                Ok(unresolved) => unresolved,
+                // Both facts, as `drop_part` tells them: otherwise an operator
+                // cannot tell "kept because the answer was yes" from "kept because
+                // nobody answered", which is the difference between a part to
+                // investigate and a database to fix.
+                Err(_) => {
+                    emit(
+                        Event::new(Code::StorageFailed)
+                            .for_job(self.job.id().get(), self.job.generation().get()),
+                    );
+                    true
+                }
+            };
+            if keep {
+                emit(
+                    Event::new(Code::PartRetained)
+                        .for_job(self.job.id().get(), self.job.generation().get()),
+                );
+                return;
+            }
         }
         // The lane owns the file while it lives, so it must do the releasing;
         // only a session without one falls back to a standalone handle.
