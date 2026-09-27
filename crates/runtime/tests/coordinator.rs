@@ -860,3 +860,96 @@ async fn a_job_left_at_cancelling_is_finished_rather_than_called_done() {
         "the record still says Cancelling after the command was confirmed"
     );
 }
+
+/// **The retry after a failed save goes through the domain, so a published file is
+/// safe from it.**
+///
+/// `confirm_command` does not only read the record: where the record does not
+/// already show the command taken, it **applies it again**. A review corrected the
+/// claim that this path merely re-reads, and that correction raises the question
+/// this test answers -- if a cancel is retried, what stops it acting on a job whose
+/// file the user already has?
+///
+/// The domain does. `Completed` has no `Cancel` arm and `Publishing` answers
+/// `PublishInProgress`, and the refusal propagates before any part is opened. So
+/// the retry is refused, the job stays `Completed`, the published bytes are
+/// untouched, and the caller is told the honest thing rather than `Done`.
+#[tokio::test]
+async fn a_retried_cancel_after_publication_is_refused_and_touches_no_published_file() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
+    );
+    assert_eq!(rig.job().await.state(), JobState::Completed);
+
+    // Asked twice, which is what the failed-save path does: once to try, once to
+    // confirm. Both must refuse.
+    for attempt in 1..=2 {
+        let refused = rig
+            .coordinator
+            .confirm_command(rig.id, JobCommand::Cancel)
+            .await;
+        assert!(
+            refused.is_err(),
+            "attempt {attempt}: a retried cancel was accepted for a job whose file \
+             the user already has: {refused:?}"
+        );
+        assert_eq!(
+            rig.job().await.state(),
+            JobState::Completed,
+            "attempt {attempt}: a refused cancel moved a completed job"
+        );
+        assert_eq!(
+            rig.store.published(&rig.destination).unwrap(),
+            content,
+            "attempt {attempt}: a refused cancel disturbed the published file"
+        );
+    }
+}
+
+/// **A record that cannot be read is reported as unknown, not as a refusal.**
+///
+/// The other half of the failed-save path. When the retry cannot read the record
+/// either, nothing is known about what became of the command -- and saying `No`
+/// would render as `ENGINE-INVALID-INPUT`, telling the operator their input was
+/// wrong about a command that may well have taken effect.
+///
+/// `confirm_command` returns an error, which the scheduler turns into a dropped
+/// reply and the IPC layer into unknown. Asserted here at the seam: an error, and
+/// a record that did not move.
+#[tokio::test]
+async fn a_record_that_cannot_be_read_is_an_error_rather_than_a_refusal() {
+    let content = body(15_000);
+    let rig = rig(&content, true, None);
+    rig.transport
+        .fail_probe(fhd_app::transport::TransportError::UserAction(
+            StopReason::Authentication,
+        ));
+    let outcome = rig.run().await;
+    assert!(
+        matches!(outcome, Ok(SessionEnd::Settled(JobState::NeedsAction))),
+        "the job did not come to rest where this test needs it: {outcome:?}"
+    );
+
+    // The next repository operation fails, which is the read `confirm_command`
+    // starts with.
+    rig.repo.fail_next(1);
+    let answered = rig
+        .coordinator
+        .confirm_command(rig.id, JobCommand::Cancel)
+        .await;
+    assert!(
+        answered.is_err(),
+        "a record that could not be read was reported as a definite answer: {answered:?}"
+    );
+    // And nothing moved on the strength of a read that failed.
+    assert_eq!(
+        rig.job().await.state(),
+        JobState::NeedsAction,
+        "the job moved although the record could not be read"
+    );
+}

@@ -258,6 +258,32 @@ impl Coordinator {
         let Some((total, _)) = job.plan() else {
             return;
         };
+        // **The publish intent cannot decide this, and the reason is worth keeping.**
+        //
+        // The guard below reads the part's own state byte. A corrupted byte -- 3
+        // (`Sealed | Attempted`) flipping to 0 (`Open`) is still a legal value, so
+        // the part opens and the guard reads "nothing was begun" -- would let a
+        // cancel remove a part that may be a second name for a delivered file. That
+        // destroys the local evidence for recovery. It does not remove the user's
+        // file: a hard link means the destination name survives either way.
+        //
+        // The obvious answer is to consult the saved publish intent, the way
+        // `Session::may_be_published` does, and that was tried. **It does not work,
+        // because the intent is not cleared when publication is definitively
+        // refused** -- only on `PublishCommitted` or a generation replacement. So an
+        // intent is present both when the outcome is unknown *and* when the linker
+        // reported that no name was created, and the two cannot be told apart by it.
+        // Keeping the part whenever an intent exists therefore leaks one after every
+        // ordinary refusal, which
+        // `a_stopped_job_can_be_cancelled_and_an_unknown_one_is_refused` measures:
+        // "a cancelled job left parts behind".
+        //
+        // Closing this needs the intent dropped when a refusal is definite, so that
+        // its presence means "unknown" -- a change to the durable record and to both
+        // repository implementations -- or an integrity check over the part record,
+        // which is already recorded as an open item. Neither is done here, and the
+        // risk to recovery evidence stays open in `docs/execution-status.md` rather
+        // than being papered over with a guard that leaks.
         let Ok(spec) = PartSpec::new(job.id(), job.generation(), total) else {
             return;
         };

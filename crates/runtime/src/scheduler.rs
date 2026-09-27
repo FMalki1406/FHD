@@ -223,7 +223,8 @@ impl Scheduler {
         let mut open = true;
         let mut stopping = false;
         loop {
-            self.deliver(&mut deferred, &mut awaiting, &active).await;
+            self.deliver(&mut deferred, &mut awaiting, &active, &mut queue)
+                .await;
             let mut started = false;
             if !stopping {
                 self.promote_due(&mut queue).await;
@@ -479,6 +480,7 @@ impl Scheduler {
         deferred: &mut Deferred,
         awaiting: &mut Awaiting,
         active: &HashMap<JobId, Active>,
+        queue: &mut Queue,
     ) {
         for _ in 0..deferred.len() {
             let Some((id, control, reply)) = deferred.pop_front() else {
@@ -501,8 +503,38 @@ impl Scheduler {
                         Control::Cancel => JobCommand::Cancel,
                     };
                     match self.coordinator.command_resting(id, command).await {
-                        Ok(Some(job)) if reached(&job, command) => answer(reply, Applied::Yes),
-                        Ok(_) => {
+                        Ok(Some(job)) => {
+                            let applied = if reached(&job, command) {
+                                Applied::Yes
+                            } else {
+                                emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                                Applied::No
+                            };
+                            // **The queue's copy is now stale, wherever it sits.**
+                            // When the session ended, the run loop put the job it
+                            // returned back in the queue; this call has since moved
+                            // the record.
+                            //
+                            // In `ready` or `waiting` that copy is admitted and runs
+                            // again, for a job the record may call `Cancelled` and
+                            // whose part is gone. In `done` it is worse in a quieter
+                            // way: it is the value `run` hands back, so the caller is
+                            // told the cancel succeeded while the run reports the job
+                            // resting at `NeedsAction`. The first version of this fix
+                            // covered only the first two.
+                            //
+                            // So a stale copy is dropped from either place and the
+                            // authoritative one enqueued, which `take` routes to
+                            // `done` for a terminal state and to `ready` otherwise.
+                            // If the queue held no copy at all, none is added: the job
+                            // was not this pass's to report.
+                            let held = queue.remove(id).is_some() || queue.drop_settled(id);
+                            if held {
+                                self.enqueue(queue, job);
+                            }
+                            answer(reply, applied);
+                        }
+                        Ok(None) => {
                             emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
                             answer(reply, Applied::No);
                         }
@@ -574,8 +606,26 @@ impl Scheduler {
             match self.coordinator.command_resting(id, command).await {
                 // No such job, or a command its state refuses: now the report is
                 // true rather than a description of this scheduler's bookkeeping.
-                Ok(Some(job)) if reached(&job, command) => answer(reply, Applied::Yes),
-                Ok(_) => {
+                Ok(Some(job)) => {
+                    let applied = if reached(&job, command) {
+                        Applied::Yes
+                    } else {
+                        emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                        Applied::No
+                    };
+                    // **The same staleness as in `deliver`, on the path that is far
+                    // easier to reach.** A command for a job whose session already
+                    // settled arrives here, and `take` has parked that session's copy
+                    // in `done` as the value `run` will hand back. `queue.remove` does
+                    // not look there, so the record moved to `Cancelled`, the caller
+                    // was told so, and `run` still reported `NeedsAction`. The reviews
+                    // found it in `deliver`; it was here too.
+                    if queue.drop_settled(id) {
+                        self.enqueue(queue, job);
+                    }
+                    answer(reply, applied);
+                }
+                Ok(None) => {
                     emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
                     answer(reply, Applied::No);
                 }
@@ -616,8 +666,42 @@ impl Scheduler {
                 // reply is dropped rather than guessed at.
                 Err((id, error)) => queue.done.push(Outcome::failed(id, error)),
             },
+            // **A save that failed is not a command that was refused.**
+            // `coordinator::command` can fail *after* a transition was committed --
+            // a commit that succeeded and could not be confirmed, or a second step
+            // in the same command that did not land. Reporting `No` turned that
+            // into `ENGINE-INVALID-INPUT`: "your input was wrong" for a command
+            // whose outcome nobody knows.
+            //
+            // So `confirm_command` is asked -- and **it does more than read.** A
+            // review corrected this comment, which used to say "the record is read
+            // again": `confirm_command` reloads the job, and where the record does
+            // *not* already show the command taken, it **applies it again** through
+            // `command_resting`. So a failed first commit is retried here, which is
+            // what makes the answer true rather than merely informed.
+            //
+            // That retry is safe in the direction that matters. It goes through the
+            // domain, so a job whose file is already published refuses the cancel --
+            // `Completed` has no `Cancel` arm and `Publishing` answers
+            // `PublishInProgress` -- and the refusal propagates before any part is
+            // opened. Nothing of the user's is touched by the second attempt.
+            //
+            // If the job reached where the command was taking it, that is reported.
+            // If it did not, the answer is `No` on evidence rather than on the
+            // failure of a write. And if the record cannot be read or the retry
+            // cannot commit either, the reply is dropped, which the IPC layer
+            // reports as unknown.
             Err(error) => {
-                answer(reply, Applied::No);
+                match self.coordinator.confirm_command(id, command).await {
+                    Ok(Some(job)) if reached(&job, command) => {
+                        answer(reply, Applied::Yes);
+                    }
+                    Ok(_) => {
+                        emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1));
+                        answer(reply, Applied::No);
+                    }
+                    Err(_) => emit(Event::new(Code::CommandIgnored).for_job(id.get(), 1)),
+                }
                 queue.done.push(Outcome::failed(id, error));
             }
         }
@@ -664,6 +748,24 @@ impl Queue {
             _ => self.done.push(Outcome::settled(entry.job)),
         }
     }
+    /// Drops a **settled** outcome for this job, saying whether there was one.
+    ///
+    /// `take` parks a job that rests -- `NeedsAction`, `Paused`, `Cancelled` -- in
+    /// `done` as the value `run` will hand back. So a command resolved after that
+    /// point leaves a stale answer there, and the first version of this fix looked
+    /// only in `ready` and `waiting`: the record said `Cancelled`, the caller was
+    /// told so, and `run` still reported `NeedsAction`. Two reviews caught it.
+    ///
+    /// A **failed** outcome is left alone. Its `result` is an error this pass
+    /// genuinely produced, and replacing it would turn a reported failure into a
+    /// tidy answer that nothing observed.
+    fn drop_settled(&mut self, id: JobId) -> bool {
+        let before = self.done.len();
+        self.done
+            .retain(|outcome| outcome.id != id || outcome.result.is_some());
+        before != self.done.len()
+    }
+
     fn remove(&mut self, id: JobId) -> Option<Entry> {
         for queue in [&mut self.ready, &mut self.waiting] {
             if let Some(at) = queue.iter().position(|entry| entry.job.id() == id) {
