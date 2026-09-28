@@ -51,11 +51,18 @@ jobs:
         run: cargo +1.98.1 fmt --all -- --check
       # Both gates and both of their test suites. Running a gate without its own
       # tests is how an approved allowance once broke the build for everyone.
+      #
+      # The local verification tool's tests run here as well. It is not a gate -- it
+      # is what a developer runs before pushing -- but its defects are the same class
+      # as a gate's: the first version reported a step that never ran as having
+      # passed, because it read an exit code the step had not set. Something that
+      # decides whether a change is ready has to be tested where the decision is read.
       - name: Enforce architecture boundaries
         run: |
           node tools/check-architecture.test.mjs
           node tools/check-architecture.mjs
           node tools/check-contract-tests.test.mjs
+          node tools/verify.test.mjs
       - name: Check Rust warnings
         run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
       # Split by area on purpose: a job's step names and their results are

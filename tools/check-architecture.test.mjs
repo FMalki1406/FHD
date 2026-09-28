@@ -392,6 +392,67 @@ test('an item is read as one line however its signature is wrapped', () => {
   );
 });
 
+/// An unapproved item on the attribute's own line is reported.
+///
+/// **This one walked through, and an independent review reproduced the pass.** The
+/// scan for the item started on the line *after* the attribute, so
+/// `#[allow(unsafe_code)] pub fn whatever() {` had its item read from the line below
+/// -- and where that line happened to hold an approved signature, the allowance was
+/// matched, the list came out fully accounted for, and the function actually carrying
+/// `unsafe` was never examined. One line of formatting, no offence reported.
+///
+/// The approved spelling on one line has to keep working, or the gate would be
+/// refusing legitimate code to close this; both directions are asserted.
+test('an item written on the attribute\'s own line is the item that is checked', () => {
+  const platform = 'crates/adapters/platform/src/lib.rs';
+  const approved = 'fn our_uid() -> u32 {';
+
+  // The bypass: unapproved on the attribute's line, approved on the next.
+  const slipped = [
+    '    #[allow(unsafe_code)] pub fn slipped_through(path: &Path) -> io::Result<()> {',
+    `    ${approved}`,
+  ].join('\n');
+  const offenders = unsafeOffendersIn(platform, slipped);
+  assert.equal(offenders.length, 1, JSON.stringify(offenders));
+  assert.match(offenders[0], /slipped_through/u);
+  assert.doesNotMatch(
+    offenders[0],
+    /our_uid/u,
+    'the item below was read instead of the one the attribute sits on',
+  );
+
+  // The same with further attributes between the two on that line.
+  const behind = [
+    '    #[allow(unsafe_code)] #[cfg(unix)] pub fn also_slipped() -> u32 {',
+    `    ${approved}`,
+  ].join('\n');
+  assert.match(unsafeOffendersIn(platform, behind)[0], /also_slipped/u);
+
+  // And an approved item on the attribute's own line is accepted.
+  assert.deepEqual(unsafeOffendersIn(platform, `    #[allow(unsafe_code)] ${approved}`), []);
+
+  // A comment after the attribute is not an item, so the scan goes on to the next
+  // line, which is the behaviour that was always there.
+  assert.deepEqual(
+    unsafeOffendersIn(platform, ['    #[allow(unsafe_code)] // why this is sound', `    ${approved}`].join('\n')),
+    [],
+  );
+
+  // A signature that begins on the attribute's line and wraps onto the next is read
+  // whole, so it is pinned by its parameters like any other.
+  const wrapped = [
+    '    #[allow(unsafe_code)] pub fn slipped_wrapped(',
+    '        path: &Path,',
+    '    ) -> io::Result<()> {',
+  ].join('\n');
+  assert.match(
+    unsafeOffendersIn(platform, wrapped)[0],
+    /pub fn slipped_wrapped\(path: &Path\) -> io::Result<\(\)> \{/u,
+    'a signature that begins on the attribute line and wraps onto the next was not \
+     read whole, so it could not be pinned by its parameters',
+  );
+});
+
 test('a restriction is the policy, not a breach of it', () => {
   const clean = 'crates/adapters/storage/src/lib.rs';
   for (const restriction of [

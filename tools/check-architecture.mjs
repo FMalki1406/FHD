@@ -116,15 +116,31 @@ export const UNSAFE_ALLOWANCES = new Map([
 // space between tokens, no padding just inside the brackets, and no trailing comma
 // before the closing one. An entry therefore says the same thing whether the file has
 // the signature on one line or five.
-export function itemBelow(lines, from) {
+export function itemBelow(lines, from, rest = '') {
+  const head = [];
+  // **What follows the attribute on its own line is part of the item.**
+  //
+  // This is where an unapproved function used to walk through. The scan began on
+  // the *next* line, so `#[allow(unsafe_code)] pub fn whatever() {` had its item
+  // read from the line below -- and where that line held an approved signature,
+  // the allowance was matched and the function that actually carried it was never
+  // examined. An independent review reproduced the pass with no offence reported.
+  // Leading attributes on the same line are stepped over the same way they are on
+  // lines of their own.
+  const sameLine = pastAttributes(rest);
+  if (sameLine) {
+    head.push(sameLine);
+    if (sameLine.endsWith('{') || sameLine.endsWith(';')) {
+      return normalizeItem(head.join(' '));
+    }
+  }
   let index = from + 1;
   for (; index < lines.length; index += 1) {
     const line = lines[index].trim();
     if (!line || line.startsWith('//') || line.startsWith('#[') || line.startsWith('#![')) continue;
     break;
   }
-  if (index >= lines.length) return '<end of file>';
-  const head = [];
+  if (index >= lines.length) return head.length ? normalizeItem(head.join(' ')) : '<end of file>';
   // Twenty lines is far more than any signature in this tree and stops a file
   // without a terminator from being read to its end.
   for (let scan = index; scan < lines.length && scan < index + 20; scan += 1) {
@@ -133,6 +149,21 @@ export function itemBelow(lines, from) {
     if (line.endsWith('{') || line.endsWith(';')) break;
   }
   return normalizeItem(head.join(' '));
+}
+
+/// `text` past any attributes it begins with, and past comments, or `''` if there is
+/// nothing else on it.
+///
+/// Used for the remainder of an attribute's own line: `#[allow(unsafe_code)]` can be
+/// followed by `#[cfg(unix)] pub fn x() {`, and the item is what comes after both.
+export function pastAttributes(text) {
+  let rest = withoutComments(text).replace(/\r$/u, '').trimStart();
+  while (rest.startsWith('#[') || rest.startsWith('#![')) {
+    const [found] = attributesIn(rest);
+    if (!found || !rest.startsWith(found.text)) break;
+    rest = rest.slice(found.after).trimStart();
+  }
+  return rest.trim();
 }
 
 /// One line, spaced the way a signature is written rather than the way it is wrapped.
@@ -623,7 +654,11 @@ export function unsafeOffendersIn(relative, text) {
       );
       continue;
     }
-    const item = itemBelow(lines, attribute.line - 1);
+    // The line the attribute *ends* on, which is not its first where it wraps, and
+    // whatever is left on that line after the closing bracket.
+    const endLine = text.slice(0, attribute.after).split('\n').length;
+    const rest = text.slice(attribute.after).split('\n', 1)[0];
+    const item = itemBelow(lines, endLine - 1, rest);
     const at = remaining.indexOf(item);
     if (at === -1) {
       offenders.push(
