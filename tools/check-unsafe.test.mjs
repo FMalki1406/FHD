@@ -4,8 +4,10 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { APPROVED, auditFile, findings, INHERITED, itemBelow, sitesFrom, targetsFrom, unaudited }
-  from './check-unsafe.mjs';
+import {
+  APPROVED, auditFailed, auditFile, findings, itemBelow, resolveCargo, sitesFrom, targetsFrom,
+  unaudited,
+} from './check-unsafe.mjs';
 
 /// The compiler these tests put their samples to.
 ///
@@ -157,37 +159,40 @@ test('diagnostics are read from rustc and from cargo, and nothing else is', () =
 /// The comparison, without a compiler: what is approved, for which platform.
 test('an allowance is approved per platform, and a missing one is reported', () => {
   const file = 'crates/adapters/platform/src/lib.rs';
-  const approved = new Map([[file, [
-    { item: 'fn windows_only() {', platforms: ['win32'] },
-    { item: 'fn mac_only() {', platforms: ['darwin'] },
-  ]]]);
+  const approved = new Map([[file, {
+    allowances: [
+      { item: 'fn windows_only() {', platforms: ['win32'] },
+      { item: 'fn mac_only() {', platforms: ['darwin'] },
+    ],
+    uses: { win32: 0, linux: 0, darwin: 0 },
+  }]]);
   const site = (line) => ({ kind: 'allowance', file, line, text: '#[allow(unsafe_code)]' });
   const name = (_, line) => (line === 1 ? 'fn windows_only() {' : 'fn mac_only() {');
-  const inherited = new Map();
 
   // On Windows the Windows one is expected and the macOS one is not compiled.
-  assert.deepEqual(
-    findings({ sites: [site(1)], approved, inherited, platform: 'win32', name }),
-    [],
-  );
+  assert.deepEqual(findings({ sites: [site(1)], approved, platform: 'win32', name }), []);
   // The same allowance on a platform it is not approved for is a finding.
-  const wrong = findings({ sites: [site(1)], approved, inherited, platform: 'darwin', name });
+  const wrong = findings({ sites: [site(1)], approved, platform: 'darwin', name });
   assert.equal(wrong.length, 2, JSON.stringify(wrong));
   assert.match(wrong[0], /not approved for darwin/u);
   assert.match(wrong[1], /not present on darwin: fn mac_only/u);
 
   // An approved entry the compiler did not report is a finding: the list is a
   // description of the tree, not a wish.
-  const absent = findings({ sites: [], approved, inherited, platform: 'win32', name });
+  const absent = findings({ sites: [], approved, platform: 'win32', name });
   assert.equal(absent.length, 1, JSON.stringify(absent));
   assert.match(absent[0], /not present on win32: fn windows_only/u);
 
   // A module-wide allowance is never approved, whatever item it sits above.
   const inner = findings({
     sites: [{ kind: 'allowance', file, line: 1, text: '#![allow(unsafe_code)]' }],
-    approved, inherited, platform: 'win32', name,
+    approved, platform: 'win32', name,
   });
   assert.match(inner[0], /crate- or module-wide/u);
+
+  // A platform with no count recorded at all is a finding rather than a pass.
+  const silent = findings({ sites: [], approved, platform: 'freebsd', name });
+  assert.ok(silent.some((one) => /no use count is recorded for freebsd/u.test(one)), JSON.stringify(silent));
 });
 
 /// Uses of unsafe in a crate that declares no restriction: the ratchet.
@@ -196,53 +201,113 @@ test('an allowance is approved per platform, and a missing one is reported', () 
 /// needs no allowance to use `unsafe`, so there is no attribute to find -- which is how
 /// four uses in two crates sat outside the architecture rule, unreported, for as long
 /// as the rule has existed. The compiler reports every one.
-test('unsafe in a file that approves none is a finding unless it is recorded', () => {
-  const approved = new Map();
-  const inherited = new Map([['crates/legacy/src/lib.rs', 2]]);
-  const use = (file, line) => ({ kind: 'usage', file, line, text: 'unsafe { }' });
+test('a use of unsafe that no allowance had to be added for is still counted', () => {
+  const file = 'crates/adapters/platform/src/lib.rs';
+  const approved = new Map([[file, {
+    allowances: [{ item: 'fn one() {', platforms: ['win32'] }],
+    uses: { win32: 2, linux: 0, darwin: 0 },
+  }]]);
+  const name = () => 'fn one() {';
+  const allow = { kind: 'allowance', file, line: 1, text: '#[allow(unsafe_code)]' };
+  const use = (line) => ({ kind: 'usage', file, line, text: 'unsafe { }' });
 
-  // Exactly what is recorded: no finding, and the gate goes on saying it is there.
+  // Exactly what is recorded.
   assert.deepEqual(
-    findings({
-      sites: [use('crates/legacy/src/lib.rs', 4), use('crates/legacy/src/lib.rs', 9)],
-      approved, inherited, platform: 'win32',
-    }),
+    findings({ sites: [allow, use(3), use(4)], approved, platform: 'win32', name }),
     [],
   );
 
-  // One more than recorded: a new use, which needs a review rather than a bigger number.
+  // **One more, under the same allowance.** This is the hole the count exists to close:
+  // an allowance covers a whole item, so a new block inside an approved function needs
+  // no new attribute and the first version of this gate skipped it outright.
   const grown = findings({
-    sites: [1, 2, 3].map((line) => use('crates/legacy/src/lib.rs', line)),
-    approved, inherited, platform: 'win32',
+    sites: [allow, use(3), use(4), use(5)], approved, platform: 'win32', name,
   });
   assert.equal(grown.length, 1, JSON.stringify(grown));
-  assert.match(grown[0], /3 use\(s\).*2 recorded/u);
+  assert.match(grown[0], /3 use\(s\) of unsafe on win32, and 2 recorded/u);
 
-  // One fewer: the list has gone stale and says so.
-  const shrunk = findings({
-    sites: [use('crates/legacy/src/lib.rs', 1)],
-    approved, inherited, platform: 'win32',
-  });
-  assert.match(shrunk[0], /1 use\(s\).*2 recorded/u);
+  // One fewer: the list has gone stale and says so, so it stays a description.
+  const shrunk = findings({ sites: [allow, use(3)], approved, platform: 'win32', name });
+  assert.match(shrunk[0], /1 use\(s\) of unsafe on win32, and 2 recorded/u);
 
-  // A file nobody recorded at all.
-  const fresh = findings({
-    sites: [use('crates/new/src/lib.rs', 3)],
-    approved, inherited: new Map(), platform: 'win32',
+  // And a use in a file that approves nothing at all.
+  const elsewhere = findings({
+    sites: [{ kind: 'usage', file: 'crates/other/src/lib.rs', line: 3, text: 'unsafe { }' }],
+    approved, platform: 'win32', name,
   });
-  assert.match(fresh[0], /not one of the recorded inherited ones/u);
+  assert.match(elsewhere[0], /approves none/u);
+});
+
+/// A non-zero exit with nothing to explain it is a target that was not audited.
+///
+/// **CI found this the hard way.** The gate looked for cargo only under `.tools/`, which
+/// CI does not have, so every invocation failed to launch -- and the first version read
+/// a quiet failure as "nothing found". Both halves are asserted here: the exit status is
+/// part of the answer, and cargo is looked for where it actually is.
+test('a run that did not audit anything is not read as a clean one', () => {
+  // Exit zero with no diagnostics: audited, and there was nothing to say.
+  assert.deepEqual(auditFailed({ status: 0, sites: [], reasons: [], output: '' }), []);
+  // Non-zero with the diagnostics this gate reads: that is what a finding looks like.
+  assert.deepEqual(
+    auditFailed({ status: 1, sites: [{ kind: 'usage' }], reasons: [], output: '' }),
+    [],
+  );
+  // Non-zero with nothing at all: not audited.
+  const quiet = auditFailed({ status: 101, sites: [], reasons: [], output: '' });
+  assert.equal(quiet.length, 1, JSON.stringify(quiet));
+  assert.match(quiet[0], /exited 101 with no diagnostic this gate can read/u);
+  // And it says what cargo said, without the command line cargo echoes.
+  const noisy = auditFailed({
+    status: 101,
+    sites: [],
+    reasons: [],
+    output: ['error: no such option', 'Caused by:', `  rustc ${'x'.repeat(4000)}`].join('\n'),
+  });
+  assert.match(noisy[0], /error: no such option/u);
+  assert.ok(noisy[0].length < 400, `the reason is ${noisy[0].length} characters long`);
+  // A reason the compiler itself gave is carried through untouched.
+  assert.deepEqual(
+    auditFailed({ status: 1, sites: [], reasons: ['mismatched types'], output: '' }),
+    ['mismatched types'],
+  );
+});
+
+/// Cargo is looked for where the project keeps it, and then where everyone else does.
+test('cargo is found without the project-local toolchain', () => {
+  assert.equal(resolveCargo('D:/nowhere', () => false), 'cargo');
+  const local = resolveCargo('D:/nowhere', () => true);
+  assert.match(local, /[\\/]\.tools[\\/]cargo[\\/]bin[\\/]cargo/u);
 });
 
 /// One invocation per target, because `cargo rustc` refuses extra arguments otherwise.
-test('every buildable target is selected, one at a time', () => {
+test('every buildable target is selected, one at a time, and again as its harness', () => {
   const targets = targetsFrom({
     packages: [
-      { name: 'a', targets: [{ kind: ['lib'], name: 'a' }, { kind: ['test'], name: 'smoke' }] },
-      { name: 'b', targets: [{ kind: ['bin'], name: 'tool' }, { kind: ['custom-build'], name: 'build-script-build' }] },
+      {
+        name: 'a',
+        targets: [
+          { kind: ['lib'], name: 'a', test: true },
+          { kind: ['test'], name: 'smoke', test: true },
+        ],
+      },
+      {
+        name: 'b',
+        targets: [
+          { kind: ['bin'], name: 'tool', test: false },
+          { kind: ['custom-build'], name: 'build-script-build', test: false },
+        ],
+      },
     ],
   });
   assert.deepEqual(targets.map((one) => [one.package, ...one.flags]), [
     ['a', '--lib'],
+    // **The lib again as its own test harness**, which is a different configuration of
+    // the same file: `--lib` alone compiles without `cfg(test)`, so an `unsafe` block
+    // inside a `#[cfg(test)]` module is invisible to it. A security review named the
+    // hole.
+    ['a', '--lib', '--profile', 'test'],
+    // A `test` target is a harness already: cargo passes `--test` for it, and asking
+    // again is an error.
     ['a', '--test', 'smoke'],
     ['b', '--bin', 'tool'],
   ]);
@@ -329,22 +394,43 @@ test('an item is read as one line however its signature is wrapped', () => {
 });
 
 /// The lists this gate is read against say what they are.
-test('the approved and inherited lists are shaped as the gate reads them', () => {
-  for (const [file, entries] of APPROVED) {
+test('the approved list is shaped as the gate reads it, and complete for every platform', () => {
+  const platforms = ['win32', 'linux', 'darwin'];
+  for (const [file, entry] of APPROVED) {
     assert.match(file, /^crates\//u);
-    for (const entry of entries) {
-      assert.ok(entry.item.length > 0, `${file}: an entry with no item`);
-      assert.ok(entry.platforms.length > 0, `${file}: ${entry.item} is approved nowhere`);
-      for (const platform of entry.platforms) {
+    assert.ok(entry.allowances.length > 0, `${file}: approves nothing`);
+    for (const one of entry.allowances) {
+      assert.ok(one.item.length > 0, `${file}: an entry with no item`);
+      assert.ok(one.platforms.length > 0, `${file}: ${one.item} is approved nowhere`);
+      for (const platform of one.platforms) {
         assert.ok(
-          ['win32', 'linux', 'darwin'].includes(platform),
-          `${file}: ${entry.item} names a platform this project does not build: ${platform}`,
+          platforms.includes(platform),
+          `${file}: ${one.item} names a platform this project does not build: ${platform}`,
         );
       }
     }
-  }
-  for (const [file, count] of INHERITED) {
-    assert.match(file, /^crates\//u);
-    assert.ok(Number.isInteger(count) && count > 0, `${file}: ${count} is not a count`);
+    // **A count for every platform, including zero.** A platform left out would read as
+    // "nothing recorded", and the gate reports that rather than passing -- but the list
+    // should not be putting it in that position in the first place.
+    for (const platform of platforms) {
+      assert.equal(
+        typeof entry.uses[platform],
+        'number',
+        `${file}: no use count for ${platform}`,
+      );
+      assert.ok(entry.uses[platform] >= 0, `${file}: a negative count for ${platform}`);
+    }
+    // Every platform that approves something should have something to approve.
+    for (const platform of platforms) {
+      const approves = entry.allowances.some((one) => one.platforms.includes(platform));
+      if (!approves) {
+        assert.equal(
+          entry.uses[platform],
+          0,
+          `${file}: ${entry.uses[platform]} use(s) recorded on ${platform} with no ` +
+          'allowance approved there, which cannot both be true',
+        );
+      }
+    }
   }
 });

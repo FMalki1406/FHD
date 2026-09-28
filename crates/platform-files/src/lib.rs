@@ -1,6 +1,19 @@
 //! Minimal native free-space query. Values are advisory, never reservations.
+//!
+//! **`unsafe` is banned here and permitted at one named place per platform.** This
+//! crate used to declare no restriction, so its native calls needed no allowance to be
+//! written and an attribute-based gate could not see them. The calls stay here, where
+//! the question they answer is; what is added is a ban with the two exceptions named,
+//! so each is approved in `tools/check-unsafe.mjs` by the signature it sits on.
+#![deny(unsafe_code)]
 use std::{io, path::Path};
+/// Free space on the volume holding `path`, from `GetDiskFreeSpaceExW`.
+///
+/// One call, reviewed: the wide buffer is rejected if it holds an interior NUL, is
+/// terminated, and stays live across the call; `available` is a writable `u64` read
+/// only after success; the two total counters are documented as nullable.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 pub fn available_space(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -25,7 +38,13 @@ pub fn available_space(path: &Path) -> io::Result<u64> {
         Ok(available)
     }
 }
+/// The same, from `statvfs(3)`.
+///
+/// Two calls, reviewed: the path is a live NUL-terminated `CString` and the struct is
+/// writable, correctly aligned storage; the return is checked before `assume_init`, so
+/// nothing reads a field the call did not fill.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn available_space(path: &Path) -> io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())

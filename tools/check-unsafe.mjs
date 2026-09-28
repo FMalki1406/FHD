@@ -30,87 +30,99 @@
 // scan cannot see it. Here every use is reported, and a use in a file this list does
 // not name is a finding.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
-/// Every approved allowance, with the platforms whose compiler should report it.
+/// Where `unsafe` is permitted, and how much of it, per platform.
 ///
-/// **The platforms are part of the entry now.** There is one implementation of the
-/// linker per system and three unwired macOS primitives, so an entry that is absent on
-/// Windows may be perfectly present on macOS. The scanner read every `cfg` branch at
-/// once and could not tell the difference; the compiler tells the truth about one
-/// configuration at a time, which means the list has to say which.
+/// **Two numbers per file, and both are pinned.** `allowances` is the items an
+/// allowance may sit on; `uses` is how many `unsafe` blocks the compiler should find
+/// there. The second exists because the first is not enough: an allowance covers a whole
+/// item, so a new `unsafe` block added inside an already-approved function needs no new
+/// attribute and would otherwise pass unseen. A security review found exactly that hole
+/// in the first version of this gate, which skipped every use in a file that approved
+/// anything.
 ///
-/// `item` is the text of the item the allowance sits on, as one line. Widening this is
-/// an edit to this file, which is reviewed. It is a gate, not the review: an approved
-/// entry still needs somebody to have agreed that the call in it is sound.
+/// **The platforms are part of the entry**, because the compiler answers for one
+/// configuration at a time: there is one linker implementation per system, three unwired
+/// macOS primitives, and two free-space implementations. An entry absent on Windows may
+/// be perfectly present on macOS, and each CI job checks its own platform's numbers.
+///
+/// Widening any of this is an edit to this file, which is reviewed. It is a gate, not
+/// the review: an approved entry still needs somebody to have agreed that the call in it
+/// is sound.
 export const APPROVED = new Map([
-  ['crates/adapters/platform/src/lib.rs', [
-    // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
-    { item: 'fn our_uid() -> u32 {', platforms: ['linux', 'darwin'] },
-    // Windows calls `NtSetInformationFile` with `FILE_LINK_INFORMATION`; Linux calls
-    // `linkat(2)` through the descriptor's entry under `/proc/self/fd`. Both take
-    // borrowed descriptors and a name owned by the caller for longer than the call, and
-    // both are the only route on their system from an open handle to a new name without
-    // resolving a path -- which is the property the whole publication design rests on.
-    // The return type is part of the entry: it carries whether the mechanism issued its
-    // call, which is the only thing publication may read as "no name was created".
-    {
-      item: 'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
-      platforms: ['win32', 'linux'],
-    },
-    // `clone_into_directory` calls `fclonefileat(2)` on macOS, `open_in_directory`
-    // calls `openat(2)`, and `move_into_directory` calls `renameatx_np`: the three
-    // steps of the candidate macOS path. All take borrowed descriptors and names owned
-    // here, and all are measured rather than adopted -- nothing in the engine calls
-    // them, and the publication contract says what adopting them would require first.
-    {
-      item: 'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
-      platforms: ['darwin'],
-    },
-    {
-      item: 'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
-      platforms: ['darwin'],
-    },
-    {
-      item: 'pub fn move_into_directory(from: &File, from_name: &OsStr, to: &File, to_name: &OsStr) -> io::Result<()> {',
-      platforms: ['darwin'],
-    },
-  ]],
-]);
-
-/// Uses of `unsafe` that were already in the tree when this gate could first see them.
-///
-/// **These are recorded, not approved.** Neither crate declares `deny(unsafe_code)` or
-/// `forbid(unsafe_code)`, so its `unsafe` needs no allowance attribute -- which is
-/// exactly why the attribute scanner this gate replaces was structurally unable to see
-/// them. The architecture rules say `fhd-platform` is the only crate that may use
-/// `unsafe`; these two have been outside that rule, unreported, for as long as the rule
-/// has existed.
-///
-/// What this list is for is a ratchet, not an absolution: the count per file is pinned,
-/// so a **new** use fails the gate, and a use that goes away fails it too -- the list
-/// stays a description of the tree. The gate's success line states the total, so the
-/// debt is read out on every run rather than filed away.
-///
-/// What each one is, for whoever picks this up:
-///
-/// * `platform-files`: one `GetDiskFreeSpaceExW` behind a NUL-terminated wide buffer,
-///   with two documented-nullable out-parameters.
-/// * `queue-secrets`: DPAPI `CryptProtectData`/`CryptUnprotectData` and one
-///   `slice::from_raw_parts` over the blob they return.
-///
-/// **Closing it is one of two things**, and both need a security review rather than an
-/// edit here: bring them under the same mechanism as `fhd-platform` -- a crate-level
-/// `deny` and an `#[allow(unsafe_code)]` on the one item, which this gate then requires
-/// to be approved by signature -- or move the calls into `fhd-platform`, where the
-/// `unsafe` boundary already lives.
-export const INHERITED = new Map([
-  ['crates/platform-files/src/lib.rs', 1],
-  ['crates/queue-secrets/src/lib.rs', 3],
+  ['crates/adapters/platform/src/lib.rs', {
+    allowances: [
+      // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
+      { item: 'fn our_uid() -> u32 {', platforms: ['linux', 'darwin'] },
+      // Windows calls `NtSetInformationFile` with `FILE_LINK_INFORMATION`; Linux calls
+      // `linkat(2)` through the descriptor's entry under `/proc/self/fd`. Both take
+      // borrowed descriptors and a name owned by the caller for longer than the call, and
+      // both are the only route on their system from an open handle to a new name without
+      // resolving a path -- which is the property the whole publication design rests on.
+      // The return type is part of the entry: it carries whether the mechanism issued its
+      // call, which is the only thing publication may read as "no name was created".
+      {
+        item: 'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
+        platforms: ['win32', 'linux'],
+      },
+      // `clone_into_directory` calls `fclonefileat(2)`, `open_in_directory` calls
+      // `openat(2)`, and `move_into_directory` calls `renameatx_np`: the three steps of
+      // the candidate macOS path. All take borrowed descriptors and names owned here, and
+      // all are measured rather than adopted -- nothing in the engine calls them, and the
+      // publication contract says what adopting them would require first.
+      {
+        item: 'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
+        platforms: ['darwin'],
+      },
+      {
+        item: 'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
+        platforms: ['darwin'],
+      },
+      {
+        item: 'pub fn move_into_directory(from: &File, from_name: &OsStr, to: &File, to_name: &OsStr) -> io::Result<()> {',
+        platforms: ['darwin'],
+      },
+    ],
+    // Measured per platform, because `cfg` decides which of these compile: on Windows
+    // the named-pipe and link paths, on Linux `linkat` and `geteuid`, on macOS the three
+    // clone primitives and `geteuid`.
+    uses: { win32: 51, linux: 2, darwin: 5 },
+  }],
+  // **These two were outside the rule until the compiler said so.** Neither crate
+  // declared any restriction, so its native calls needed no allowance to be written and
+  // an attribute-based scan could not see them -- four uses, unreported for as long as
+  // the rule has existed. Each call has now been read: the free-space queries check their
+  // return before using what it wrote, and the DPAPI path bounds every buffer and copies
+  // out only after success, a non-null pointer and a length inside its own maximum. The
+  // calls stay in their crates, where their contracts are; what was added is a
+  // crate-level ban and these named exceptions, so the gate pins them by signature.
+  ['crates/platform-files/src/lib.rs', {
+    allowances: [
+      {
+        item: 'pub fn available_space(path: &Path) -> io::Result<u64> {',
+        platforms: ['win32', 'linux', 'darwin'],
+      },
+    ],
+    uses: { win32: 1, linux: 2, darwin: 2 },
+  }],
+  // The wipe in `Output::drop` is bounded by `LocalSize` rather than by the blob's own
+  // `cbData`, because it runs on the failure path and while unwinding, where nothing has
+  // checked that field -- see the note on the function.
+  ['crates/queue-secrets/src/lib.rs', {
+    allowances: [
+      {
+        item: 'fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {',
+        platforms: ['win32'],
+      },
+    ],
+    // Nothing outside `cfg(windows)`, so no other platform compiles a single one.
+    uses: { win32: 5, linux: 0, darwin: 0 },
+  }],
 ]);
 
 /// The diagnostics that matter, from a stream of rustc or cargo JSON lines.
@@ -281,32 +293,23 @@ export function itemAt(file, line, read = (path) => readFileSync(path, 'utf8')) 
 }
 
 /// Every finding, given what the compiler reported and what this file approves.
-export function findings({
-  sites,
-  approved = APPROVED,
-  inherited = INHERITED,
-  platform,
-  name = itemAt,
-}) {
+export function findings({ sites, approved = APPROVED, platform, name = itemAt }) {
   const messages = [];
-  const uses = new Map();
   const expected = new Map();
-  for (const [file, entries] of approved) {
-    const wanted = entries.filter((entry) => entry.platforms.includes(platform));
-    if (wanted.length) expected.set(file, wanted.map((entry) => entry.item));
+  for (const [file, entry] of approved) {
+    const wanted = entry.allowances.filter((one) => one.platforms.includes(platform));
+    expected.set(file, wanted.map((one) => one.item));
   }
   const matched = new Map([...expected].map(([file, items]) => [file, [...items]]));
+  const uses = new Map();
 
   for (const site of sites) {
     if (site.kind === 'usage') {
-      // A use of `unsafe` in a file that approves nothing. No attribute-based scan can
-      // see this: a crate that declares no restriction needs no allowance to use it.
-      if (approved.has(site.file)) continue;
       uses.set(site.file, (uses.get(site.file) ?? 0) + 1);
-      if (!inherited.has(site.file)) {
+      if (!approved.has(site.file)) {
         messages.push(
-          `${site.file}:${site.line}: unsafe is used in a file that approves none, and ` +
-          `this file is not one of the recorded inherited ones. ${site.text}`,
+          `${site.file}:${site.line}: unsafe is used in a file that approves none. ` +
+          `${site.text}`,
         );
       }
       continue;
@@ -332,17 +335,6 @@ export function findings({
     remaining.splice(at, 1);
   }
 
-  // The ratchet: the recorded count is what the tree has, no more and no less.
-  for (const [file, recorded] of inherited) {
-    const found = uses.get(file) ?? 0;
-    if (found !== recorded) {
-      messages.push(
-        `${file}: ${found} use(s) of unsafe, and ${recorded} recorded as inherited. ` +
-        'A new one needs a review before it is recorded; one that has gone needs the ' +
-        'count corrected, so the list stays a description of the tree.',
-      );
-    }
-  }
   for (const [file, left] of matched) {
     for (const item of left) {
       messages.push(
@@ -352,7 +344,54 @@ export function findings({
       );
     }
   }
+
+  // **The count, which is the half an allowance cannot carry.** An allowance covers a
+  // whole item, so a new `unsafe` block inside an approved function needs no new
+  // attribute; pinning how many the compiler should find is what makes adding one a
+  // change somebody has to agree to. A count that has gone down is reported too, so the
+  // list stays a description of the tree rather than a ceiling.
+  for (const [file, entry] of approved) {
+    const recorded = entry.uses[platform];
+    if (recorded === undefined) {
+      messages.push(
+        `${file}: no use count is recorded for ${platform}, so nothing here says how ` +
+        'much unsafe this file should have on it.',
+      );
+      continue;
+    }
+    const found = uses.get(file) ?? 0;
+    if (found !== recorded) {
+      messages.push(
+        `${file}: ${found} use(s) of unsafe on ${platform}, and ${recorded} recorded. ` +
+        'A new one needs a review before the number changes; one that has gone needs ' +
+        'the number corrected.',
+      );
+    }
+  }
   return messages;
+}
+
+/// Whether a run actually audited what it was given.
+///
+/// **A non-zero exit with nothing to explain it is a target that was not audited.**
+/// Under `-F unsafe_code` a findings-free target exits zero, and a target with findings
+/// exits non-zero *with* diagnostics this gate reads. Anything else -- a flag cargo
+/// rejected, a lock it could not take, a toolchain that is not installed -- comes back
+/// non-zero with no JSON at all, and the first version of this gate read that as
+/// "nothing found". A security review named it: the exit status has to be part of the
+/// answer, not ignored because the diagnostics were quiet.
+export function auditFailed({ status, sites, reasons, output }) {
+  if (reasons.length) return reasons;
+  if (status === 0) return [];
+  if (sites.length) return [];
+  // cargo echoes the whole rustc command line on failure, thousands of characters of no
+  // use to a reader. What is wanted is what it said went wrong.
+  const said = output.split('\n').map((line) => line.trim())
+    .filter((line) => /^(error|warning|Caused by|failed)/u.test(line))
+    .map((line) => (line.length > 160 ? `${line.slice(0, 160)}...` : line))
+    .slice(0, 3)
+    .join(' / ');
+  return [`exited ${status} with no diagnostic this gate can read: ${said || 'and said nothing'}`];
 }
 
 /// Compiles one file with the forbid and returns what the compiler said.
@@ -365,7 +404,9 @@ export function auditFile(rustc, path, extra = []) {
   );
   if (run.error) return { sites: [], reasons: [`could not run ${rustc}: ${run.error.message}`] };
   const output = `${run.stdout ?? ''}${run.stderr ?? ''}`;
-  return { sites: sitesFrom(output), reasons: unaudited(output) };
+  const sites = sitesFrom(output);
+  const reasons = unaudited(output);
+  return { sites, reasons: auditFailed({ status: run.status, sites, reasons, output }) };
 }
 
 /// Every target in the workspace, as the flags `cargo rustc` needs to select one.
@@ -382,14 +423,48 @@ export function targetsFrom(metadata) {
         bench: ['--bench', target.name], example: ['--example', target.name] }[kind];
       if (!flag) continue;
       targets.push({ package: pkg.name, kind, name: target.name, flags: flag });
+      // **And the same target again as its own test harness**, because that is a
+      // different configuration of the same file. `cargo rustc --lib` compiles without
+      // `cfg(test)`, so an `unsafe` block inside `#[cfg(test)] mod tests` is invisible
+      // to it -- and a test module is a place where somebody reaches for a native call
+      // to set something up. A security review pointed out the hole. `--profile test`
+      // with `--test` is how cargo builds that harness, and it is where the crate's
+      // dev-dependencies are available.
+      // A `test` target is already a harness -- cargo passes `--test` to rustc for it,
+      // and passing it twice is an error, which is how this was found. What needs the
+      // extra pass is a lib or a bin, whose `#[cfg(test)]` modules are compiled only
+      // into a harness cargo builds separately.
+      if (target.test && (kind === 'lib' || kind === 'bin')) {
+        targets.push({
+          package: pkg.name,
+          kind: `${kind} (as its test harness)`,
+          name: target.name,
+          // `--profile test` is enough: cargo builds the target's harness for it and
+          // passes `--test` to rustc itself. Passing it again is an error, which is how
+          // this was found -- twice, because a `test` target is a harness already.
+          flags: [...flag, '--profile', 'test'],
+        });
+      }
     }
   }
   return targets;
 }
 
+/// Cargo, from the project's own toolchain or from PATH.
+///
+/// **A missing `.tools/cargo` is not a missing cargo.** The first version of this gate
+/// looked only under `.tools/`, which is where `docs/development.md` keeps Rust so a
+/// machine's own installation is untouched -- and CI has no `.tools/` at all, so the
+/// gate failed on all three platforms before a single Rust test ran. The project's
+/// toolchain is preferred where it exists, and PATH is used where it does not.
+export function resolveCargo(base = root, exists = existsSync) {
+  const local = resolvePath(base, '.tools/cargo/bin', process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+  if (process.env.FHD_CARGO) return process.env.FHD_CARGO;
+  return exists(local) ? local : 'cargo';
+}
+
 function main() {
-  const cargo = process.env.FHD_CARGO
-    ?? resolvePath(root, '.tools/cargo/bin', process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+  const cargo = resolveCargo();
   const listed = spawnSync(cargo, ['metadata', '--no-deps', '--format-version', '1'], {
     cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
   });
@@ -404,8 +479,9 @@ function main() {
   for (const target of targets) {
     const run = spawnSync(
       cargo,
-      ['rustc', '-p', target.package, ...target.flags, '--profile', 'check',
-        '--message-format=json', '--', '-F', 'unsafe_code'],
+      ['rustc', '-p', target.package, ...target.flags,
+        ...(target.flags.includes('--profile') ? [] : ['--profile', 'check']),
+        '--message-format=json', '--', '-F', 'unsafe_code', ...(target.rustc ?? [])],
       { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
     );
     if (run.error) {
@@ -413,12 +489,24 @@ function main() {
       continue;
     }
     const output = `${run.stdout ?? ''}${run.stderr ?? ''}`;
-    sites.push(...sitesFrom(output));
-    for (const reason of unaudited(output)) {
+    const found = sitesFrom(output);
+    sites.push(...found);
+    for (const reason of auditFailed({
+      status: run.status, sites: found, reasons: unaudited(output), output,
+    })) {
       reasons.push(`${target.package} ${target.kind} ${target.name}: ${reason}`);
     }
   }
-  const messages = findings({ sites, platform: process.platform });
+  // **One source line is one site, however many configurations compiled it.** Every
+  // file is now audited more than once -- as itself and as its own test harness, and a
+  // lib also through each target that links it -- so the same `unsafe` block comes back
+  // from several invocations. Counting them all would double every number and report
+  // every allowance twice.
+  const seen = new Map();
+  for (const site of sites) {
+    seen.set(`${site.kind}:${site.file}:${site.line}`, site);
+  }
+  const messages = findings({ sites: [...seen.values()], platform: process.platform });
   if (reasons.length || messages.length) {
     console.error(`Unsafe policy failed on ${process.platform}:`);
     for (const reason of reasons) {
@@ -428,14 +516,12 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  const allowances = sites.filter((site) => site.kind === 'allowance').length;
-  const debt = [...INHERITED.values()].reduce((total, one) => total + one, 0);
+  const unique = [...seen.values()];
+  const allowances = unique.filter((site) => site.kind === 'allowance').length;
   console.log(
-    `Unsafe policy: the compiler found ${allowances} approved allowance(s) and ` +
-    `${sites.length - allowances} use(s) of unsafe across ${targets.length} targets on ` +
-    `${process.platform}. ${debt} of those uses are recorded as inherited and ` +
-    `**not approved** (${[...INHERITED.keys()].join(', ')}); the rest are covered by an ` +
-    'approved allowance.',
+    `Unsafe policy: the compiler found ${allowances} allowance(s) and ` +
+    `${unique.length - allowances} use(s) of unsafe across ${targets.length} targets on ` +
+    `${process.platform}, and every one is approved at the count recorded for it.`,
   );
 }
 
