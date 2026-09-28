@@ -80,6 +80,10 @@ export const WITNESS_REQUIRED = new Map([
   ['an_answer_that_could_not_be_saved_leaves_the_doubt_standing', ['win32', 'linux']],
   ['a_save_that_fails_once_is_retried_and_settles_the_attempt', ['win32', 'linux']],
   [
+    'a_database_from_before_the_witness_does_not_read_as_nothing_begun',
+    ['win32', 'linux'],
+  ],
+  [
     'a_part_that_says_nothing_was_begun_is_still_refused_by_the_witness',
     ['win32', 'linux'],
   ],

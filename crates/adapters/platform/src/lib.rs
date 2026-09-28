@@ -131,6 +131,65 @@ impl ForeignWriters {
     }
 }
 
+/// A link that was not made, and whether the mechanism issued its call.
+///
+/// **The only thing a mechanism can say reliably about its own failure.** Whether an
+/// entry exists after a failed link is not something a caller can work out: on a local
+/// filesystem the call is atomic and a failure creates nothing, but `link(2)` NOTES
+/// records that an NFS client retry after a lost reply returns `EEXIST` for a link it
+/// made itself, and the Windows twin goes through the SMB redirector, which is the
+/// same class with less documentation. Nothing here knows which kind of filesystem the
+/// adopted directory is on.
+///
+/// So this reports the one fact that is always true and always knowable: was the call
+/// issued at all. Everything this function refuses *before* issuing it -- a name that
+/// is not one component, a descriptor holding a NUL -- cannot have created anything.
+/// Everything after it is the caller's to treat as unresolved.
+///
+/// **What it deliberately does not do** is classify system error codes. Saying
+/// "`ENOSPC` means no entry" would be the same inference one layer down, resting on a
+/// filesystem nobody identified, and an independent review rejected exactly that
+/// reasoning when it was done by checking the destination path afterwards.
+#[derive(Debug)]
+pub struct LinkFailure {
+    error: io::Error,
+    called: bool,
+}
+
+impl LinkFailure {
+    /// Refused before the call went out, so no entry can exist because of it.
+    pub fn before_the_call(error: io::Error) -> Self {
+        Self {
+            error,
+            called: false,
+        }
+    }
+    /// The call was issued and came back a failure. Whether it left an entry is
+    /// unresolved.
+    pub fn after_the_call(error: io::Error) -> Self {
+        Self {
+            error,
+            called: true,
+        }
+    }
+    /// Whether the mechanism issued its call.
+    pub fn called(&self) -> bool {
+        self.called
+    }
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+    pub fn into_error(self) -> io::Error {
+        self.error
+    }
+}
+
+impl std::fmt::Display for LinkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::*;
@@ -200,7 +259,11 @@ mod imp {
     /// this claim stated here as a contract and relied on as one.
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
-    pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
+    pub fn link_into_directory(
+        file: &File,
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<(), LinkFailure> {
         // A relative name under a directory is exactly one component. Any
         // separator would reopen the path resolution this call exists to avoid,
         // and an interior NUL cannot cross the C boundary at all.
@@ -209,9 +272,13 @@ mod imp {
         // before the parse: `Path::components` normalises `x/.`, and where `x` is
         // a symlink to a directory the kernel walks it, which is the
         // destination-end path resolution this call exists to prevent.
-        let leaf = one_component(name)?;
-        let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a descriptor with a NUL"))?;
+        let leaf = one_component(name).map_err(LinkFailure::before_the_call)?;
+        let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
+            LinkFailure::before_the_call(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a descriptor with a NUL",
+            ))
+        })?;
 
         // SAFETY: both descriptors are borrowed from open `File`s and outlive
         // the call; `source` and `leaf` are NUL-terminated and stay alive for
@@ -231,7 +298,9 @@ mod imp {
         if created == 0 {
             return Ok(());
         }
-        Err(io::Error::last_os_error())
+        // The call went out. What it left behind is the caller's to treat as
+        // unresolved, whatever the code says.
+        Err(LinkFailure::after_the_call(io::Error::last_os_error()))
     }
 
     /// Copies the file this handle holds into `directory` under `name`, by
@@ -1640,7 +1709,11 @@ mod imp {
     /// `directory` must be opened with `FILE_FLAG_BACKUP_SEMANTICS`, which is
     /// how a directory is opened at all on Windows.
     #[allow(unsafe_code)]
-    pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
+    pub fn link_into_directory(
+        file: &File,
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<(), LinkFailure> {
         // A relative name under a root directory is exactly one component. Any
         // separator, and any drive or root spelling, would reopen the path
         // resolution this call exists to avoid, so it is refused rather than
@@ -1649,10 +1722,10 @@ mod imp {
         match (components.next(), components.next()) {
             (Some(std::path::Component::Normal(_)), None) => (),
             _ => {
-                return Err(io::Error::new(
+                return Err(LinkFailure::before_the_call(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "a link name must be a single path component",
-                ));
+                )));
             }
         }
         let name: Vec<u16> = name.encode_wide().collect();
@@ -1696,11 +1769,16 @@ mod imp {
         };
         match status as u32 {
             0 => Ok(()),
-            // An occupied name, which callers already handle from `hard_link`.
-            NAME_COLLISION => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
-            other => Err(io::Error::other(format!(
-                "NtSetInformationFile(FileLinkInformation) failed: {other:#010x}"
+            // An occupied name, which callers already handle from `hard_link`. The
+            // call went out, so whether the name that is occupied is one this call
+            // just made is not something the answer can settle -- over the
+            // redirector a retried success looks exactly like this.
+            NAME_COLLISION => Err(LinkFailure::after_the_call(io::Error::from(
+                io::ErrorKind::AlreadyExists,
             ))),
+            other => Err(LinkFailure::after_the_call(io::Error::other(format!(
+                "NtSetInformationFile(FileLinkInformation) failed: {other:#010x}"
+            )))),
         }
     }
 
@@ -2726,9 +2804,17 @@ mod tests {
         fs::write(&occupied, b"somebody else").unwrap();
         let refused = link_into_directory(&held, &folder, OsStr::new("occupied.bin")).unwrap_err();
         assert_eq!(
-            refused.kind(),
+            refused.error().kind(),
             std::io::ErrorKind::AlreadyExists,
             "an occupied name was refused for the wrong reason: {refused}"
+        );
+        // **And the refusal says the call went out.** It is the one answer a caller
+        // may not work out for itself: over a network filesystem this same code can
+        // come back for a link this call made, so publication treats it as
+        // unresolved and keeps the part sealed.
+        assert!(
+            refused.called(),
+            "a refusal from the mechanism itself claimed the call never went out,              which would let a caller conclude no name exists"
         );
         assert_eq!(fs::read(&occupied).unwrap(), b"somebody else");
 
@@ -2737,9 +2823,15 @@ mod tests {
         for escape in ["sub\\deep.bin", "..\\up.bin", r"C:\absolute.bin"] {
             let refused = link_into_directory(&held, &folder, OsStr::new(escape)).unwrap_err();
             assert_eq!(
-                refused.kind(),
+                refused.error().kind(),
                 std::io::ErrorKind::InvalidInput,
                 "{escape} was not refused as a name"
+            );
+            // Refused before anything was issued, which is the only case a caller may
+            // read as "no entry was created".
+            assert!(
+                !refused.called(),
+                "{escape} was refused by the call rather than before it, so a caller                  cannot tell that nothing was created"
             );
         }
         drop(folder);

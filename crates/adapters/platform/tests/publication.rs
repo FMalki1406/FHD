@@ -90,11 +90,20 @@ fn an_occupied_name_is_refused_and_the_file_there_is_untouched() {
     written(&taken, b"someone else's file");
     let folder = File::open(&sandbox.0).unwrap();
 
-    let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new("taken"));
+    let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new("taken"))
+        .expect_err("an occupied name was replaced");
     assert_eq!(
-        refused.unwrap_err().kind(),
+        refused.error().kind(),
         std::io::ErrorKind::AlreadyExists,
         "an occupied name was not refused"
+    );
+    // **And the refusal says the call went out.** It is the one thing a caller cannot
+    // work out for itself: over a network filesystem this same code comes back for a
+    // link the call made, so publication treats it as unresolved and keeps the part
+    // sealed rather than concluding nothing exists.
+    assert!(
+        refused.called(),
+        "a refusal from `linkat` itself claimed the call never went out, which would          let a caller conclude no name exists"
     );
     assert_eq!(fs::read(&taken).unwrap(), b"someone else's file");
 }
@@ -130,11 +139,18 @@ fn a_name_that_is_not_one_component_is_refused() {
         "inner/.",
         "",
     ] {
-        let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new(name));
+        let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new(name))
+            .expect_err("a name that is not one component was accepted");
         assert_eq!(
-            refused.unwrap_err().kind(),
+            refused.error().kind(),
             std::io::ErrorKind::InvalidInput,
             "{name:?} was not refused"
+        );
+        // Refused before anything was issued, which is the only case a caller may
+        // read as "no entry was created".
+        assert!(
+            !refused.called(),
+            "{name:?} was refused by the call rather than before it, so a caller              cannot tell that nothing was created"
         );
     }
     assert!(!sandbox.0.join("inner/escaped").exists());
@@ -157,11 +173,16 @@ fn a_symlinked_directory_is_not_walked_by_a_trailing_dot() {
     std::os::unix::fs::symlink(&elsewhere, sandbox.0.join("link")).unwrap();
     let folder = File::open(&sandbox.0).unwrap();
 
-    let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new("link/."));
+    let refused = fhd_platform::link_into_directory(&file, &folder, OsStr::new("link/."))
+        .expect_err("a trailing /. on a symlink to a directory was accepted");
     assert_eq!(
-        refused.unwrap_err().kind(),
+        refused.error().kind(),
         std::io::ErrorKind::InvalidInput,
         "a trailing /. on a symlink to a directory was not refused"
+    );
+    assert!(
+        !refused.called(),
+        "the name was refused by the call rather than before it"
     );
     assert_eq!(
         fs::read_dir(&elsewhere).unwrap().count(),

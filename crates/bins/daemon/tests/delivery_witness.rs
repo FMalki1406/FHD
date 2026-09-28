@@ -23,7 +23,7 @@
 mod harness;
 
 use fhd_app::{
-    storage::{HandleLinker, StorageError},
+    storage::{HandleLinker, LinkRefused, StorageError},
     AddDownload, AppError, Authorizer, CommitError, Destinations, DurableExtent, EntitlementGate,
     PortFuture, Principal, PublishIntent, ReceiptKey, ReferenceStore, SourceReference,
     TransferRepository,
@@ -81,15 +81,26 @@ impl HandleLinker for Linker {
         file: &std::fs::File,
         folder: &std::fs::File,
         name: &std::ffi::OsStr,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), LinkRefused> {
         if self.refuse.load(Ordering::SeqCst) {
-            // The one answer that establishes no directory entry was created: the
-            // call that would have created it, refusing.
-            return Err(StorageError::Conflict);
+            // **The one answer that establishes no directory entry was created:** the
+            // mechanism refusing without issuing anything. That is the shape of a
+            // platform with no mechanism, and of a name this call will not encode --
+            // and it is the only way to produce a definite refusal, because an error
+            // that comes back *from* the call cannot say what it left behind.
+            return Err(LinkRefused::before_the_call(StorageError::Conflict));
         }
-        fhd_platform::link_into_directory(file, folder, name).map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-            other => StorageError::Io(other),
+        fhd_platform::link_into_directory(file, folder, name).map_err(|failure| {
+            let called = failure.called();
+            let error = match failure.error().kind() {
+                std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+                other => StorageError::Io(other),
+            };
+            if called {
+                LinkRefused::after_the_call(error)
+            } else {
+                LinkRefused::before_the_call(error)
+            }
         })
     }
     fn same_object(
@@ -310,7 +321,31 @@ struct Wired {
 impl Wired {
     async fn open(state: &Directory, body: &[u8], repository: Repository) -> Self {
         let (port, _) = serve(body.to_vec(), 0);
-        let url = format!("http://127.0.0.1:{port}/file");
+        Self::wire(
+            state,
+            &format!("http://127.0.0.1:{port}/file"),
+            body,
+            repository,
+        )
+        .await
+    }
+
+    /// Wires the same state directory again, which is what a restart is.
+    ///
+    /// The admission replays -- the receipt key is the same, so the same job comes
+    /// back rather than a second one -- and the repository opens the database that is
+    /// already there, applying whatever migrations it has not seen. The caller must
+    /// have dropped the previous `Wired`: the part store and the repository each hold
+    /// an exclusive lock, which is the behaviour, not an accident of the test.
+    async fn reopen(state: &Directory, body: &[u8], repository: Repository) -> Self {
+        // Literally the same wiring, which is the point rather than an economy: a
+        // restart opens what is on disk with the same code, and the only difference
+        // is what it finds there.
+        Self::open(state, body, repository).await
+    }
+
+    async fn wire(state: &Directory, url: &str, body: &[u8], repository: Repository) -> Self {
+        let url = url.to_string();
         let engine = state.engine();
         let downloads = state.0.join("downloads");
         std::fs::create_dir_all(&engine).expect("the engine directory is usable");
@@ -865,6 +900,94 @@ async fn a_witness_that_cannot_be_read_stops_the_job_rather_than_the_session() {
              an operator can retry"
         );
     }
+}
+
+/// A database from before the witness existed does not read as "nothing was begun".
+///
+/// **The upgrade is where a new record can quietly answer an old question wrongly.**
+/// The migration that created the witness created it empty, which says exactly what
+/// the engine is not allowed to assume about a part it inherited: that no attempt was
+/// ever made. An older build recorded the attempt in `publish_intents` and nothing
+/// else -- and its part's own record is one byte that a flip to `Open` makes look
+/// untouched. So an upgrade could have handed over permission to write the part, link
+/// a second name, and remove the evidence, for a file the user may already have. An
+/// independent review found this before the upgrade shipped.
+///
+/// This drives it on the real thing: a real database, a real part on disk, the
+/// repository closed and opened again the way a restart closes and opens it. The
+/// database is rolled back to the state the earlier build left -- the witness row
+/// gone and the schema at the version before the backfill -- and the part's byte is
+/// corrupted, so the only thing that can refuse is the row the migration writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_database_from_before_the_witness_does_not_read_as_nothing_begun() {
+    let state = Directory::new("witness-upgrade");
+    let body = content(512 * 1024 + 3);
+    let wired = Wired::open(&state, &body, Repository::Real).await;
+
+    let _ = wired.run().await;
+    assert_eq!(wired.state().await, JobState::NeedsAction);
+    // The premise: an attempt was recorded, and the intent an older build would have
+    // left is there.
+    assert_eq!(wired.counters().await, Some((1, 1)));
+    assert!(
+        wired.intended_attempt().await.is_some(),
+        "no publish intent was recorded, so there is nothing for the migration to \
+         carry across and this measures nothing"
+    );
+    let before = std::fs::read(wired.part()).expect("the part is readable");
+    let database = wired.state.join("state").join("admission.sqlite");
+    drop(wired);
+
+    // The state the older build left: the witness table exists because the schema is
+    // shared, but it holds nothing, and the database has not seen the migration that
+    // carries the intents across.
+    {
+        let db = rusqlite::Connection::open(&database).expect("the database opens");
+        db.execute("DELETE FROM publish_attempts", [])
+            .expect("the witness is cleared");
+        db.execute("DELETE FROM schema_migrations WHERE version=7", [])
+            .expect("the migration is forgotten");
+        db.pragma_update(None, "user_version", 6)
+            .expect("the version rolls back");
+    }
+
+    let wired = Wired::reopen(&state, &body, Repository::Real).await;
+    assert_eq!(
+        wired.counters().await,
+        Some((1, 0)),
+        "the upgrade did not carry the older build's attempt across, so the engine \
+         reads it as one that never happened"
+    );
+    assert!(wired.unresolved().await);
+
+    // And the part's own record says nothing, which is what a corrupted byte reads
+    // as. Only the migrated row refuses now.
+    wired.set_publication_byte(0);
+    wired.allow_linking();
+    wired.resume().await;
+    let outcome = wired.run().await;
+    assert_eq!(
+        wired.reason().await,
+        Some(StopReason::Unconfirmed),
+        "a part inherited from an older build was run on: {outcome:?}"
+    );
+    assert!(
+        !wired.destination.exists(),
+        "a second name was created for a part inherited from an older build"
+    );
+    assert_eq!(
+        std::fs::read(wired.part()).expect("the part is readable"),
+        before,
+        "an inherited part was written to"
+    );
+
+    wired.cancel().await;
+    assert_eq!(wired.state().await, JobState::Cancelled);
+    assert!(
+        wired.part().exists() && wired.meta().exists(),
+        "a cancel removed a part inherited from a build that could not say what \
+         became of its publication"
+    );
 }
 
 /// A witness that cannot be read is not a `false`.

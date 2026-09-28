@@ -306,16 +306,22 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
             .map_err(|error| fhd_app::storage::StorageError::Io(error.kind()))
     }
 
+    /// **The refusal carries whether the call went out**, which the mechanism reports
+    /// and this only translates. It is not this function's business to decide whether
+    /// a failure left an entry behind, and the two reviews that looked at publication
+    /// rejected both attempts to decide it here or above: inferring it from the error
+    /// code, and checking the destination path after the call.
     fn link(
         &self,
         file: &std::fs::File,
         directory: &std::fs::File,
         name: &std::ffi::OsStr,
-    ) -> Result<(), fhd_app::storage::StorageError> {
+    ) -> Result<(), fhd_app::storage::LinkRefused> {
         #[cfg(windows)]
         {
-            fhd_platform::link_into_directory(file, directory, name).map_err(|error| {
-                match error.kind() {
+            fhd_platform::link_into_directory(file, directory, name).map_err(|failure| {
+                let called = failure.called();
+                let error = match failure.error().kind() {
                     std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
                     std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
                         fhd_app::storage::StorageError::Unsupported
@@ -324,6 +330,11 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
                         fhd_app::storage::StorageError::InvalidInput
                     }
                     other => fhd_app::storage::StorageError::Io(other),
+                };
+                if called {
+                    fhd_app::storage::LinkRefused::after_the_call(error)
+                } else {
+                    fhd_app::storage::LinkRefused::before_the_call(error)
                 }
             })
         }
@@ -356,8 +367,9 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
             // errno makes the engine retry or fall back to a path: the
             // coordinator sends `Conflict` to `Destination` and everything else
             // to `Storage`, both straight to `NeedsAction` with no retry loop.
-            fhd_platform::link_into_directory(file, directory, name).map_err(|error| {
-                match error.kind() {
+            fhd_platform::link_into_directory(file, directory, name).map_err(|failure| {
+                let called = failure.called();
+                let error = match failure.error().kind() {
                     std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
                     std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
                         fhd_app::storage::StorageError::Unsupported
@@ -366,13 +378,24 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
                         fhd_app::storage::StorageError::InvalidInput
                     }
                     other => fhd_app::storage::StorageError::Io(other),
+                };
+                if called {
+                    fhd_app::storage::LinkRefused::after_the_call(error)
+                } else {
+                    fhd_app::storage::LinkRefused::before_the_call(error)
                 }
             })
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (file, directory, name);
-            Err(fhd_app::storage::StorageError::Unsupported)
+            // No mechanism, so nothing was issued and nothing can exist because of
+            // it. (In the engine this branch is unreachable: the composition root
+            // supplies no linker at all where there is none, so publication refuses
+            // before recording an attempt.)
+            Err(fhd_app::storage::LinkRefused::before_the_call(
+                fhd_app::storage::StorageError::Unsupported,
+            ))
         }
     }
 }
@@ -1333,6 +1356,84 @@ pub fn code(error: &EngineError) -> String {
         EngineError::Binding(error) => binding_code(error).into(),
         EngineError::Admission(error) => error.code().into(),
         EngineError::Run(error) => run_code(error).into(),
+    }
+}
+
+/// What the composition root tells publication about a link it could not make.
+///
+/// **This is the binding, not a double.** Every test of the publication contract
+/// supplies its own `HandleLinker`, so the translation that production actually uses
+/// -- from the mechanism's answer to the port's -- had nothing measuring it, and a
+/// mutation that labelled every refusal "the call never went out" passed the whole
+/// suite. That label is what permits a cleanup to remove a part, so it is the one
+/// that must not be given away.
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod refusals {
+    use super::PlatformLinker;
+    use fhd_app::storage::HandleLinker;
+    use std::fs;
+
+    /// A refusal the mechanism produced says the call went out; one it produced
+    /// without acting says so too.
+    ///
+    /// The occupied name is a real refusal from the real call -- the file is there and
+    /// the mechanism reports it -- and over a network filesystem that same answer can
+    /// come back for a link the call itself made. So it is unresolved, and publication
+    /// keeps the part sealed on the strength of this bit.
+    ///
+    /// The one-component check is the other side: it refuses before issuing anything,
+    /// which is the only case a caller may read as "no entry was created".
+    #[test]
+    fn a_refusal_says_whether_the_call_went_out() {
+        let base = std::env::temp_dir().join(format!("fhd-refusals-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("the directory is usable");
+        let source = base.join("source.bin");
+        fs::write(&source, b"held").expect("the source is writable");
+        let held = fs::File::open(&source).expect("the source opens");
+        let taken = base.join("taken.bin");
+        fs::write(&taken, b"somebody else").expect("the name is taken");
+        // The same open the storage adapter makes: on Windows a directory needs
+        // `FILE_FLAG_BACKUP_SEMANTICS` to become a `File` at all, and the mechanism
+        // needs a directory handle.
+        #[cfg(windows)]
+        let folder = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(BACKUP_SEMANTICS)
+                .open(&base)
+                .expect("the folder opens")
+        };
+        #[cfg(not(windows))]
+        let folder = fs::File::open(&base).expect("the folder opens");
+
+        let refused = PlatformLinker
+            .link(&held, &folder, std::ffi::OsStr::new("taken.bin"))
+            .expect_err("an occupied name was replaced");
+        assert!(
+            refused.called(),
+            "the mechanism refused from its own call and the answer says otherwise, \
+             which would let a cleanup remove a part that may be the user's file"
+        );
+
+        let refused = PlatformLinker
+            .link(&held, &folder, std::ffi::OsStr::new("sub/deep.bin"))
+            .expect_err("a name that is not one component was accepted");
+        assert!(
+            !refused.called(),
+            "a name refused before anything was issued was reported as an attempt, \
+             which strands a job that could simply be retried"
+        );
+
+        // And the file that was in the way is untouched by either.
+        assert_eq!(
+            fs::read(&taken).expect("the file is still there"),
+            b"somebody else"
+        );
+        drop(folder);
+        let _ = fs::remove_dir_all(&base);
     }
 }
 

@@ -2402,9 +2402,11 @@ async fn a_link_across_two_volumes_is_refused_and_creates_nothing() {
          destination and that design can be revisited",
     );
     eprintln!(
-        "cross-volume link refused with: {error:?} (kind {:?})",
-        error.kind()
+        "cross-volume link refused with: {error:?} (kind {:?}, call issued: {})",
+        error.error().kind(),
+        error.called()
     );
+    let error = error.into_error();
     #[cfg(windows)]
     assert!(
         error.to_string().contains("0xc00000d4"),

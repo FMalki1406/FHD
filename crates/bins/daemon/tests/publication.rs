@@ -31,8 +31,8 @@
 mod harness;
 
 use fhd_app::storage::{
-    HandleLinker, NameEvidence, PartSpec, PublishRefused, Published, SegmentFile, SegmentStore,
-    StorageError,
+    HandleLinker, LinkRefused, NameEvidence, PartSpec, PublishRefused, Published, SegmentFile,
+    SegmentStore, StorageError,
 };
 use fhd_domain::{ByteRange, Generation, JobId};
 use fhd_storage::FileStorage;
@@ -82,7 +82,7 @@ impl HandleLinker for SubstituteThenLink {
     fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
         objects_match(left, right)
     }
-    fn link(&self, file: &fs::File, folder: &fs::File, name: &OsStr) -> Result<(), StorageError> {
+    fn link(&self, file: &fs::File, folder: &fs::File, name: &OsStr) -> Result<(), LinkRefused> {
         fs::rename(&self.source, &self.aside).expect("the source name is taken");
         fs::write(&self.source, &self.theirs).expect("another file takes that name");
         self.reached.store(true, Ordering::SeqCst);
@@ -121,10 +121,20 @@ fn link_through_the_platform(
     file: &fs::File,
     folder: &fs::File,
     name: &OsStr,
-) -> Result<(), StorageError> {
-    fhd_platform::link_into_directory(file, folder, name).map_err(|error| match error.kind() {
-        std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
-        other => StorageError::Io(other),
+) -> Result<(), LinkRefused> {
+    fhd_platform::link_into_directory(file, folder, name).map_err(|failure| {
+        let called = failure.called();
+        let error = match failure.error().kind() {
+            std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+            other => StorageError::Io(other),
+        };
+        // The mechanism's own answer, carried and not re-decided: it says whether it
+        // issued its call, and this only translates the error beside it.
+        if called {
+            LinkRefused::after_the_call(error)
+        } else {
+            LinkRefused::before_the_call(error)
+        }
     })
 }
 
@@ -231,7 +241,7 @@ fn publication_never_replaces_a_file_that_is_already_there() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
     }
@@ -294,7 +304,7 @@ fn the_window_after_the_last_read_belongs_to_whoever_can_write_the_inode() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             // Through the name, as a same-account process would.
             if let Ok(mut open) = fs::OpenOptions::new().write(true).open(&self.source) {
                 use std::io::Write;
@@ -393,7 +403,7 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             if fs::rename(&self.approved, &self.aside).is_ok() {
                 fs::create_dir(&self.approved).expect("an impostor takes the name");
                 self.swapped.store(true, Ordering::SeqCst);
@@ -506,6 +516,13 @@ fn a_destination_folder_swapped_at_the_boundary_publishes_nowhere_else() {
 /// lifting it here would make the user's just-delivered file writable through the
 /// part. A security review found the "a failure creates nothing" claim stated as a
 /// contract in the platform port and relied on here.
+///
+/// **And the answer comes from the mechanism, not from looking afterwards.** A first
+/// fix asked whether the requested path led to the object being published. A second
+/// review rejected that: the linking call resolves the name inside the *adopted
+/// folder's handle*, so a path check asks a different question and cannot see an
+/// entry made in a folder whose name has since changed. What the double says here is
+/// the only thing a mechanism can answer reliably -- the call went out.
 #[test]
 fn a_link_that_was_made_and_then_reported_refused_is_not_reported_as_making_nothing() {
     struct LinkThenReportConflict;
@@ -521,10 +538,11 @@ fn a_link_that_was_made_and_then_reported_refused_is_not_reported_as_making_noth
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)?;
-            // The reply was lost; the retry found the name taken -- by us.
-            Err(StorageError::Conflict)
+            // The reply was lost; the retry found the name taken -- by us. The call
+            // went out, which is exactly what the refusal has to say.
+            Err(LinkRefused::after_the_call(StorageError::Conflict))
         }
     }
 
@@ -607,8 +625,11 @@ fn a_refused_publication_leaves_the_part_writable_on_the_next_run() {
         fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
             Err(StorageError::Unsupported)
         }
-        fn link(&self, _: &fs::File, _: &fs::File, _: &OsStr) -> Result<(), StorageError> {
-            Err(StorageError::Unsupported)
+        fn link(&self, _: &fs::File, _: &fs::File, _: &OsStr) -> Result<(), LinkRefused> {
+            // No mechanism: nothing is issued, so nothing can exist because of it.
+            // That is what lets the part below be unsealed and retried, and it is a
+            // claim about control flow rather than about a filesystem.
+            Err(LinkRefused::before_the_call(StorageError::Unsupported))
         }
     }
 
@@ -703,7 +724,7 @@ fn a_folder_swapped_before_adoption_is_the_one_adopted_and_that_is_the_window() 
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
@@ -780,9 +801,11 @@ fn a_refused_publication_keeps_the_progress_allows_a_retry_and_touches_nothing_e
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             if self.0.load(Ordering::SeqCst) {
-                return Err(StorageError::Unsupported);
+                // Refused without acting, which is what a mechanism that cannot do
+                // this at all does.
+                return Err(LinkRefused::before_the_call(StorageError::Unsupported));
             }
             link_through_the_platform(file, folder, name)
         }
@@ -919,7 +942,7 @@ fn a_location_check_that_cannot_be_completed_is_not_reported_as_a_move() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, _: &fs::File, _: &fs::File) -> Result<bool, StorageError> {
@@ -995,7 +1018,7 @@ fn a_part_that_has_published_refuses_to_publish_again_and_keeps_its_seal() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
@@ -1081,7 +1104,7 @@ fn a_part_found_sealed_after_a_crash_neither_publishes_nor_loses_its_seal() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
         fn same_object(&self, left: &fs::File, right: &fs::File) -> Result<bool, StorageError> {
@@ -1191,7 +1214,7 @@ fn a_fifo_at_the_requested_path_does_not_hang_publication() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             // Published through the adopted handle first, so the file really is
             // delivered before anything below can confuse the report about it.
             link_through_the_platform(file, folder, name)?;
@@ -1353,7 +1376,7 @@ fn a_parts_directory_swapped_for_a_fifo_does_not_hang_publication_after_delivery
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             // Deliver first, so what follows can only affect the *report*.
             link_through_the_platform(file, folder, name)?;
             fs::rename(&self.parts, &self.aside).expect("the parts directory is displaced");
@@ -1466,7 +1489,7 @@ fn a_failed_location_check_after_the_link_keeps_the_seal_and_the_files() {
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             link_through_the_platform(file, folder, name)
         }
     }
@@ -1555,7 +1578,7 @@ fn a_symlink_at_the_requested_name_pointing_at_the_part_is_not_reported_as_at() 
             file: &fs::File,
             folder: &fs::File,
             name: &OsStr,
-        ) -> Result<(), StorageError> {
+        ) -> Result<(), LinkRefused> {
             // Published into the folder whose handle was adopted, first.
             link_through_the_platform(file, folder, name)?;
             // The folder is displaced and an impostor takes its name, which frees

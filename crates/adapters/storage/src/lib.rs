@@ -901,45 +901,48 @@ impl SegmentFile for FilePart {
         self.mark(Publication::Attempted)
             .map_err(PublishRefused::none_created)?;
         let linked = linker.link(&self.file, &folder, leaf.as_os_str());
-        if let Err(error) = linked {
-            // **"The call refused" is not by itself "no entry exists".**
+        if let Err(refused) = linked {
+            let error = refused.error();
+            // **"The call refused" is not by itself "no entry exists", and only the
+            // mechanism can say which happened.**
             //
-            // On a local filesystem it is: the link is one system call. Over NFS it
-            // is not -- `link(2)` NOTES records that a client retry after a lost
-            // reply returns `EEXIST` although the link was made, and the link is
-            // ours. SMB is the same class. And the parts directory lives inside the
-            // destination folder by design, so a destination on a share puts this
-            // call on the network path by construction.
+            // On a local filesystem the link is one system call and a failure creates
+            // nothing. Over NFS the two come apart -- `link(2)` NOTES: a client retry
+            // after a lost reply returns `EEXIST` for the caller's own link -- and SMB
+            // through the redirector is the same class. The parts directory lives
+            // inside the destination folder by design, so a destination on a share
+            // puts this call on the network path by construction. Nothing here knows
+            // which kind of filesystem it is.
             //
-            // What that would have cost: the unwind below lifts the seal, and the
-            // seal is the only thing stopping a reopened part from writing to the
-            // inode the published file is a link to. So a lost reply on a share
-            // would have made the user's just-delivered file writable again, and
-            // then let a cancel remove the evidence that any of it happened. A
-            // security review found the claim stated as a contract in the platform
-            // port and relied on here.
+            // What that costs if it is got wrong: the unwind below lifts the seal, and
+            // the seal is the only thing stopping a reopened part from writing to the
+            // inode the published file is a link to. A lost reply on a share would
+            // have made the user's just-delivered file writable again, and then let a
+            // cancel remove the evidence that any of it happened.
             //
-            // So the name is asked about, through the same non-blocking port the
-            // location check uses. Only a positive identification changes the
-            // answer: the name leads to the object being published, therefore the
-            // link happened and this refusal is a report of something else.
-            let ours = match linker.open_for_identity(&destination) {
-                // Nothing there, or not a regular file. Also the case where the
-                // folder was renamed and the path no longer reaches it -- an entry
-                // could exist inside the adopted folder and be invisible here, which
-                // is the residual `NameEvidence::NoneCreated` names and does not
-                // close.
-                Ok(None) => false,
-                Ok(Some(found)) => linker.same_object(&self.file, &found).unwrap_or(false),
-                Err(_) => false,
-            };
-            if ours {
-                // The part is a second name for a file the user now has. **The seal
-                // stays on**, because lifting it is what would make that file
-                // writable, and the record stays at `Attempted`, which is what it
-                // is: an attempt whose outcome this run cannot report. The engine
-                // keeps the part and the next run reconciles against the
-                // destination, where the bytes and their digest settle it.
+            // **A first fix asked the destination path about it, and was wrong.** The
+            // linking call resolves `leaf` inside the *adopted folder's handle*; the
+            // requested path is a different question, and where the folder has since
+            // been renamed the path cannot see an entry the call made. An independent
+            // review said so: a path check after the call proves nothing about it.
+            //
+            // So nothing here looks at the filesystem. The mechanism reports whether
+            // it issued its call, which is the one thing it can answer reliably, and
+            // an issued call that failed is unresolved whatever its error code says.
+            if refused.called() {
+                // The part may be a second name for a file the user now has. **The
+                // seal stays on**, because lifting it is what would make that file
+                // writable, and the record stays at `Attempted`, which is what it is:
+                // an attempt whose outcome this run cannot report. The engine keeps
+                // the part, and the next run reconciles against the destination, where
+                // the bytes and their digest settle it.
+                //
+                // **The cost is conservatism**, and it is stated rather than traded
+                // away: a full disk or a permission error at the moment of linking now
+                // rests the job on `Unconfirmed` and keeps its part, where it used to
+                // be a retryable stop. What would recover that is a mechanism able to
+                // say the volume is local, which is a new platform surface and is not
+                // implemented.
                 return Err(PublishRefused::unknown(error));
             }
             // The linker returned, so the attempt is over and its answer is
@@ -1194,7 +1197,7 @@ impl FilePart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fhd_app::storage::NameEvidence;
+    use fhd_app::storage::{LinkRefused, NameEvidence};
     use fhd_domain::{Generation, JobId};
     use std::{
         sync::atomic::{AtomicU64, Ordering},
@@ -1491,15 +1494,19 @@ mod tests {
         fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
             identity_open_for_a_double(path)
         }
-        fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
+        fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), LinkRefused> {
             // Both handles ignored, both ends resolved by path: exactly the
             // behaviour the real linker replaces, which is why the properties
             // this double can carry are only the ones that do not depend on it.
+            //
+            // `hard_link` is one call, so a failure of it is a failure after the
+            // call went out -- which is what this says, rather than the more
+            // convenient answer.
             fs::hard_link(&self.source, self.folder.join(name)).map_err(|error| {
-                match error.kind() {
+                LinkRefused::after_the_call(match error.kind() {
                     std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
                     other => StorageError::Io(other),
-                }
+                })
             })
         }
         fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
@@ -1558,8 +1565,9 @@ mod tests {
         fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
             identity_open_for_a_double(path)
         }
-        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
-            Err(StorageError::Unsupported)
+        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), LinkRefused> {
+            // Nothing is issued, so nothing can exist because of it.
+            Err(LinkRefused::before_the_call(StorageError::Unsupported))
         }
         fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
             Err(StorageError::Unsupported)
@@ -1989,12 +1997,16 @@ mod tests {
             fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
                 identity_open_for_a_double(path)
             }
-            fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), StorageError> {
+            fn link(&self, _: &File, _: &File, name: &std::ffi::OsStr) -> Result<(), LinkRefused> {
                 if self.failing.load(Ordering::SeqCst) {
-                    return Err(StorageError::Io(std::io::ErrorKind::StorageFull));
+                    // Refused without acting, which is why the part it leaves is a
+                    // part a retry can use.
+                    return Err(LinkRefused::before_the_call(StorageError::Io(
+                        std::io::ErrorKind::StorageFull,
+                    )));
                 }
                 fs::hard_link(&self.source, self.folder.join(name))
-                    .map_err(|error| StorageError::Io(error.kind()))
+                    .map_err(|error| LinkRefused::after_the_call(StorageError::Io(error.kind())))
             }
             fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
                 Err(StorageError::Unsupported)
@@ -2131,12 +2143,13 @@ mod tests {
         fn open_for_identity(&self, path: &Path) -> Result<Option<File>, StorageError> {
             identity_open_for_a_double(path)
         }
-        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), StorageError> {
+        fn link(&self, _: &File, _: &File, _: &std::ffi::OsStr) -> Result<(), LinkRefused> {
             let byte = fs::read(&self.meta)
                 .ok()
                 .and_then(|data| data.get(33).copied());
             *self.seen.lock().unwrap() = byte;
-            Err(StorageError::Unsupported)
+            // Reading the record is not issuing a link; nothing was created.
+            Err(LinkRefused::before_the_call(StorageError::Unsupported))
         }
         fn same_object(&self, _: &File, _: &File) -> Result<bool, StorageError> {
             Err(StorageError::Unsupported)

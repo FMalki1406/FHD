@@ -272,28 +272,82 @@ impl std::fmt::Display for Published {
 /// by name: that is the behaviour being replaced, and a fallback that happens
 /// quietly would leave the same hole under a new arrangement. Returning
 /// `Unsupported` makes publication refuse with a reason instead.
+/// A link that was not made, and whether the mechanism issued its call.
+///
+/// **The one thing an implementation can be asked for reliably.** "Did an entry get
+/// created?" is not answerable after a failure: on a local filesystem the call is
+/// atomic and nothing was made, but `link(2)` NOTES records that an NFS client retry
+/// after a lost reply returns `EEXIST` for a link it made itself, and the Windows
+/// twin goes through the SMB redirector, which is the same class with less
+/// documentation. Nothing in the engine knows what kind of filesystem the adopted
+/// directory is on.
+///
+/// So the question put to the mechanism is narrower and always knowable: **was the
+/// call issued at all.** What an implementation refuses before issuing it -- a name
+/// that is not one component, an argument it will not encode, a platform with no
+/// mechanism -- cannot have created anything. Everything after it is unresolved, and
+/// the caller keeps the part sealed.
+///
+/// **What an implementation must not do** is classify its own error codes as proof.
+/// Two independent reviews rejected that reasoning: first when publication inferred it
+/// from the `StorageError` it was returning, and then when publication checked the
+/// destination *path* after the call -- which cannot see an entry made inside an
+/// adopted folder whose name has since changed, and which the linking call did not use
+/// in the first place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkRefused {
+    error: StorageError,
+    called: bool,
+}
+impl LinkRefused {
+    /// Refused before the call went out, so no entry can exist because of it.
+    pub fn before_the_call(error: StorageError) -> Self {
+        Self {
+            error,
+            called: false,
+        }
+    }
+    /// The call was issued and failed. Whether it left an entry is unresolved.
+    pub fn after_the_call(error: StorageError) -> Self {
+        Self {
+            error,
+            called: true,
+        }
+    }
+    pub fn error(self) -> StorageError {
+        self.error
+    }
+    /// Whether the mechanism issued its call. `false` is the only answer that lets a
+    /// caller conclude no name was created.
+    pub fn called(self) -> bool {
+        self.called
+    }
+}
+impl std::fmt::Display for LinkRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+impl From<LinkRefused> for StorageError {
+    fn from(refused: LinkRefused) -> Self {
+        refused.error
+    }
+}
+
 pub trait HandleLinker: Send + Sync {
     /// Creates `name` in `directory` for the file `file` holds.
     ///
-    /// **An `Err` means no name was created.** Publication writes that to disk
-    /// and acts on it: a refused link is recorded as "the attempt is over and
-    /// nothing was made", and the part is made writable again on that basis.
-    /// An implementation that can fail after creating the name -- a retry
-    /// wrapper that resends a request, a filesystem that reports an existing
-    /// name for one it just made -- would leave the engine unsealing a file the
-    /// user already has.
-    ///
-    /// The single `NtSetInformationFile` the Windows implementation makes
-    /// satisfies this because its failure is atomic. A second implementation
-    /// must say how it does. An independent security review asked for this to
-    /// be written down, having found the code depending on it and the trait
-    /// silent about it.
+    /// **A refusal says whether the call was issued, and nothing more.** See
+    /// `LinkRefused`. An implementation reports `before_the_call` only for what it
+    /// refuses without acting; everything its mechanism returns is
+    /// `after_the_call`, whatever the code. It is not asked, and must not try, to
+    /// say whether the failure left an entry behind.
     fn link(
         &self,
         file: &std::fs::File,
         directory: &std::fs::File,
         name: &std::ffi::OsStr,
-    ) -> Result<(), StorageError>;
+    ) -> Result<(), LinkRefused>;
 
     /// Whether two open handles are the same file.
     ///
@@ -425,27 +479,20 @@ impl From<PublishRefused> for StorageError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameEvidence {
     /// **No name was created, and that is established rather than assumed.** It is
-    /// claimed from a refusal on a path that never reached the linking call, or from
-    /// the linking call's own refusal *together with a check that the requested name
-    /// does not lead to the object being published*.
+    /// claimed only where the linking call was never issued: a refusal on the way to
+    /// it, or the mechanism refusing to act -- see `LinkRefused`.
     ///
-    /// **The check is there because "the call refused" is not the same as "no entry
-    /// exists".** On a local filesystem the link is one system call and the two are
-    /// the same. Over NFS the two come apart: `link(2)` NOTES records that a client
-    /// retry after a lost reply returns `EEXIST` although the link was made, and it
-    /// is the caller's own link. SMB is the same class of risk. So an implementation
-    /// may claim this only when nothing it can see contradicts it, and must answer
-    /// `Unknown` when the name leads to the object it holds.
+    /// **Not from an error the mechanism returned**, and not from looking at the
+    /// destination afterwards. A first version inferred it from the `StorageError`
+    /// publication was returning; a second asked whether the requested *path* led to
+    /// the object being published. Two independent reviews rejected both, the second
+    /// because the linking call uses the adopted folder's handle and not that path:
+    /// an entry made inside a folder whose name has since changed is invisible to it,
+    /// and an identity comparison the platform cannot make proves nothing either.
     ///
-    /// **What the check cannot settle**, and therefore what this answer still
-    /// carries: a name created inside the adopted folder while the requested path no
-    /// longer reaches that folder, and a name the platform could not compare. Both
-    /// read as `NoneCreated`, because the alternative -- treating an unanswerable
-    /// comparison as a doubt -- keeps a part after every ordinary refusal, which is
-    /// the leak this whole mechanism exists to avoid. The residual is stated rather
-    /// than closed.
-    ///
-    /// This is the one answer that permits a later cleanup to remove the part.
+    /// This is the one answer that permits a later cleanup to remove the part, which
+    /// is why it is claimed from control flow rather than from evidence about a
+    /// filesystem nobody identified.
     NoneCreated,
     /// **Nobody can say.** The linking call may have created a name and the
     /// failure came afterwards, or the attempt was interrupted before it could
