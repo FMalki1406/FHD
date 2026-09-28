@@ -248,13 +248,51 @@ export function withoutComments(text) {
 /// inside an attribute are skipped so a `]` in a doc string or a `cfg` value
 /// does not end it early. This is not a Rust parser, which is why the caller
 /// refuses every spelling it does not recognise instead of interpreting it.
+/// The index of the next thing that is not whitespace or a comment.
+///
+/// `#`, `!` and `[` are three tokens, so Rust allows whitespace and comments between
+/// them: `# [allow(unsafe_code)]` and a `#` with the bracket on the next line are both
+/// the attribute they look like. This is what lets the scan see them.
+export function skipTrivia(text, from) {
+  let index = from;
+  while (index < text.length) {
+    const here = text.slice(index, index + 2);
+    if (here === '/*') {
+      let depth = 0;
+      while (index < text.length) {
+        const two = text.slice(index, index + 2);
+        if (two === '/*') { depth += 1; index += 2; continue; }
+        if (two === '*/') { depth -= 1; index += 2; if (depth === 0) break; continue; }
+        index += 1;
+      }
+      continue;
+    }
+    if (here === '//') {
+      while (index < text.length && text[index] !== '\n') index += 1;
+      continue;
+    }
+    if (/\s/u.test(text[index])) { index += 1; continue; }
+    break;
+  }
+  return index;
+}
+
 export function attributesIn(text) {
   const found = [];
   for (let i = 0; i + 1 < text.length; i += 1) {
     if (text[i] !== '#') continue;
-    let open = i + 1;
+    // **The three tokens may be separated, and Rust does not mind.** This used to
+    // require the bracket to sit immediately against the `#`, so
+    // `# [allow(unsafe_code)]` -- and the same thing with a newline between them --
+    // silenced the lint while the gate returned an empty list of offences. A security
+    // review reproduced it. Whitespace and comments are stepped over instead.
+    let open = skipTrivia(text, i + 1);
     const inner = text[open] === '!';
-    if (inner) open += 1;
+    if (inner) open = skipTrivia(text, open + 1);
+    // Not an attribute: a raw string's `r#"`, a `#` inside one, anything else. Those
+    // are left alone -- refusing them would be refusing ordinary Rust -- and what is
+    // refused instead is a `#` that *does* open an attribute and never closes it, just
+    // below.
     if (text[open] !== '[') continue;
     let depth = 0;
     let end = -1;
@@ -291,8 +329,21 @@ export function attributesIn(text) {
         if (depth === 0) { end = j; break; }
       }
     }
-    // An attribute that never closes is malformed; the compiler will say so.
-    if (end === -1) continue;
+    // **An attribute that opens and never closes is reported, not skipped.** The
+    // compiler would refuse the file too, so this costs nothing -- and a gate that
+    // silently ignores what it cannot parse is a gate whose coverage nobody can
+    // state. A security review asked for exactly that: handle the spellings, or refuse
+    // the ones that cannot be read.
+    if (end === -1) {
+      found.push({
+        text: text.slice(i, Math.min(i + 60, text.length)),
+        inner,
+        line: text.slice(0, i).split('\n').length,
+        after: text.length,
+        unreadable: true,
+      });
+      continue;
+    }
     found.push({
       text: text.slice(i, end + 1),
       inner,
@@ -634,8 +685,16 @@ export function unsafeOffendersIn(relative, text) {
   const remaining = [...approved];
   const lines = text.split("\n").map(line => line.replace(/\r$/u, ""));
   for (const attribute of attributesIn(text)) {
-    if (!permitsUnsafe(attribute.text)) continue;
     const where = `${relative}:${attribute.line}`;
+    if (attribute.unreadable) {
+      offenders.push(
+        `${where}: an attribute opens here and never closes, so this gate cannot say ` +
+        'whether it permits unsafe code. Fix the attribute; a form that cannot be read ' +
+        'is refused rather than ignored.',
+      );
+      continue;
+    }
+    if (!permitsUnsafe(attribute.text)) continue;
     if (attribute.inner) {
       offenders.push(
         `${where}: a crate- or module-wide unsafe allowance is never approved. ` +

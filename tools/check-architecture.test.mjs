@@ -453,6 +453,66 @@ test('an item written on the attribute\'s own line is the item that is checked',
   );
 });
 
+/// An attribute whose tokens are separated is still an attribute.
+///
+/// **`#`, `!` and `[` are three tokens**, so Rust accepts whitespace and comments
+/// between them: `# [allow(unsafe_code)]` silences the lint, and so does a `#` with
+/// the bracket on the next line. The scan required the bracket to sit against the
+/// `#`, so both walked past a gate that returned an empty list of offences -- a
+/// security review reproduced it. Every spelling is asserted here in the direction
+/// that matters: reported, not silent.
+test('an attribute with whitespace or a comment between its tokens is not missed', () => {
+  const platform = 'crates/adapters/platform/src/lib.rs';
+  const unapproved = '    pub fn slipped_through(path: &Path) -> io::Result<()> {';
+
+  for (const [name, opening] of [
+    ['a space between the hash and the bracket', '    # [allow(unsafe_code)]'],
+    ['two spaces', '    #  [allow(unsafe_code)]'],
+    ['a tab', '    #\t[allow(unsafe_code)]'],
+    ['a newline', '    #\n    [allow(unsafe_code)]'],
+    ['a comment', '    # /* why this is sound */ [allow(unsafe_code)]'],
+    ['a line comment and a newline', '    # // why\n    [allow(unsafe_code)]'],
+  ]) {
+    const offenders = unsafeOffendersIn(platform, `${opening}\n${unapproved}`);
+    assert.equal(offenders.length, 1, `${name}: ${JSON.stringify(offenders)}`);
+    assert.match(offenders[0], /slipped_through/u, name);
+  }
+
+  // The inner form separated the same way is still refused as crate- or module-wide.
+  assert.match(
+    unsafeOffendersIn(platform, '# ! [allow(unsafe_code)]\npub fn whatever() {}')[0],
+    /crate- or module-wide/u,
+  );
+
+  // And the approved item keeps being approved however its attribute is spaced, or
+  // the gate would be buying this by refusing sound code.
+  assert.deepEqual(
+    unsafeOffendersIn(platform, '    # [allow(unsafe_code)]\n    fn our_uid() -> u32 {'),
+    [],
+  );
+});
+
+/// A `#` that opens an attribute and never closes it is refused, not ignored.
+///
+/// The scan used to skip it on the grounds that the compiler would complain. That is
+/// true and it is not the point: a gate that silently ignores what it cannot parse is
+/// a gate whose coverage nobody can state, and a security review asked for the
+/// unreadable forms to be refused rather than passed over.
+test('an attribute that cannot be read is refused rather than skipped', () => {
+  const platform = 'crates/adapters/platform/src/lib.rs';
+  const offenders = unsafeOffendersIn(
+    platform,
+    '    #[allow(unsafe_code)\n    pub fn slipped_through() {',
+  );
+  assert.equal(offenders.length, 1, JSON.stringify(offenders));
+  assert.match(offenders[0], /opens here and never closes/u);
+
+  // A raw string is not an attribute and is left alone: refusing every `#` the scan
+  // cannot parse as one would refuse ordinary Rust.
+  assert.deepEqual(unsafeOffendersIn(platform, 'let s = r#"[allow(unsafe_code)]"#;'), []);
+  assert.deepEqual(unsafeOffendersIn(platform, 'let n = 1; // count # of things'), []);
+});
+
 test('a restriction is the policy, not a breach of it', () => {
   const clean = 'crates/adapters/storage/src/lib.rs';
   for (const restriction of [
