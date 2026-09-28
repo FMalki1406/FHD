@@ -6,8 +6,29 @@ import { tmpdir } from 'node:os';
 import {
   attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
   doubleEncodedText, itemBelow, shellEscapeWreckage,
+  skipNonCode,
   UNSAFE_ALLOWANCES, unsafeOffendersIn, unusedAllowances, withoutComments,
 } from './check-architecture.mjs';
+import { spawnSync } from 'node:child_process';
+
+/// The compiler these tests put their samples to.
+///
+/// The project keeps Rust under `.tools/` so a machine's own installation is untouched
+/// (`docs/development.md`), and CI installs it on PATH. **A missing compiler fails the
+/// test rather than skipping it**: a sample nobody compiled is not evidence, and a
+/// skipped test reads as a passing one in every summary that matters.
+function resolveRustc() {
+  const candidates = [
+    process.env.RUSTC,
+    join(process.cwd(), '.tools', 'cargo', 'bin', process.platform === 'win32' ? 'rustc.exe' : 'rustc'),
+    'rustc',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const found = spawnSync(candidate, ['--version'], { encoding: 'utf8' });
+    if (!found.error && found.status === 0) return candidate;
+  }
+  assert.fail(`no rustc found; tried ${candidates.join(', ')}`);
+}
 
 function metadata(graph) {
   const packages = Object.entries(graph).map(([name, dependencies]) => ({
@@ -507,10 +528,143 @@ test('an attribute that cannot be read is refused rather than skipped', () => {
   assert.equal(offenders.length, 1, JSON.stringify(offenders));
   assert.match(offenders[0], /opens here and never closes/u);
 
+  // An attribute holding an unterminated literal cannot be read to its end either, and
+  // is refused for the same reason: the walk finds no closing bracket, because the
+  // literal runs to the end of the file.
+  for (const source of [
+    ['    #[doc = r#"never closed]', '    pub fn slipped_through() {'].join('\n'),
+    ['    #[doc = "never closed', '    pub fn slipped_through() {'].join('\n'),
+    ['    #[allow(/* never closed', '    pub fn slipped_through() {'].join('\n'),
+  ]) {
+    const refused = unsafeOffendersIn(platform, source);
+    assert.equal(refused.length, 1, JSON.stringify(refused));
+    assert.match(refused[0], /opens here and never closes/u, source);
+  }
+
   // A raw string is not an attribute and is left alone: refusing every `#` the scan
   // cannot parse as one would refuse ordinary Rust.
   assert.deepEqual(unsafeOffendersIn(platform, 'let s = r#"[allow(unsafe_code)]"#;'), []);
   assert.deepEqual(unsafeOffendersIn(platform, 'let n = 1; // count # of things'), []);
+});
+
+/// Where rustc finds a literal, so does this gate.
+///
+/// **Both samples come from a security review, and both are put to the compiler here.**
+/// The scan used to read text where rustc reads tokens, and it was wrong in both
+/// directions at once:
+///
+/// * a raw string holding a quote and then a `]` ended an attribute early, so the text
+///   came back truncated, did not mention `unsafe_code`, and was dropped -- a real
+///   allowance, invisible, with the gate reporting nothing;
+/// * and `r"# [allow(unsafe_code)]"` in ordinary code was read *as* an attribute, so
+///   valid Rust was refused.
+///
+/// A gate is only as good as its agreement with the compiler, so the agreement is
+/// measured rather than argued: each sample is compiled, and the verdict is compared
+/// with the gate's. The first sample denies unsafe at the crate root and uses `unsafe`
+/// in a body, so it compiles **only because the attribute silenced the lint** -- which
+/// is what makes it a bypass rather than a curiosity.
+test('the gate and the compiler agree about what is a literal', () => {
+  const rustc = resolveRustc();
+  const base = mkdtempSync(join(tmpdir(), 'fhd-attribute-samples-'));
+  try {
+    for (const [name, source, reported] of [
+      [
+        // A raw string with a quote and a `]` in it, in an attribute that allows unsafe.
+        'a raw string inside an allowance',
+        [
+          '#![deny(unsafe_code)]',
+          '#[cfg_attr(not(any(feature = r#"a"b]"#)), allow(unsafe_code))]',
+          'pub fn sneaky() -> u32 {',
+          '    unsafe { core::ptr::read(&7u32 as *const u32) }',
+          '}',
+        ].join('\n'),
+        true,
+      ],
+      [
+        // The same shape with the reason field, which is the approved lint itself.
+        'a raw string in the allowance\'s reason',
+        [
+          '#![deny(unsafe_code)]',
+          '#[allow(unsafe_code, reason = r#"a"b]"#)]',
+          'pub fn sneaky() -> u32 {',
+          '    unsafe { core::ptr::read(&7u32 as *const u32) }',
+          '}',
+        ].join('\n'),
+        true,
+      ],
+      [
+        'a raw string that only looks like an attribute',
+        [
+          '#![deny(unsafe_code)]',
+          'pub fn looks_like_one() -> &\'static str {',
+          '    r"# [allow(unsafe_code)]"',
+          '}',
+        ].join('\n'),
+        false,
+      ],
+      [
+        'hashes inside the raw string',
+        [
+          '#![deny(unsafe_code)]',
+          'pub fn also_looks_like_one() -> &\'static str {',
+          '    r##"#[allow(unsafe_code)]"##',
+          '}',
+        ].join('\n'),
+        false,
+      ],
+    ]) {
+      const file = join(base, `${name.replaceAll(/\W+/gu, '_')}.rs`);
+      writeFileSync(file, `${source}\n`, 'utf8');
+      const compiled = spawnSync(
+        rustc,
+        ['--crate-type', 'lib', '--edition', '2021', '-o', `${file}.rlib`, file],
+        { encoding: 'utf8' },
+      );
+      assert.equal(
+        compiled.status,
+        0,
+        `${name}: the sample must be Rust the compiler accepts, or it proves nothing. ` +
+        `rustc said: ${compiled.stderr}`,
+      );
+      const offenders = unsafeOffendersIn('crates/adapters/platform/src/lib.rs', source);
+      assert.equal(
+        offenders.length > 0,
+        reported,
+        `${name}: the compiler and the gate disagree. offenders: ${JSON.stringify(offenders)}`,
+      );
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/// The literal scan itself, without the compiler, on the shapes that matter.
+test('a literal ends where Rust says it ends', () => {
+  const at = (source) => skipNonCode(source, 0).next;
+  assert.equal(at('"plain"rest'), '"plain"'.length);
+  assert.equal(at('"with \\" quote"rest'), '"with \\" quote"'.length);
+  assert.equal(at('r"raw"rest'), 'r"raw"'.length);
+  assert.equal(at('r#"a"b"#rest'), 'r#"a"b"#'.length, 'a quote inside a raw string ended it');
+  assert.equal(at('r##"a"#b"##rest'), 'r##"a"#b"##'.length, 'the hash count was not matched');
+  assert.equal(at('b"bytes"rest'), 'b"bytes"'.length);
+  assert.equal(at('br#"bytes"#rest'), 'br#"bytes"#'.length);
+  assert.equal(at('// line\nrest'), '// line'.length);
+  assert.equal(at('/* a /* nested */ b */rest'), '/* a /* nested */ b */'.length);
+  assert.equal(at("'x'rest"), "'x'".length);
+  assert.equal(at("'\\n'rest"), "'\\n'".length);
+
+  // A lifetime is not a literal, and must not swallow the text to the next quote.
+  assert.equal(at("'a, T: 'static> { let c = 'x';"), 0, 'a lifetime was read as a literal');
+
+  // An unterminated literal is reported as not closed, which is what makes an
+  // attribute holding one unreadable rather than silently truncated.
+  assert.equal(skipNonCode('r#"never closed', 0).closed, false);
+  assert.equal(skipNonCode('/* never closed', 0).closed, false);
+  assert.equal(skipNonCode('"never closed\n', 0).closed, false);
+
+  // A prefix is only a prefix at the start of a token.
+  assert.equal(skipNonCode('abr"x"', 3).next, 3, 'an identifier ending in r began a raw string');
 });
 
 test('a restriction is the policy, not a breach of it', () => {

@@ -277,10 +277,89 @@ export function skipTrivia(text, from) {
   return index;
 }
 
+/// Whether the character before `at` can be part of an identifier.
+///
+/// A literal's prefix is only a prefix at the start of a token: the `b` in `abr"x"` is
+/// part of a name, not the beginning of a byte string.
+function identifierBefore(text, at) {
+  return at > 0 && /[\p{L}\p{N}_]/u.test(text[at - 1]);
+}
+
+/// The end of the comment or literal that begins at `from`, and whether it was closed.
+///
+/// `{ next, closed }`, with `next === from` where nothing begins there. **This is the
+/// one place that decides what is code**, and both the search for attributes and the
+/// bracket walk inside one use it -- because a security review found the two disagreeing
+/// with the compiler in opposite directions at once. A raw string holding a quote and
+/// then a `]` ended an attribute early, so the text came back truncated, did not mention
+/// `unsafe_code`, and was dropped: a real allowance, invisible, with the gate reporting
+/// nothing. And `r"# [allow(unsafe_code)]"` in ordinary code was read *as* an
+/// attribute, so valid Rust was refused. Both samples were checked against rustc.
+///
+/// What it knows: line and nested block comments; ordinary, byte and C strings with
+/// their escapes; raw strings with any number of hashes, which is what the old scan got
+/// wrong; and character literals, told from lifetimes by requiring a closing quote.
+///
+/// **Where it cannot tell, it treats the text as code.** That direction is deliberate:
+/// reading code as a literal hides an attribute, and reading a literal as code at worst
+/// reports one that is not there, which a person then resolves. A gate may be wrong in
+/// the direction that asks a question, never in the direction that stays quiet.
+export function skipNonCode(text, from) {
+  const here = text.slice(from, from + 2);
+  if (here === '//') {
+    const end = text.indexOf('\n', from);
+    return { next: end === -1 ? text.length : end, closed: true };
+  }
+  if (here === '/*') {
+    let depth = 0;
+    let index = from;
+    while (index < text.length) {
+      const two = text.slice(index, index + 2);
+      if (two === '/*') { depth += 1; index += 2; continue; }
+      if (two === '*/') { depth -= 1; index += 2; if (depth === 0) return { next: index, closed: true }; continue; }
+      index += 1;
+    }
+    return { next: text.length, closed: false };
+  }
+  // A raw string: an optional `b` or `c`, then `r`, then hashes, then the quote. It
+  // ends at a quote followed by exactly as many hashes.
+  const raw = /^(?:b|c)?r(#*)"/u.exec(text.slice(from, from + 40));
+  if (raw && !identifierBefore(text, from)) {
+    const close = `"${'#'.repeat(raw[1].length)}`;
+    const opened = from + raw[0].length;
+    const end = text.indexOf(close, opened);
+    if (end === -1) return { next: text.length, closed: false };
+    return { next: end + close.length, closed: true };
+  }
+  const quoted = /^(?:b|c)?"/u.exec(text.slice(from, from + 3));
+  if (quoted && !identifierBefore(text, from)) {
+    let index = from + quoted[0].length;
+    while (index < text.length) {
+      if (text[index] === '\\') { index += 2; continue; }
+      if (text[index] === '"') return { next: index + 1, closed: true };
+      if (text[index] === '\n') break; // An ordinary string does not span lines unescaped.
+      index += 1;
+    }
+    return { next: text.length, closed: false };
+  }
+  // A character literal, or a lifetime. `'a` is a lifetime and must not swallow the
+  // text to the next quote, so a closing quote is required for this to be a literal.
+  const character = /^b?'(?:\\.|[^'\\\n])'/u.exec(text.slice(from, from + 12));
+  if (character && !identifierBefore(text, from)) {
+    return { next: from + character[0].length, closed: true };
+  }
+  return { next: from, closed: true };
+}
+
 export function attributesIn(text) {
   const found = [];
-  for (let i = 0; i + 1 < text.length; i += 1) {
-    if (text[i] !== '#') continue;
+  let i = 0;
+  while (i < text.length) {
+    // Comments and literals are not code, so nothing is looked for inside them.
+    const outside = skipNonCode(text, i);
+    if (outside.next !== i) { i = outside.next; continue; }
+    if (text[i] !== '#') { i += 1; continue; }
+    const start = i;
     // **The three tokens may be separated, and Rust does not mind.** This used to
     // require the bracket to sit immediately against the `#`, so
     // `# [allow(unsafe_code)]` -- and the same thing with a newline between them --
@@ -289,45 +368,35 @@ export function attributesIn(text) {
     let open = skipTrivia(text, i + 1);
     const inner = text[open] === '!';
     if (inner) open = skipTrivia(text, open + 1);
-    // Not an attribute: a raw string's `r#"`, a `#` inside one, anything else. Those
-    // are left alone -- refusing them would be refusing ordinary Rust -- and what is
-    // refused instead is a `#` that *does* open an attribute and never closes it, just
-    // below.
-    if (text[open] !== '[') continue;
+    // Not an attribute: a `#` in ordinary code, or one this scan reached because it
+    // could not tell a literal from code. Left alone, because refusing it would be
+    // refusing ordinary Rust -- what is refused instead is a `#` that *does* open an
+    // attribute and cannot be read to its end, just below.
+    if (text[open] !== '[') { i += 1; continue; }
     let depth = 0;
     let end = -1;
-    for (let j = open; j < text.length; j += 1) {
+    for (let j = open; j < text.length; ) {
+      // The same decision as outside, for the same reason: a `]` inside a comment or a
+      // literal is not the end of the attribute. `#[allow /* ] */ (unsafe_code)]` and
+      // `#[cfg_attr(feature = r#"a"b]"#, allow(unsafe_code))]` both ended it early
+      // under the two ad-hoc versions this replaces.
+      const literal = skipNonCode(text, j);
+      if (literal.next !== j) {
+        // An unterminated literal runs to the end of the file, so the walk finds no
+        // closing bracket and the attribute is refused below. A separate flag for it
+        // was redundant -- a mutation that removed it changed nothing, because both
+        // paths arrive at the same refusal -- and state nothing can distinguish is
+        // state a reader has to take on trust.
+        j = literal.next;
+        continue;
+      }
       const ch = text[j];
-      // Comments are skipped here, not later. Stripping them afterwards was
-      // too late: `#[allow /* ] */ (unsafe_code)]` ended at the bracket inside
-      // the comment, so the attribute came back as `#[allow /* ]`, which does
-      // not mention unsafe_code and was dropped without ever being examined.
-      // Rust nests block comments, so the depth is counted.
-      if (text.slice(j, j + 2) === '/*') {
-        let comment = 0;
-        while (j < text.length) {
-          const here = text.slice(j, j + 2);
-          if (here === '/*') { comment += 1; j += 2; continue; }
-          if (here === '*/') { comment -= 1; j += 2; if (comment === 0) break; continue; }
-          j += 1;
-        }
-        j -= 1;
-        continue;
-      }
-      if (text.slice(j, j + 2) === '//') {
-        while (j < text.length && text[j] !== '\n') j += 1;
-        continue;
-      }
-      if (ch === '"') {
-        j += 1;
-        while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
-        continue;
-      }
       if (ch === '[') depth += 1;
       else if (ch === ']') {
         depth -= 1;
         if (depth === 0) { end = j; break; }
       }
+      j += 1;
     }
     // **An attribute that opens and never closes is reported, not skipped.** The
     // compiler would refuse the file too, so this costs nothing -- and a gate that
@@ -336,21 +405,22 @@ export function attributesIn(text) {
     // the ones that cannot be read.
     if (end === -1) {
       found.push({
-        text: text.slice(i, Math.min(i + 60, text.length)),
+        text: text.slice(start, Math.min(start + 60, text.length)),
         inner,
-        line: text.slice(0, i).split('\n').length,
+        line: text.slice(0, start).split('\n').length,
         after: text.length,
         unreadable: true,
       });
+      i = start + 1;
       continue;
     }
     found.push({
-      text: text.slice(i, end + 1),
+      text: text.slice(start, end + 1),
       inner,
-      line: text.slice(0, i).split('\n').length,
+      line: text.slice(0, start).split('\n').length,
       after: end + 1,
     });
-    i = end;
+    i = end + 1;
   }
   return found;
 }
