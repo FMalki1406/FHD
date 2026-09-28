@@ -125,6 +125,11 @@ export function plan({ cargo, skipTests }) {
     ]],
     ['architecture-gate', process.execPath, ['tools/check-architecture.mjs']],
     ['architecture-gate-tests', process.execPath, ['tools/check-architecture.test.mjs']],
+    ['unsafe-gate-tests', process.execPath, ['tools/check-unsafe.test.mjs']],
+    // Last of the gates because it is the slow one: it compiles every target in the
+    // workspace under a command-line forbid, which is what makes its answer the
+    // compiler's rather than a scanner's.
+    ['unsafe-gate', process.execPath, ['tools/check-unsafe.mjs']],
     ['coverage-gate-tests', process.execPath, ['tools/check-contract-tests.test.mjs']],
     ['coverage-gate', process.execPath, ['tools/check-contract-tests.mjs']],
   ];

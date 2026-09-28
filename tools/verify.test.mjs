@@ -85,6 +85,8 @@ test('the plan covers the gates and both cross targets', () => {
     'clippy-macos',
     'architecture-gate',
     'architecture-gate-tests',
+    'unsafe-gate-tests',
+    'unsafe-gate',
     'coverage-gate-tests',
     'coverage-gate',
     'tests',

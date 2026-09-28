@@ -63,6 +63,16 @@ jobs:
           node tools/check-architecture.mjs
           node tools/check-contract-tests.test.mjs
           node tools/verify.test.mjs
+          node tools/check-unsafe.test.mjs
+      # Where `unsafe` is permitted, asked of the compiler rather than of a scanner.
+      #
+      # Each job answers for its own platform: the control compiles every target under
+      # a command-line `forbid` and compares what rustc reports with what is approved,
+      # so it sees the configurations this platform builds and says so. Five rounds of
+      # review found five ways past the scanner it replaces, every one of them the same
+      # mistake -- reading text where the compiler reads tokens.
+      - name: Check where unsafe is permitted
+        run: node tools/check-unsafe.mjs
       - name: Check Rust warnings
         run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
       # Split by area on purpose: a job's step names and their results are

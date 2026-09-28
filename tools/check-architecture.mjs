@@ -45,137 +45,6 @@ const legacy = {
 };
 const pureDependencies = new Set(['serde', 'thiserror']);
 
-// The workflow names the packages it tests, one step per area, so a failure on a
-// runner whose logs we cannot read still says where it is. The cost of naming
-// them is that a new member could ship untested; this is that cost paid.
-// Every place in the tree allowed to write `unsafe`: which file, and which item.
-//
-// The policy used to be a comment beside the dependency rules, which is close
-// to not having one. Counting the attributes was the next version and was still
-// too weak: moving an allowance to another item, or widening it from a function
-// to the module around it, keeps the count identical. So an approved allowance
-// names the item it sits on, and an inner `#![allow(unsafe_code)]` -- which
-// covers everything below it -- is never approved.
-//
-// Widening this is an edit to this file, which is reviewed. It is a gate, not
-// the review: an approved entry still needs somebody to have agreed that the
-// call in it is sound.
-export const UNSAFE_ALLOWANCES = new Map([
-  ['crates/adapters/platform/src/lib.rs', [
-    // `our_uid` calls `geteuid(2)`: no arguments, no pointers, cannot fail.
-    'fn our_uid() -> u32 {',
-    // `link_into_directory`, twice: there are two of it, one per platform, and
-    // an entry approves one allowance. Naming both is the point of this list
-    // being a description of the tree rather than a count.
-    //
-    // Windows calls `NtSetInformationFile` with `FILE_LINK_INFORMATION`; Linux
-    // calls `linkat(2)` through the descriptor's entry under `/proc/self/fd`.
-    // Both take borrowed descriptors and a name owned by the caller for longer
-    // than the call, and both are the only route on their system from an open
-    // handle to a new name without resolving a path -- which is the property
-    // the whole publication design rests on.
-    // The return type is part of the entry: it carries whether the mechanism issued
-    // its call, which is the only thing publication may read as "no name was created".
-    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
-    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
-    // `clone_into_directory` calls `fclonefileat(2)` on macOS. Same shape as the
-    // linkers -- borrowed descriptors, a name owned here, a status back -- and
-    // measured rather than adopted: nothing in the engine calls it, and the
-    // publication contract says what adopting it would require first.
-    'pub fn clone_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
-    // `open_in_directory` calls `openat(2)` and `move_into_directory` calls
-    // `renameatx_np`, the second and third steps of the candidate macOS path.
-    // Both take borrowed descriptors and names owned by the caller, and both
-    // are measured rather than adopted: nothing in the engine calls them.
-    'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
-    // This used to be a bare `pub fn move_into_directory(`, because `itemBelow`
-    // returned one trimmed line and this signature is wrapped across five. It was
-    // the weakest entry here -- changing a parameter to `to: &Path`, which is
-    // exactly the regression the publication contract forbids, kept the allowance
-    // satisfied -- and an engineering review said so, adding that pinning it would
-    // mean teaching `itemBelow` to read a whole signature. That is now done, so the
-    // entry says what it was always meant to.
-    'pub fn move_into_directory(from: &File, from_name: &OsStr, to: &File, to_name: &OsStr) -> io::Result<()> {',
-  ]],
-]);
-
-// The item an attribute sits on, **as one line however it is written in the file**:
-// the next line that is not blank, a comment, or another attribute, and every line
-// after it up to the `{` or `;` that ends the item's head.
-//
-// **It used to return that first line and nothing else**, and two things followed.
-// An entry could only pin a signature that rustfmt had left on one line, so widening
-// a parameter from `&File` to `&Path` -- the regression the publication contract
-// exists to forbid -- kept a wrapped signature's allowance satisfied. That was
-// recorded as a known weakness. And it made the gate brittle in the other direction:
-// adding a return type to `link_into_directory` pushed its signature across lines,
-// the recorded entry stopped matching, and CI failed at the gate on two platforms for
-// a change that had nothing to do with `unsafe`.
-//
-// So the head is joined and normalised to the form a reader would write it in: one
-// space between tokens, no padding just inside the brackets, and no trailing comma
-// before the closing one. An entry therefore says the same thing whether the file has
-// the signature on one line or five.
-export function itemBelow(lines, from, rest = '') {
-  const head = [];
-  // **What follows the attribute on its own line is part of the item.**
-  //
-  // This is where an unapproved function used to walk through. The scan began on
-  // the *next* line, so `#[allow(unsafe_code)] pub fn whatever() {` had its item
-  // read from the line below -- and where that line held an approved signature,
-  // the allowance was matched and the function that actually carried it was never
-  // examined. An independent review reproduced the pass with no offence reported.
-  // Leading attributes on the same line are stepped over the same way they are on
-  // lines of their own.
-  const sameLine = pastAttributes(rest);
-  if (sameLine) {
-    head.push(sameLine);
-    if (sameLine.endsWith('{') || sameLine.endsWith(';')) {
-      return normalizeItem(head.join(' '));
-    }
-  }
-  let index = from + 1;
-  for (; index < lines.length; index += 1) {
-    const line = lines[index].trim();
-    if (!line || line.startsWith('//') || line.startsWith('#[') || line.startsWith('#![')) continue;
-    break;
-  }
-  if (index >= lines.length) return head.length ? normalizeItem(head.join(' ')) : '<end of file>';
-  // Twenty lines is far more than any signature in this tree and stops a file
-  // without a terminator from being read to its end.
-  for (let scan = index; scan < lines.length && scan < index + 20; scan += 1) {
-    const line = lines[scan].trim();
-    if (line) head.push(line);
-    if (line.endsWith('{') || line.endsWith(';')) break;
-  }
-  return normalizeItem(head.join(' '));
-}
-
-/// `text` past any attributes it begins with, and past comments, or `''` if there is
-/// nothing else on it.
-///
-/// Used for the remainder of an attribute's own line: `#[allow(unsafe_code)]` can be
-/// followed by `#[cfg(unix)] pub fn x() {`, and the item is what comes after both.
-export function pastAttributes(text) {
-  let rest = withoutComments(text).replace(/\r$/u, '').trimStart();
-  while (rest.startsWith('#[') || rest.startsWith('#![')) {
-    const [found] = attributesIn(rest);
-    if (!found || !rest.startsWith(found.text)) break;
-    rest = rest.slice(found.after).trimStart();
-  }
-  return rest.trim();
-}
-
-/// One line, spaced the way a signature is written rather than the way it is wrapped.
-export function normalizeItem(text) {
-  return text
-    .replace(/\s+/gu, ' ')
-    .replace(/\(\s+/gu, '(')
-    .replace(/,\s*\)/gu, ')')
-    .replace(/\s+\)/gu, ')')
-    .trim();
-}
-
 /// `text` with Rust comments removed, leaving string literals alone.
 ///
 /// F1 in the re-review of 11dd794: `#[allow /* reason */ (unsafe_code)]` is
@@ -237,234 +106,10 @@ export function withoutComments(text) {
   return out;
 }
 
-/// Every attribute in `text`, as whole attributes rather than lines.
-///
-/// A line-based scan was the flaw the review of 2026-09-24 found: it matched
-/// the prefix `#[allow(unsafe_code)]` and nothing else, so `#[allow(dead_code,
-/// unsafe_code)]`, `#[cfg_attr(unix, allow(unsafe_code))]` and any attribute
-/// split across lines went straight past a gate that claimed to bound them.
-///
-/// Brackets are matched so a nested attribute comes back whole. String literals
-/// inside an attribute are skipped so a `]` in a doc string or a `cfg` value
-/// does not end it early. This is not a Rust parser, which is why the caller
-/// refuses every spelling it does not recognise instead of interpreting it.
-/// The index of the next thing that is not whitespace or a comment.
-///
-/// `#`, `!` and `[` are three tokens, so Rust allows whitespace and comments between
-/// them: `# [allow(unsafe_code)]` and a `#` with the bracket on the next line are both
-/// the attribute they look like. This is what lets the scan see them.
-export function skipTrivia(text, from) {
-  let index = from;
-  while (index < text.length) {
-    const here = text.slice(index, index + 2);
-    if (here === '/*') {
-      let depth = 0;
-      while (index < text.length) {
-        const two = text.slice(index, index + 2);
-        if (two === '/*') { depth += 1; index += 2; continue; }
-        if (two === '*/') { depth -= 1; index += 2; if (depth === 0) break; continue; }
-        index += 1;
-      }
-      continue;
-    }
-    if (here === '//') {
-      while (index < text.length && text[index] !== '\n') index += 1;
-      continue;
-    }
-    if (/\s/u.test(text[index])) { index += 1; continue; }
-    break;
-  }
-  return index;
-}
 
-/// Whether the character before `at` can be part of an identifier.
-///
-/// A literal's prefix is only a prefix at the start of a token: the `b` in `abr"x"` is
-/// part of a name, not the beginning of a byte string.
-function identifierBefore(text, at) {
-  return at > 0 && /[\p{L}\p{N}_]/u.test(text[at - 1]);
-}
 
-/// The end of the comment or literal that begins at `from`, and whether it was closed.
-///
-/// `{ next, closed }`, with `next === from` where nothing begins there. **This is the
-/// one place that decides what is code**, and both the search for attributes and the
-/// bracket walk inside one use it -- because a security review found the two disagreeing
-/// with the compiler in opposite directions at once. A raw string holding a quote and
-/// then a `]` ended an attribute early, so the text came back truncated, did not mention
-/// `unsafe_code`, and was dropped: a real allowance, invisible, with the gate reporting
-/// nothing. And `r"# [allow(unsafe_code)]"` in ordinary code was read *as* an
-/// attribute, so valid Rust was refused. Both samples were checked against rustc.
-///
-/// What it knows: line and nested block comments; ordinary, byte and C strings with
-/// their escapes; raw strings with any number of hashes, which is what the old scan got
-/// wrong; and character literals, told from lifetimes by requiring a closing quote.
-///
-/// **Where it cannot tell, it treats the text as code.** That direction is deliberate:
-/// reading code as a literal hides an attribute, and reading a literal as code at worst
-/// reports one that is not there, which a person then resolves. A gate may be wrong in
-/// the direction that asks a question, never in the direction that stays quiet.
-export function skipNonCode(text, from) {
-  const here = text.slice(from, from + 2);
-  if (here === '//') {
-    const end = text.indexOf('\n', from);
-    return { next: end === -1 ? text.length : end, closed: true };
-  }
-  if (here === '/*') {
-    let depth = 0;
-    let index = from;
-    while (index < text.length) {
-      const two = text.slice(index, index + 2);
-      if (two === '/*') { depth += 1; index += 2; continue; }
-      if (two === '*/') { depth -= 1; index += 2; if (depth === 0) return { next: index, closed: true }; continue; }
-      index += 1;
-    }
-    return { next: text.length, closed: false };
-  }
-  // A raw string: an optional `b` or `c`, then `r`, then hashes, then the quote. It
-  // ends at a quote followed by exactly as many hashes.
-  const raw = /^(?:b|c)?r(#*)"/u.exec(text.slice(from, from + 40));
-  if (raw && !identifierBefore(text, from)) {
-    const close = `"${'#'.repeat(raw[1].length)}`;
-    const opened = from + raw[0].length;
-    const end = text.indexOf(close, opened);
-    if (end === -1) return { next: text.length, closed: false };
-    return { next: end + close.length, closed: true };
-  }
-  const quoted = /^(?:b|c)?"/u.exec(text.slice(from, from + 3));
-  if (quoted && !identifierBefore(text, from)) {
-    let index = from + quoted[0].length;
-    while (index < text.length) {
-      if (text[index] === '\\') { index += 2; continue; }
-      if (text[index] === '"') return { next: index + 1, closed: true };
-      if (text[index] === '\n') break; // An ordinary string does not span lines unescaped.
-      index += 1;
-    }
-    return { next: text.length, closed: false };
-  }
-  // A character literal, or a lifetime. `'a` is a lifetime and must not swallow the
-  // text to the next quote, so a closing quote is required for this to be a literal.
-  const character = /^b?'(?:\\.|[^'\\\n])'/u.exec(text.slice(from, from + 12));
-  if (character && !identifierBefore(text, from)) {
-    return { next: from + character[0].length, closed: true };
-  }
-  return { next: from, closed: true };
-}
 
-export function attributesIn(text) {
-  const found = [];
-  let i = 0;
-  while (i < text.length) {
-    // Comments and literals are not code, so nothing is looked for inside them.
-    const outside = skipNonCode(text, i);
-    if (outside.next !== i) { i = outside.next; continue; }
-    if (text[i] !== '#') { i += 1; continue; }
-    const start = i;
-    // **The three tokens may be separated, and Rust does not mind.** This used to
-    // require the bracket to sit immediately against the `#`, so
-    // `# [allow(unsafe_code)]` -- and the same thing with a newline between them --
-    // silenced the lint while the gate returned an empty list of offences. A security
-    // review reproduced it. Whitespace and comments are stepped over instead.
-    let open = skipTrivia(text, i + 1);
-    const inner = text[open] === '!';
-    if (inner) open = skipTrivia(text, open + 1);
-    // Not an attribute: a `#` in ordinary code, or one this scan reached because it
-    // could not tell a literal from code. Left alone, because refusing it would be
-    // refusing ordinary Rust -- what is refused instead is a `#` that *does* open an
-    // attribute and cannot be read to its end, just below.
-    if (text[open] !== '[') { i += 1; continue; }
-    let depth = 0;
-    let end = -1;
-    for (let j = open; j < text.length; ) {
-      // The same decision as outside, for the same reason: a `]` inside a comment or a
-      // literal is not the end of the attribute. `#[allow /* ] */ (unsafe_code)]` and
-      // `#[cfg_attr(feature = r#"a"b]"#, allow(unsafe_code))]` both ended it early
-      // under the two ad-hoc versions this replaces.
-      const literal = skipNonCode(text, j);
-      if (literal.next !== j) {
-        // An unterminated literal runs to the end of the file, so the walk finds no
-        // closing bracket and the attribute is refused below. A separate flag for it
-        // was redundant -- a mutation that removed it changed nothing, because both
-        // paths arrive at the same refusal -- and state nothing can distinguish is
-        // state a reader has to take on trust.
-        j = literal.next;
-        continue;
-      }
-      const ch = text[j];
-      if (ch === '[') depth += 1;
-      else if (ch === ']') {
-        depth -= 1;
-        if (depth === 0) { end = j; break; }
-      }
-      j += 1;
-    }
-    // **An attribute that opens and never closes is reported, not skipped.** The
-    // compiler would refuse the file too, so this costs nothing -- and a gate that
-    // silently ignores what it cannot parse is a gate whose coverage nobody can
-    // state. A security review asked for exactly that: handle the spellings, or refuse
-    // the ones that cannot be read.
-    if (end === -1) {
-      found.push({
-        text: text.slice(start, Math.min(start + 60, text.length)),
-        inner,
-        line: text.slice(0, start).split('\n').length,
-        after: text.length,
-        unreadable: true,
-      });
-      i = start + 1;
-      continue;
-    }
-    found.push({
-      text: text.slice(start, end + 1),
-      inner,
-      line: text.slice(0, start).split('\n').length,
-      after: end + 1,
-    });
-    i = end + 1;
-  }
-  return found;
-}
 
-/// Whether an attribute's text would permit unsafe code somewhere.
-///
-/// `allow` and `expect` both silence `deny(unsafe_code)`; `expect` was missed
-/// entirely before. `deny` and `forbid` mentions are the policy itself and are
-/// left alone -- but only when the attribute does not *also* allow, so
-/// `cfg_attr(windows, allow(unsafe_code))` beside a deny is still caught.
-function permitsUnsafe(text) {
-  const bare = withoutComments(text);
-  if (!bare.includes('unsafe_code')) return false;
-  const stripped = bare.replaceAll(/\s+/gu, '');
-  return stripped.includes('allow(') || stripped.includes('expect(');
-}
-
-export function checkUnsafePolicy(root) {
-  const offenders = [];
-  // Which approved items were actually found, so the list can be checked
-  // against the tree once every file has been read.
-  const seen = new Map();
-  walkSources(`${root}/crates`, (full) => {
-    if (!full.endsWith('.rs')) return;
-    const relative = full.slice(root.length + 1).split('\\').join('/');
-    const text = readFileSync(full, 'utf8');
-    offenders.push(...unsafeOffendersIn(relative, text));
-    seen.set(relative, allowedItemsIn(text));
-  });
-  offenders.push(...unusedAllowances(seen));
-  return offenders;
-}
-
-/// The items an approved-spelling allowance sits on in this text.
-function allowedItemsIn(text) {
-  const lines = text.split("\n").map(line => line.replace(/\r$/u, ""));
-  const items = [];
-  for (const attribute of attributesIn(text)) {
-    if (!permitsUnsafe(attribute.text) || attribute.inner) continue;
-    if (withoutComments(attribute.text).replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') continue;
-    items.push(itemBelow(lines, attribute.line - 1));
-  }
-  return items;
-}
 
 /// Source files git would treat as binary, so no diff of them is ever reviewed.
 ///
@@ -747,85 +392,7 @@ export function walkSources(directory, visit) {
   }
 }
 
-/// The policy itself, over one file's text. Exported so it can be tested on
-/// spellings that do not exist in the tree.
-export function unsafeOffendersIn(relative, text) {
-  const offenders = [];
-  const approved = UNSAFE_ALLOWANCES.get(relative) ?? [];
-  const remaining = [...approved];
-  const lines = text.split("\n").map(line => line.replace(/\r$/u, ""));
-  for (const attribute of attributesIn(text)) {
-    const where = `${relative}:${attribute.line}`;
-    if (attribute.unreadable) {
-      offenders.push(
-        `${where}: an attribute opens here and never closes, so this gate cannot say ` +
-        'whether it permits unsafe code. Fix the attribute; a form that cannot be read ' +
-        'is refused rather than ignored.',
-      );
-      continue;
-    }
-    if (!permitsUnsafe(attribute.text)) continue;
-    if (attribute.inner) {
-      offenders.push(
-        `${where}: a crate- or module-wide unsafe allowance is never approved. ` +
-        'Attach it to the one item that needs it.',
-      );
-      continue;
-    }
-    // One spelling is approved, and everything else is refused rather than
-    // interpreted. A gate that guesses at what an attribute means is a gate
-    // whose coverage nobody can state.
-    if (withoutComments(attribute.text).replaceAll(/\s+/gu, '') !== '#[allow(unsafe_code)]') {
-      offenders.push(
-        `${where}: unsafe is permitted by a spelling this gate does not accept: ` +
-        `${attribute.text.replaceAll(/\s+/gu, ' ')}. Write it as #[allow(unsafe_code)] ` +
-        'on the single item that needs it, so the allowance has one reviewable form.',
-      );
-      continue;
-    }
-    // The line the attribute *ends* on, which is not its first where it wraps, and
-    // whatever is left on that line after the closing bracket.
-    const endLine = text.slice(0, attribute.after).split('\n').length;
-    const rest = text.slice(attribute.after).split('\n', 1)[0];
-    const item = itemBelow(lines, endLine - 1, rest);
-    const at = remaining.indexOf(item);
-    if (at === -1) {
-      offenders.push(
-        `${where}: unsafe allowed on an item that is not approved: ${item}. ` +
-        'Add it to UNSAFE_ALLOWANCES in this file, which is reviewed, or remove it.',
-      );
-      continue;
-    }
-    remaining.splice(at, 1);
-  }
-  return offenders;
-}
 
-/// Approved allowances that no longer exist in the tree.
-///
-/// This used to live inside `unsafeOffendersIn`, which is a predicate over one
-/// file's *text* -- so it answered "this approved item is missing" for every
-/// synthetic source a test handed it, and the tests only passed while the list
-/// happened to hold a single entry that they happened to include. Whether the
-/// list still describes the tree is a question about the tree, so it is asked
-/// where the tree is read.
-export function unusedAllowances(seen) {
-  const offenders = [];
-  for (const [relative, approved] of UNSAFE_ALLOWANCES) {
-    const remaining = [...approved];
-    for (const item of seen.get(relative) ?? []) {
-      const at = remaining.indexOf(item);
-      if (at !== -1) remaining.splice(at, 1);
-    }
-    for (const unused of remaining) {
-      offenders.push(
-        `${relative}: approved unsafe allowance is no longer present: ${unused}. ` +
-        'Remove it from UNSAFE_ALLOWANCES so the list stays a description of the tree.',
-      );
-    }
-  }
-  return offenders;
-}
 
 export function checkTestCoverage(metadata, workflow) {
   const members = metadata.workspace_members
@@ -914,11 +481,14 @@ function main(args) {
   const workflow = readFileSync(fileURLToPath(new URL('../.github/workflows/engine.yml', import.meta.url)), 'utf8');
   const untested = checkTestCoverage(metadata, workflow);
   if (untested.length) throw new Error(`Untested workspace members:\n${untested.join('\n')}`);
-  // An unsafe allowance that nobody approved would otherwise be one attribute
-  // away from being policy.
+  // **Where unsafe is permitted is no longer decided here.** It was decided by reading
+  // attributes out of the source, and four rounds of review found four ways past that
+  // reading -- all of them the same mistake, text where the compiler reads tokens. It
+  // now lives in `tools/check-unsafe.mjs`, which compiles the workspace under a
+  // command-line `forbid` and compares what the compiler reports with what is
+  // approved. This gate keeps the questions that are about the tree's shape rather than
+  // about Rust's grammar.
   const root = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/u, '');
-  const unapproved = checkUnsafePolicy(root);
-  if (unapproved.length) throw new Error(`Unapproved unsafe allowances:\n${unapproved.join('\n')}`);
   // A source file git diffs as binary cannot be reviewed at all, which is worse
   // than any single rule this gate enforces on what the file says.
   const unreviewable = checkReviewableSources(root);
@@ -926,7 +496,7 @@ function main(args) {
   // Says what was scanned, not "every source". A review pointed out that the
   // previous wording claimed more than the walk covers, which is the same kind
   // of overclaim this gate exists to make expensive.
-  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, unsafe allowances as approved, no NUL bytes, stray shell escapes or twice-decoded text in ${TREES.map((tree) => tree || '<root>').join('/')} sources).`);
+  console.log(`Architecture dependency rules passed (${metadata.workspace_members.length} workspace packages, each named by a test step, no NUL bytes, stray shell escapes or twice-decoded text in ${TREES.map((tree) => tree || '<root>').join('/')} sources). Where unsafe is permitted is checked by tools/check-unsafe.mjs, against the compiler.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
