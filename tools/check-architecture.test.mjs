@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   attributesIn, checkArchitecture, checkReviewableSources, checkTestCoverage,
-  doubleEncodedText, shellEscapeWreckage,
+  doubleEncodedText, itemBelow, shellEscapeWreckage,
   UNSAFE_ALLOWANCES, unsafeOffendersIn, unusedAllowances, withoutComments,
 } from './check-architecture.mjs';
 
@@ -291,7 +291,7 @@ test('an approved allowance that no longer exists in the tree is reported', () =
   // Found once, approved twice -- which is the shape of a platform-specific
   // item with one implementation per system -- still reports the missing one.
   const linker =
-    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {';
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {';
   // Every other approved item, each approved exactly once. Read from the list
   // rather than copied out of it: the question here is whether a *duplicate*
   // entry found once is reported, and spelling the singles out again would make
@@ -310,6 +310,86 @@ test('an approved allowance that no longer exists in the tree is reported', () =
 
   // And everything present reports nothing.
   assert.deepEqual(unusedAllowances(new Map([[platform, [...singles, linker, linker]]])), []);
+});
+
+/// A signature is read as one line however the file wraps it.
+///
+/// **This is why the gate broke, and why the fix is here rather than in the entry.**
+/// An allowance used to be pinned to the first line below the attribute, so an entry
+/// could only name a signature rustfmt had left on one line. Adding a return type to
+/// `link_into_directory` pushed it across five lines, the entry stopped matching, and
+/// CI failed at the gate on two platforms over a change that had nothing to do with
+/// `unsafe`. The other half of the same weakness was already recorded: a wrapped
+/// signature could only be approved by its bare `fn name(`, which left a parameter
+/// free to change from `&File` to `&Path` -- the one regression the publication
+/// contract exists to forbid -- with the allowance still satisfied.
+test('an item is read as one line however its signature is wrapped', () => {
+  const wrapped = [
+    '    #[allow(unsafe_code)]',
+    '    pub fn link_into_directory(',
+    '        file: &File,',
+    '        directory: &File,',
+    '        name: &OsStr,',
+    '    ) -> Result<(), LinkFailure> {',
+  ];
+  assert.equal(
+    itemBelow(wrapped, 0),
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
+  );
+
+  // The same signature on one line reads identically, which is the point: an entry
+  // says the same thing whichever way the file is formatted.
+  assert.equal(
+    itemBelow(
+      [
+        '    #[allow(unsafe_code)]',
+        '    pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
+      ],
+      0,
+    ),
+    itemBelow(wrapped, 0),
+  );
+
+  // Comments, blank lines and further attributes are still walked over, and the head
+  // stops at the brace rather than running into the body.
+  assert.equal(
+    itemBelow(
+      [
+        '#[allow(unsafe_code)]',
+        '// why this one is sound',
+        '',
+        '#[cfg(target_os = "linux")]',
+        'pub fn our_uid() -> u32 {',
+        '    let value = 0;',
+      ],
+      0,
+    ),
+    'pub fn our_uid() -> u32 {',
+  );
+
+  // A declaration that ends in a semicolon is a head too.
+  assert.equal(
+    itemBelow(['#[allow(unsafe_code)]', 'extern "C" {', '    fn geteuid() -> u32;'], 0),
+    'extern "C" {',
+  );
+
+  // And a parameter that changed is a different item, which is the property the
+  // strengthened entry rests on.
+  assert.notEqual(
+    itemBelow(
+      [
+        '    #[allow(unsafe_code)]',
+        '    pub fn move_into_directory(',
+        '        from: &File,',
+        '        from_name: &OsStr,',
+        '        to: &Path,',
+        '        to_name: &OsStr,',
+        '    ) -> io::Result<()> {',
+      ],
+      0,
+    ),
+    'pub fn move_into_directory(from: &File, from_name: &OsStr, to: &File, to_name: &OsStr) -> io::Result<()> {',
+  );
 });
 
 test('a restriction is the policy, not a breach of it', () => {

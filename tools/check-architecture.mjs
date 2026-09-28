@@ -74,8 +74,10 @@ export const UNSAFE_ALLOWANCES = new Map([
     // than the call, and both are the only route on their system from an open
     // handle to a new name without resolving a path -- which is the property
     // the whole publication design rests on.
-    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
-    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {',
+    // The return type is part of the entry: it carries whether the mechanism issued
+    // its call, which is the only thing publication may read as "no name was created".
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
+    'pub fn link_into_directory(file: &File, directory: &File, name: &OsStr) -> Result<(), LinkFailure> {',
     // `clone_into_directory` calls `fclonefileat(2)` on macOS. Same shape as the
     // linkers -- borrowed descriptors, a name owned here, a status back -- and
     // measured rather than adopted: nothing in the engine calls it, and the
@@ -86,29 +88,61 @@ export const UNSAFE_ALLOWANCES = new Map([
     // Both take borrowed descriptors and names owned by the caller, and both
     // are measured rather than adopted: nothing in the engine calls them.
     'pub fn open_in_directory(directory: &File, name: &OsStr) -> io::Result<File> {',
-    // This one is a bare `pub fn move_into_directory(` because `itemBelow`
-    // returns a single trimmed line and the signature is wrapped across several.
-    // So it is the weakest entry here: changing a parameter -- `to: &Path`
-    // instead of `to: &File`, which is exactly the regression the publication
-    // contract forbids -- keeps the allowance satisfied. An engineering review
-    // pointed that out. Pinning it would mean teaching `itemBelow` to read a
-    // whole signature, and the entry is left as it is with the limit written
-    // down rather than papered over: the parameters are also asserted by
-    // `crates/adapters/platform/tests/publication_macos.rs`, which would stop
-    // compiling if they changed.
-    'pub fn move_into_directory(',
+    // This used to be a bare `pub fn move_into_directory(`, because `itemBelow`
+    // returned one trimmed line and this signature is wrapped across five. It was
+    // the weakest entry here -- changing a parameter to `to: &Path`, which is
+    // exactly the regression the publication contract forbids, kept the allowance
+    // satisfied -- and an engineering review said so, adding that pinning it would
+    // mean teaching `itemBelow` to read a whole signature. That is now done, so the
+    // entry says what it was always meant to.
+    'pub fn move_into_directory(from: &File, from_name: &OsStr, to: &File, to_name: &OsStr) -> io::Result<()> {',
   ]],
 ]);
 
-// The item an attribute sits on: the next line that is not blank, a comment, or
-// another attribute.
-function itemBelow(lines, from) {
-  for (let index = from + 1; index < lines.length; index += 1) {
+// The item an attribute sits on, **as one line however it is written in the file**:
+// the next line that is not blank, a comment, or another attribute, and every line
+// after it up to the `{` or `;` that ends the item's head.
+//
+// **It used to return that first line and nothing else**, and two things followed.
+// An entry could only pin a signature that rustfmt had left on one line, so widening
+// a parameter from `&File` to `&Path` -- the regression the publication contract
+// exists to forbid -- kept a wrapped signature's allowance satisfied. That was
+// recorded as a known weakness. And it made the gate brittle in the other direction:
+// adding a return type to `link_into_directory` pushed its signature across lines,
+// the recorded entry stopped matching, and CI failed at the gate on two platforms for
+// a change that had nothing to do with `unsafe`.
+//
+// So the head is joined and normalised to the form a reader would write it in: one
+// space between tokens, no padding just inside the brackets, and no trailing comma
+// before the closing one. An entry therefore says the same thing whether the file has
+// the signature on one line or five.
+export function itemBelow(lines, from) {
+  let index = from + 1;
+  for (; index < lines.length; index += 1) {
     const line = lines[index].trim();
     if (!line || line.startsWith('//') || line.startsWith('#[') || line.startsWith('#![')) continue;
-    return line;
+    break;
   }
-  return '<end of file>';
+  if (index >= lines.length) return '<end of file>';
+  const head = [];
+  // Twenty lines is far more than any signature in this tree and stops a file
+  // without a terminator from being read to its end.
+  for (let scan = index; scan < lines.length && scan < index + 20; scan += 1) {
+    const line = lines[scan].trim();
+    if (line) head.push(line);
+    if (line.endsWith('{') || line.endsWith(';')) break;
+  }
+  return normalizeItem(head.join(' '));
+}
+
+/// One line, spaced the way a signature is written rather than the way it is wrapped.
+export function normalizeItem(text) {
+  return text
+    .replace(/\s+/gu, ' ')
+    .replace(/\(\s+/gu, '(')
+    .replace(/,\s*\)/gu, ')')
+    .replace(/\s+\)/gu, ')')
+    .trim();
 }
 
 /// `text` with Rust comments removed, leaving string literals alone.
