@@ -48,6 +48,12 @@ const OVERHEAD: usize = 1024 * 1024;
 ///   * `RELEASES` says the whole path ran: a non-null pointer, a size the allocator reported
 ///     inside the bound, the wipe, and `LocalFree` returning.
 ///
+/// **`LocalFree` returning is not `LocalFree` succeeding**, and nothing here reads its
+/// result: it returns null on success and the handle on failure, and that value is
+/// discarded. So `RELEASES` witnesses that the release was reached and the call came back,
+/// not that the allocator accepted it. A review named this as a limit on what the counter
+/// proves, and it is written here so the counter is not read for more than it says.
+///
 /// **This is the smallest instrumentation that makes the wiring a fact rather than a
 /// reading.** Two rounds of review found the same gap: the wipe's own bound is measured,
 /// but nothing asserted that `transform` is connected to it at all. An engineering review
