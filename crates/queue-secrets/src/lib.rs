@@ -187,24 +187,29 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
         /// and it still covers what it was for: on `unprotect` this buffer holds the
         /// plaintext.
         ///
-        /// **What this does not establish** is that a non-null `pbData` is DPAPI's own
-        /// allocation. Nothing can: a review measured `LocalSize` terminating the process
-        /// for a freed handle and reporting a plausible size for an unrelated heap block,
-        /// so asking the allocator is not a validity test. What makes the call below sound
-        /// is DPAPI's contract plus the measurement that a failed `CryptUnprotectData`
-        /// leaves this pointer null -- recorded as a residual risk in
-        /// `docs/execution-status.md`, not as a closed one.
+        /// **This type exists only where DPAPI has reported success.** It used to wrap the
+        /// blob before the call, so the allocator was asked about `pbData` on the failure
+        /// path too -- and a review was right to refuse that: a measurement that one
+        /// particular failure leaves the pointer null is not a guarantee about every
+        /// failure, and this crate's own comments say that asking `LocalSize` about a
+        /// pointer that is not a handle can end the process. So the guard is constructed
+        /// from the blob only after the call returns non-zero, which is the one state in
+        /// which the pointer is DPAPI's to measure and release. On failure nothing here
+        /// runs, because there is nothing here.
+        ///
+        /// What that costs is written where the decision is, at the failure path below: if
+        /// a failing call ever did allocate, that block is leaked and not wiped. Leaking
+        /// memory this code cannot vouch for is the lesser harm.
         ///
         /// The two allocator calls are passed to `wipe_and_release` instead of being made
         /// here, which is what lets a test report a size and check that the wipe stops
         /// there and that a zero frees nothing.
         fn drop(&mut self) {
             // SAFETY: `LocalSize` reports the length of the block `pbData` points at, and
-            // `LocalFree` releases exactly that pointer, which is how DPAPI documents its
-            // output; this is its only release. No reference into the block is live -- the
-            // copy out of it in `transform` is finished before `Output` is dropped. The
-            // pointer is DPAPI's by its contract, and by measurement a failed call leaves
-            // it null, which returns before either closure is reached.
+            // `LocalFree` releases exactly that pointer, which is how DPAPI documents the
+            // output of a call that succeeded; this is its only release, and this type is
+            // only ever built from such a call. No reference into the block is live -- the
+            // copy out of it in `transform` is finished before `Output` is dropped.
             unsafe {
                 wipe_and_release(
                     self.0.pbData,
@@ -216,13 +221,15 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
             }
         }
     }
-    let mut output = Output(CRYPT_INTEGER_BLOB {
+    // A plain blob, not the guard: until the call reports success, nothing here is known to
+    // be an allocation, and the guard's whole job is to release one.
+    let mut blob = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
-    });
+    };
     // SAFETY: valid bounded buffers/structs remain live through the synchronous
     // call. Optional arguments are null. DPAPI allocates output with LocalAlloc;
-    // it is copied only after success and always released using LocalFree below.
+    // it is copied only after success and released through the guard built below.
     let success = unsafe {
         if encrypt {
             CryptProtectData(
@@ -232,7 +239,7 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output.0,
+                &mut blob,
             )
         } else {
             CryptUnprotectData(
@@ -242,24 +249,31 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output.0,
+                &mut blob,
             )
         }
     };
-    if success == 0
-        || output.0.pbData.is_null()
-        || output.0.cbData == 0
-        || output.0.cbData as usize > MAX_INPUT
-    {
-        Err(Error::ProtectionFailed)
-    } else {
-        // SAFETY: successful DPAPI call gives cbData initialized bytes valid until
-        // LocalFree; the returned Rust vector owns its independent allocation.
-        Ok(
-            unsafe { std::slice::from_raw_parts(output.0.pbData, output.0.cbData as usize) }
-                .to_vec(),
-        )
+    if success == 0 {
+        // **The failure path touches nothing.** Not `LocalSize`, not `LocalFree`, not the
+        // pointer. A review refused the previous version for a reason that holds: the
+        // measurement that a failed `CryptUnprotectData` leaves `pbData` null covers the
+        // failure that was measured, not every failure -- and if `pbData` were ever left
+        // pointing at something that is not a `LocalAlloc` handle, asking the allocator
+        // about it can end the process, as the note on `wipe_and_release` records from
+        // measurement. **The cost, stated rather than hidden:** should a failing call ever
+        // allocate, that block leaks un-wiped. Microsoft documents no such allocation; and a
+        // write into memory this code cannot vouch for is worse than a leak.
+        return Err(Error::ProtectionFailed);
     }
+    // Success. Only now is this pointer DPAPI's allocation, and only now does the guard that
+    // wipes and frees it exist.
+    let output = Output(blob);
+    if output.0.pbData.is_null() || output.0.cbData == 0 || output.0.cbData as usize > MAX_INPUT {
+        return Err(Error::ProtectionFailed);
+    }
+    // SAFETY: successful DPAPI call gives cbData initialized bytes valid until
+    // LocalFree; the returned Rust vector owns its independent allocation.
+    Ok(unsafe { std::slice::from_raw_parts(output.0.pbData, output.0.cbData as usize) }.to_vec())
 }
 
 #[cfg(all(test, windows))]

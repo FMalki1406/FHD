@@ -168,12 +168,21 @@ export const APPROVED = new Map([
 /// expansion carries no byte offset contributes `unknown`, which folds -- deliberately:
 /// `unaudited` reports a span with no offset, so a count is never quietly taken from one.
 /// The walk is bounded because the chain is data from a process, not a promise.
+///
+/// **Each hop carries its file, not just its offset.** A byte offset means nothing without
+/// the file it is an offset into: the diagnostics for a macro used from two different files
+/// all name the macro's own file as their primary span, so the call sites were the only
+/// thing telling them apart -- and two invocations that happen to sit at the same offset in
+/// their respective files folded into one use. A review named it, and the test writes two
+/// byte-identical modules so the offsets really do collide.
 export function expansionOf(span, limit = 16) {
   const through = [];
   let hop = span?.expansion;
   while (hop && through.length < limit) {
     const at = hop.span?.byte_start;
-    through.push(typeof at === 'number' ? at : 'unknown');
+    const file = hop.span?.file_name;
+    const where = typeof at === 'number' ? at : 'unknown';
+    through.push(`${typeof file === 'string' ? file.replaceAll('\\', '/') : 'unknown'}:${where}`);
     hop = hop.span?.expansion;
   }
   return through.length ? through.join('<') : null;

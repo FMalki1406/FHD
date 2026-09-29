@@ -210,6 +210,57 @@ test('each expansion of a macro that uses unsafe is its own site', () => {
   }
 });
 
+/// Two invocations in two files, at the same offset in each, are two uses.
+///
+/// **An offset means nothing without the file it is an offset into.** The first fix keyed a
+/// macro's expansions by the call site's byte offset alone -- and every diagnostic for a
+/// macro names the *macro's* file as its primary span, so the call site was the only thing
+/// separating them. Two invocations that happen to sit at the same offset in two different
+/// files therefore folded into one use. A review named it; the two modules here are
+/// byte-identical, so the collision is real rather than imagined.
+test('the same offset in two different files is two sites', () => {
+  const rustc = resolveRustc();
+  const base = mkdtempSync(join(tmpdir(), 'fhd-unsafe-collide-'));
+  try {
+    const file = join(base, 'lib.rs');
+    writeFileSync(
+      file,
+      [
+        '#![deny(unsafe_code)]',
+        'macro_rules! native {',
+        `    () => {{ ${unsafeBody} }};`,
+        '}',
+        'mod a;',
+        'mod b;',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    // The same bytes in both, so the invocation sits at the same offset in each.
+    const module = ['#[allow(unsafe_code)]', 'pub fn one() -> u32 { native!() }', ''].join('\n');
+    writeFileSync(join(base, 'a.rs'), module, 'utf8');
+    writeFileSync(join(base, 'b.rs'), module, 'utf8');
+
+    const { sites, reasons } = auditFile(rustc, file);
+    assert.deepEqual(reasons, [], 'the sample must compile, or it proves nothing');
+    const uses = sites.filter((site) => site.kind === 'usage');
+    assert.equal(uses.length, 2, `the compiler reported ${uses.length} use(s): ${JSON.stringify(uses)}`);
+    // The premise, in three parts: one primary span for both, and one offset for both call
+    // sites, in two different files.
+    assert.equal(new Set(uses.map((use) => `${use.file}:${use.offset}`)).size, 1, 'the premise failed: the primaries differ');
+    // A Windows path has a colon of its own, so the split is at the last one.
+    const hops = uses.map((use) => use.expansion);
+    const at = (hop) => hop.slice(hop.lastIndexOf(':') + 1);
+    const inFile = (hop) => hop.slice(0, hop.lastIndexOf(':'));
+    assert.equal(new Set(hops.map(at)).size, 1, `the premise failed: the offsets differ (${hops})`);
+    assert.equal(new Set(hops.map(inFile)).size, 2, `the premise failed: one file (${hops})`);
+    // And the gate's own key keeps them apart.
+    assert.equal(new Set(uses.map(siteKey)).size, 2, `the two uses share a key (${hops})`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 /// A target that would not compile has not been audited, and says so.
 test('an error the gate cannot classify is reported rather than ignored', () => {
   const rustc = resolveRustc();
@@ -275,10 +326,10 @@ test('diagnostics are read from rustc and from cargo, and nothing else is', () =
       column_start: 14,
       byte_start: 50,
       text: [{ text: 'unsafe { }' }],
-      expansion: { span: { byte_start: 300 } },
+      expansion: { span: { file_name: 'caller.rs', byte_start: 300 } },
     }],
   });
-  assert.equal(sitesFrom(expanded)[0].expansion, '300');
+  assert.equal(sitesFrom(expanded)[0].expansion, 'caller.rs:300');
 
   // The two the gate reads are not "unaudited"; anything else at error level is.
   assert.deepEqual(unaudited([bare, wrapped].join('\n')), []);
