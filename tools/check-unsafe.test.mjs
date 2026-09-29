@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  APPROVED, auditFailed, auditFile, exportedMacros, findings, itemBelow, resolveCargo, siteKey,
-  sitesFrom, targetsFrom, unaudited, unauditableTargets,
+  APPROVED, auditFailed, auditFile, EXPANSION_LIMIT, exportedMacros, findings, itemBelow,
+  resolveCargo, siteKey, sitesFrom, targetsFrom, unaudited, unauditableTargets,
 } from './check-unsafe.mjs';
 
 /// The compiler these tests put their samples to.
@@ -236,10 +236,15 @@ test('the same offset in two different files is two sites', () => {
       ].join('\n'),
       'utf8',
     );
-    // The same bytes in both, so the invocation sits at the same offset in each.
+    // The same bytes in both, so the invocation sits at the same offset in each -- and the
+    // two files are `a/mod.rs` and `b/mod.rs`, so they share a *basename* too. An
+    // engineering review measured that a hop carrying only the basename passed the first
+    // version of this test; with this layout, only the path tells them apart.
     const module = ['#[allow(unsafe_code)]', 'pub fn one() -> u32 { native!() }', ''].join('\n');
-    writeFileSync(join(base, 'a.rs'), module, 'utf8');
-    writeFileSync(join(base, 'b.rs'), module, 'utf8');
+    mkdirSync(join(base, 'a'));
+    mkdirSync(join(base, 'b'));
+    writeFileSync(join(base, 'a', 'mod.rs'), module, 'utf8');
+    writeFileSync(join(base, 'b', 'mod.rs'), module, 'utf8');
 
     const { sites, reasons } = auditFile(rustc, file);
     assert.deepEqual(reasons, [], 'the sample must compile, or it proves nothing');
@@ -248,13 +253,16 @@ test('the same offset in two different files is two sites', () => {
     // The premise, in three parts: one primary span for both, and one offset for both call
     // sites, in two different files.
     assert.equal(new Set(uses.map((use) => `${use.file}:${use.offset}`)).size, 1, 'the premise failed: the primaries differ');
-    // A Windows path has a colon of its own, so the split is at the last one.
+    // A Windows path has a colon of its own, so the split is at the last one. The premise
+    // is asserted on the offsets only; whether the *files* are distinguished is the claim
+    // under test, so it belongs in the key assertion below and not in the premise -- a
+    // first version asserted it here, and a regression then failed as a broken setup
+    // rather than as the gate folding two uses.
     const hops = uses.map((use) => use.expansion);
     const at = (hop) => hop.slice(hop.lastIndexOf(':') + 1);
-    const inFile = (hop) => hop.slice(0, hop.lastIndexOf(':'));
     assert.equal(new Set(hops.map(at)).size, 1, `the premise failed: the offsets differ (${hops})`);
-    assert.equal(new Set(hops.map(inFile)).size, 2, `the premise failed: one file (${hops})`);
-    // And the gate's own key keeps them apart.
+    // And the gate's own key keeps them apart -- which it can only do by the path, since
+    // the offset, the primary span and the basename are all shared.
     assert.equal(new Set(uses.map(siteKey)).size, 2, `the two uses share a key (${hops})`);
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -615,6 +623,51 @@ test('a site with no byte offset is reported as unaudited', () => {
     })),
     [],
   );
+});
+
+/// An expansion this gate cannot identify is reported, not folded.
+///
+/// **The same defect as the collision above, one layer out.** The chain of call sites is
+/// what separates two invocations of a macro, since every diagnostic for one names the
+/// macro's own file as its primary span. So a hop missing its file or its offset, and a
+/// chain longer than the walk follows, both leave two uses sharing a key -- and a security
+/// review measured that happening at sixteen levels of nesting with nothing reported,
+/// because the check that existed looked only at the primary span. rustc 1.98 emits both
+/// halves and nothing here nests that deep; this is a ratchet on shapes it does not
+/// produce, which is the standard already applied to the primary span.
+test('an expansion the gate cannot identify is reported as unaudited', () => {
+  const site = (expansion) => JSON.stringify({
+    code: { code: 'unsafe_code' },
+    level: 'error',
+    spans: [{
+      is_primary: true, file_name: 'crates/a/src/lib.rs', line_start: 3, byte_start: 40, expansion,
+    }],
+  });
+  // An ordinary call site, fully identified: nothing to report.
+  assert.deepEqual(unaudited(site({ span: { file_name: 'crates/a/src/use.rs', byte_start: 9 } })), []);
+
+  // A hop with no offset, and a hop with no file: each one leaves two uses sharing a key.
+  const noOffset = unaudited(site({ span: { file_name: 'crates/a/src/use.rs' } }));
+  assert.equal(noOffset.length, 1, JSON.stringify(noOffset));
+  assert.match(noOffset[0], /carries no file or no byte offset/u);
+  const noFile = unaudited(site({ span: { byte_start: 9 } }));
+  assert.equal(noFile.length, 1, JSON.stringify(noFile));
+  assert.match(noFile[0], /carries no file or no byte offset/u);
+
+  // And a chain longer than the gate follows, built from the inside out.
+  let deep = { span: { file_name: 'crates/a/src/use.rs', byte_start: 1 } };
+  for (let level = 0; level < EXPANSION_LIMIT + 1; level += 1) {
+    deep = { span: { file_name: 'crates/a/src/use.rs', byte_start: level + 2, expansion: deep } };
+  }
+  const truncated = unaudited(site(deep));
+  assert.equal(truncated.length, 1, JSON.stringify(truncated));
+  assert.match(truncated[0], /expanded through more than 16 macros/u);
+  // One hop short of the limit is still identified, so the ratchet has a defined edge.
+  let shallow = { span: { file_name: 'crates/a/src/use.rs', byte_start: 1 } };
+  for (let level = 0; level < EXPANSION_LIMIT - 2; level += 1) {
+    shallow = { span: { file_name: 'crates/a/src/use.rs', byte_start: level + 2, expansion: shallow } };
+  }
+  assert.deepEqual(unaudited(site(shallow)), []);
 });
 
 /// The two ratchets on what the compiler cannot report, and what this gate does not run.

@@ -127,8 +127,11 @@ export const APPROVED = new Map([
     uses: { win32: 1, linux: 2, darwin: 2 },
   }],
   // The wipe in `Output::drop` is bounded by `LocalSize` rather than by the blob's own
-  // `cbData`, because it runs on the failure path and while unwinding, where nothing has
-  // checked that field -- see the note on the function. The wipe itself lives in
+  // `cbData`, because this code does not believe that field without checking it -- the
+  // checks beside the guard refuse a zero or a length over `MAX_INPUT`. (This entry used to
+  // give the reason as "it runs on the failure path and while unwinding"; the guard is now
+  // built only from a successful call, so that reason lapsed and an engineering review
+  // caught it still being recorded here.) The wipe itself lives in
   // `wipe_and_release`, which takes the allocator's two calls as parameters: that is what
   // makes the bound measurable, and it is an `unsafe fn` so that taking it is still a
   // decision this gate counts.
@@ -162,12 +165,23 @@ export const APPROVED = new Map([
   }],
 ]);
 
+/// How deep a chain of expansions this gate will follow before it stops trusting itself.
+///
+/// The chain is data from another process, so the walk has to end somewhere. What matters
+/// is what happens at the end: `expansionOf` truncates, and `expansionProblems` reports the
+/// truncation, so a site the walk could not identify is a finding rather than a fold.
+export const EXPANSION_LIMIT = 16;
+
 /// The chain of call sites a diagnostic was expanded through, innermost first.
 ///
-/// `null` for code written where it stands, which is nearly all of it. A span whose
-/// expansion carries no byte offset contributes `unknown`, which folds -- deliberately:
-/// `unaudited` reports a span with no offset, so a count is never quietly taken from one.
-/// The walk is bounded because the chain is data from a process, not a promise.
+/// `null` for code written where it stands, which is nearly all of it. A hop missing
+/// either half contributes `unknown`, and a chain longer than `EXPANSION_LIMIT` is cut --
+/// **both of which fold, and neither of which is silent**: `expansionProblems` reports them
+/// through `unaudited`. An earlier version of this comment claimed the fold was covered
+/// because `unaudited` reported spans with no offset; a security review measured that it
+/// checked only the *primary* span and never a hop, so two uses sixteen expansions deep
+/// counted as one with no diagnostic at all -- the very defect this chain was added to fix,
+/// one layer out. The rationale was wrong, not just the code.
 ///
 /// **Each hop carries its file, not just its offset.** A byte offset means nothing without
 /// the file it is an offset into: the diagnostics for a macro used from two different files
@@ -175,7 +189,7 @@ export const APPROVED = new Map([
 /// thing telling them apart -- and two invocations that happen to sit at the same offset in
 /// their respective files folded into one use. A review named it, and the test writes two
 /// byte-identical modules so the offsets really do collide.
-export function expansionOf(span, limit = 16) {
+export function expansionOf(span, limit = EXPANSION_LIMIT) {
   const through = [];
   let hop = span?.expansion;
   while (hop && through.length < limit) {
@@ -186,6 +200,34 @@ export function expansionOf(span, limit = 16) {
     hop = hop.span?.expansion;
   }
   return through.length ? through.join('<') : null;
+}
+
+/// Everything about a diagnostic's expansion chain that would make its site unidentifiable.
+///
+/// **The fold this catches is the one the key cannot.** Every diagnostic for a macro names
+/// the macro's own file as its primary span, so the call site chain is the only thing
+/// separating two invocations -- and a hop with no file or no offset, or a chain cut at the
+/// limit, leaves two distinct uses sharing a key. A security review measured both: sixteen
+/// levels of nesting dropped the outermost hop, which is the call site, and two uses in
+/// byte-identical files came back as one with nothing reported. rustc 1.98 emits both halves
+/// and no such depth occurs here, so this is a ratchet on shapes the pinned compiler does
+/// not produce -- which is exactly the standard already applied to the primary span.
+export function expansionProblems(primary, limit = EXPANSION_LIMIT) {
+  const where = primary?.file_name ?? 'an unnamed file';
+  let hop = primary?.expansion;
+  let depth = 0;
+  while (hop) {
+    const span = hop.span;
+    if (!span || typeof span.byte_start !== 'number' || typeof span.file_name !== 'string') {
+      return [`an expansion of a site in ${where} carries no file or no byte offset, so two uses through it cannot be told apart`];
+    }
+    depth += 1;
+    if (depth > limit) {
+      return [`a site in ${where} is expanded through more than ${limit} macros, further than this gate follows, so its call site is not identified`];
+    }
+    hop = span.expansion;
+  }
+  return [];
 }
 
 /// The diagnostics that matter, from a stream of rustc or cargo JSON lines.
@@ -285,6 +327,7 @@ export function unaudited(output) {
       // that a stream where it is missing fails rather than counts. An engineering review
       // named the gap.
       const primary = (diagnostic.spans ?? []).find((span) => span.is_primary);
+      reasons.push(...expansionProblems(primary));
       if (primary && typeof primary.byte_start !== 'number') {
         reasons.push(
           `a ${code === 'E0453' ? 'E0453' : 'use-of-unsafe'} diagnostic in ` +
