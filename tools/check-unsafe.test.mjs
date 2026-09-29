@@ -5,8 +5,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  APPROVED, auditFailed, auditFile, findings, itemBelow, resolveCargo, siteKey, sitesFrom,
-  targetsFrom, unaudited,
+  APPROVED, auditFailed, auditFile, exportedMacros, findings, itemBelow, resolveCargo, siteKey,
+  sitesFrom, targetsFrom, unaudited, unauditableTargets,
 } from './check-unsafe.mjs';
 
 /// The compiler these tests put their samples to.
@@ -152,7 +152,59 @@ test('two uses of unsafe on one line are counted as two', () => {
     // function, not a copy of it: a first version of this test computed the key here, so
     // a mutation that put the line back in the real key passed unnoticed.
     assert.equal(new Set(uses.map(siteKey)).size, 2, 'the two uses share a key');
-    assert.equal(new Set([...uses, ...uses].map(siteKey)).size, 2, 'the same site did not fold');
+
+    // And the same file compiled a second time folds into the same two sites. This is the
+    // property the gate depends on -- it sees every file from several invocations -- and
+    // an engineering review pointed out that asserting it over a duplicated array proved
+    // nothing, because there was only ever one invocation in it. So this is a second run.
+    const again = auditFile(rustc, file).sites.filter((site) => site.kind === 'usage');
+    assert.equal(again.length, 2, 'the second run reported a different number of uses');
+    assert.equal(
+      new Set([...uses, ...again].map(siteKey)).size,
+      2,
+      'the same site from two runs did not fold into one',
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/// Every expansion of a macro is its own use.
+///
+/// **One `unsafe` block, three uses.** A use inside a `macro_rules!` body is reported once
+/// per expansion, and every one of those diagnostics points its primary span at the macro's
+/// body -- same file, same byte offset. So the offset that fixed the one-line defect folded
+/// three expansions into one site: a security review measured a fourth native call added
+/// through a one-line macro inside an already-approved function changing no count at all.
+/// The compiler is asked here, because the claim is about what it reports.
+test('each expansion of a macro that uses unsafe is its own site', () => {
+  const rustc = resolveRustc();
+  const base = mkdtempSync(join(tmpdir(), 'fhd-unsafe-macro-'));
+  try {
+    const file = join(base, 'expanded.rs');
+    writeFileSync(
+      file,
+      [
+        '#![deny(unsafe_code)]',
+        'macro_rules! native {',
+        `    () => {{ ${unsafeBody} }};`,
+        '}',
+        '#[allow(unsafe_code)]',
+        'pub fn three() -> u32 { native!() + native!() + native!() }',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const { sites, reasons } = auditFile(rustc, file);
+    assert.deepEqual(reasons, [], 'the sample must compile, or it proves nothing');
+    const uses = sites.filter((site) => site.kind === 'usage');
+    assert.equal(uses.length, 3, `the compiler reported ${uses.length} use(s): ${JSON.stringify(uses)}`);
+    // The premise: they all point at the one place the `unsafe` is written.
+    assert.equal(new Set(uses.map((use) => use.offset)).size, 1, 'the premise failed: the offsets differ');
+    assert.equal(new Set(uses.map(siteKey)).size, 3, 'the three expansions share a key');
+    // And a use written where it stands still folds with itself.
+    const again = auditFile(rustc, file).sites.filter((site) => site.kind === 'usage');
+    assert.equal(new Set([...uses, ...again].map(siteKey)).size, 3, 'the same sites did not fold');
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -197,21 +249,36 @@ test('diagnostics are read from rustc and from cargo, and nothing else is', () =
   assert.deepEqual(sites, [
     {
       kind: 'allowance', file: 'crates/a/src/lib.rs', line: 7, column: 5, offset: 120,
-      text: '#[allow(unsafe_code)]',
+      expansion: null, text: '#[allow(unsafe_code)]',
     },
     {
       kind: 'usage', file: 'crates/a/src/lib.rs', line: 9, column: 9, offset: 210,
-      text: 'unsafe { }',
+      expansion: null, text: 'unsafe { }',
     },
   ]);
-  // A span with no offset still yields a site, keyed by line and column instead.
+  // A span with no offset still yields a site, keyed by line and column instead -- and
+  // `unaudited` reports it, so the fallback key never decides a count on its own.
   const spare = JSON.stringify({
     code: { code: 'unsafe_code' },
     spans: [{ is_primary: true, file_name: 'a.rs', line_start: 1, text: [{ text: 'unsafe { }' }] }],
   });
   assert.deepEqual(sitesFrom(spare), [
-    { kind: 'usage', file: 'a.rs', line: 1, column: 0, offset: null, text: 'unsafe { }' },
+    { kind: 'usage', file: 'a.rs', line: 1, column: 0, offset: null, expansion: null, text: 'unsafe { }' },
   ]);
+  // A span that came from a macro carries the call site it was expanded at.
+  const expanded = JSON.stringify({
+    code: { code: 'unsafe_code' },
+    spans: [{
+      is_primary: true,
+      file_name: 'a.rs',
+      line_start: 2,
+      column_start: 14,
+      byte_start: 50,
+      text: [{ text: 'unsafe { }' }],
+      expansion: { span: { byte_start: 300 } },
+    }],
+  });
+  assert.equal(sitesFrom(expanded)[0].expansion, '300');
 
   // The two the gate reads are not "unaudited"; anything else at error level is.
   assert.deepEqual(unaudited([bare, wrapped].join('\n')), []);
@@ -384,6 +451,161 @@ test('a run that did not audit anything is not read as a clean one', () => {
     }),
     [],
   );
+});
+
+/// The two shapes that still read as audited, both measured by an engineering review.
+///
+/// **Neither of these is cargo dying.** The completion check above fires when the process
+/// this gate started is killed and the OS says so -- and that covers neither of the ways a
+/// run can stop having looked at everything:
+///
+///   * rustc crashes and cargo exits *normally*, reporting the crash on an indented
+///     `Caused by:` line and writing `could not compile X (lib)` with no `due to` tail;
+///   * cargo is killed on Windows, which has no signal delivery, so it exits 1 with
+///     `signal: null` -- the same event that is reported on Linux was audited here.
+///
+/// The first is told apart by the tail the forbid case always writes; the second by cargo's
+/// own `build-finished` marker, which `--message-format=json` emits on success and failure
+/// alike. Both were measured against the real toolchain before they were relied on.
+test('a run that stopped before it was done is not audited', () => {
+  const crash = [
+    JSON.stringify({ reason: 'compiler-message', message: { code: { code: 'unsafe_code' }, level: 'error' } }),
+    JSON.stringify({ reason: 'build-finished', success: false }),
+    'error: could not compile `fhd-platform` (lib)',
+    '',
+    'Caused by:',
+    "  process didn't exit successfully: `rustc ...` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)",
+  ].join('\n');
+  const crashed = auditFailed({
+    status: 101, signal: null, sites: [{ kind: 'usage' }], reasons: [], output: crash,
+    expectFinished: true,
+  });
+  assert.equal(crashed.length, 1, JSON.stringify(crashed));
+  assert.match(crashed[0], /for a reason this gate does not recognise/u);
+  // And the reason names the crash rather than the first three lines that begin with a
+  // matching word -- which, measured, were three `warning:` lines.
+  assert.match(crashed[0], /STATUS_ACCESS_VIOLATION/u);
+
+  // And the tail is load-bearing on its own. The shape above is caught twice over -- by
+  // the `Caused by:` lines as well -- so here is a run that says only that it could not
+  // compile, with no count of errors behind it: that is not the forbid firing, and a
+  // mutation that exempts every `could not compile` line has to fail on this.
+  const untold = auditFailed({
+    status: 101,
+    signal: null,
+    sites: [{ kind: 'usage' }],
+    reasons: [],
+    output: [
+      JSON.stringify({ reason: 'build-finished', success: false }),
+      'error: could not compile `fhd-platform` (lib)',
+    ].join('\n'),
+    expectFinished: true,
+  });
+  assert.equal(untold.length, 1, JSON.stringify(untold));
+  assert.match(untold[0], /for a reason this gate does not recognise/u);
+
+  // Killed on Windows: an exit code, no signal, and no marker.
+  const killed = auditFailed({
+    status: 1, signal: null, sites: [{ kind: 'usage' }], reasons: [], output: '',
+    expectFinished: true,
+  });
+  assert.equal(killed.length, 1, JSON.stringify(killed));
+  assert.match(killed[0], /stopped before cargo reported the build finished/u);
+
+  // The ordinary forbid-fired run carries the marker and the tail, and stays clean.
+  assert.deepEqual(
+    auditFailed({
+      status: 101,
+      signal: null,
+      sites: [{ kind: 'usage' }],
+      reasons: [],
+      output: [
+        JSON.stringify({ reason: 'build-finished', success: false }),
+        'error: could not compile `queue-secrets` (lib) due to 7 previous errors',
+      ].join('\n'),
+      expectFinished: true,
+    }),
+    [],
+  );
+
+  // And the marker is asked of cargo only: `auditFile` drives rustc, which emits none.
+  assert.deepEqual(
+    auditFailed({
+      status: 101,
+      signal: null,
+      sites: [{ kind: 'usage' }],
+      reasons: [],
+      output: 'error: aborting due to 1 previous error',
+    }),
+    [],
+  );
+});
+
+/// A diagnostic with no byte offset is reported, not keyed around.
+///
+/// rustc 1.98 always carries one, so this is a stream shape it does not produce -- and that
+/// is the point: the fallback key is the file and line, which is exactly what folded two
+/// uses on one line into one. An engineering review named the gap. It fails rather than
+/// counts.
+test('a site with no byte offset is reported as unaudited', () => {
+  const reasons = unaudited(JSON.stringify({
+    code: { code: 'unsafe_code' },
+    level: 'error',
+    spans: [{ is_primary: true, file_name: 'crates/a/src/lib.rs', line_start: 3 }],
+  }));
+  assert.equal(reasons.length, 1, JSON.stringify(reasons));
+  assert.match(reasons[0], /carries no byte offset/u);
+  // With an offset, it is an ordinary site and no reason at all.
+  assert.deepEqual(
+    unaudited(JSON.stringify({
+      code: { code: 'unsafe_code' },
+      level: 'error',
+      spans: [{ is_primary: true, file_name: 'a.rs', line_start: 3, byte_start: 40 }],
+    })),
+    [],
+  );
+});
+
+/// The two ratchets on what the compiler cannot report, and what this gate does not run.
+///
+/// `exportedMacros` exists because `unsafe_code` is declared without
+/// `report_in_external_macro`: a use arriving from a macro defined in another crate is
+/// reported by nobody. A security review measured three raw pointer reads in a crate that
+/// denies `unsafe`, with zero diagnostics from either crate. No crate here exports a macro,
+/// and this keeps it so -- by one literal, failing on any occurrence, because deciding what
+/// an occurrence *means* by reading text is the mistake this gate was written to stop.
+///
+/// `unauditableTargets` exists because a build script runs at build time with the machine's
+/// authority and a proc-macro runs inside the compiler, and both were skipped in silence.
+test('what the compiler cannot report, and what the gate does not run, fail closed', () => {
+  assert.deepEqual(
+    exportedMacros('D:/repo', () => ['D:/repo/crates/a/src/lib.rs'], () => 'pub fn plain() {}'),
+    [],
+  );
+  const found = exportedMacros(
+    'D:/repo',
+    () => ['D:/repo/crates/a/src/lib.rs'],
+    () => '#[macro_export]\nmacro_rules! native { () => { unsafe { } } }',
+  );
+  assert.equal(found.length, 1, JSON.stringify(found));
+  assert.match(found[0], /crates\/a\/src\/lib\.rs mentions macro_export/u);
+  // The workspace as it stands exports none, which is what the ratchet holds.
+  assert.deepEqual(exportedMacros(), []);
+
+  assert.deepEqual(unauditableTargets({ packages: [{ name: 'p', targets: [{ kind: ['lib'], name: 'p' }] }] }), []);
+  const kinds = unauditableTargets({
+    packages: [{
+      name: 'p',
+      targets: [
+        { kind: ['custom-build'], name: 'build-script-build' },
+        { kind: ['proc-macro'], name: 'p-macros' },
+        { kind: ['lib'], name: 'p' },
+      ],
+    }],
+  });
+  assert.equal(kinds.length, 2, JSON.stringify(kinds));
+  assert.match(kinds[0], /custom-build target/u);
+  assert.match(kinds[1], /proc-macro target/u);
 });
 
 /// Cargo is looked for where the project keeps it, and then where everyone else does.

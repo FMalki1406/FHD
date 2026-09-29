@@ -218,8 +218,53 @@ pub(crate) fn encode_options_v2(
     Ok(())
 }
 
+/// An upper bound on what `encode` writes, so its buffer never has to grow.
+///
+/// **`Zeroizing` wipes the allocation that is alive when it drops, and only that one.** A
+/// `Vec` that grows releases each earlier allocation as it goes, un-wiped -- so encoding a
+/// queue from a nine-byte buffer left a trail of freed blocks, each holding the plaintext
+/// prefix written so far: the jobs' URLs, their authorization headers and their cookies. A
+/// security review measured it on a forty-job snapshot -- seven allocations, six of them
+/// released without being wiped, the largest holding about 4.8 KB of plaintext -- after this
+/// project's own record had claimed the write path was covered because the type was
+/// `Zeroizing`. The type was right and the conclusion was wrong.
+///
+/// Reserving the whole length up front means there is one allocation, and `Zeroizing` wipes
+/// it. Every variable-length field is counted at its own length plus the eight-byte prefix
+/// the encoder writes for it; the fixed parts are counted generously. It is a bound, not the
+/// exact length, and `encoding_never_grows_its_buffer` is what holds it: if a new field made
+/// the bound too small, that test fails rather than production quietly leaving an orphan.
+fn reserved_for(snapshot: &Snapshot) -> usize {
+    // The header, the six config numbers, the global rate, the last id and the job count.
+    let mut total = 9 + 10 * 8;
+    for job in &snapshot.jobs {
+        let options = &job.options;
+        let policy = &options.request_policy;
+        // The id, the six fixed numbers, both optional hashes, and the five one-byte fields.
+        total += 8 + 6 * 8 + 2 * 32 + 5;
+        for text in [
+            options.url.len(),
+            options.job_dir.as_os_str().len(),
+            options.output_name.len(),
+            policy.authorization.as_deref().unwrap_or("").len(),
+            policy.cookie.as_deref().unwrap_or("").len(),
+        ] {
+            total += 8 + text;
+        }
+        total += 8;
+        for origin in &policy.redirect_origins {
+            total += 8 + origin.len();
+        }
+    }
+    total += 8 + snapshot.queue.len() * 8;
+    total += 8 + snapshot.receipts.len() * (32 + 32 + 8 + 1);
+    total + 32 // the digest appended last
+}
+
 fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
-    let mut bytes = Zeroizing::new(b"FHDQUEUE\x03".to_vec());
+    let reserved = reserved_for(snapshot);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(reserved));
+    bytes.extend_from_slice(b"FHDQUEUE\x03");
     let c = &snapshot.config;
     for value in [
         c.max_active as u64,
@@ -275,6 +320,12 @@ fn encode(snapshot: &Snapshot) -> Result<Zeroizing<Vec<u8>>, ManagerError> {
     }
     let digest = Sha256::digest(&bytes);
     bytes.extend_from_slice(&digest);
+    debug_assert!(
+        bytes.len() <= reserved,
+        "the reserve is too small ({} written, {reserved} reserved), so a reallocation \
+         released a buffer of plaintext without wiping it",
+        bytes.len(),
+    );
     Ok(bytes)
 }
 
@@ -572,6 +623,76 @@ mod tests {
         assert!(restored.jobs.is_empty());
         assert_eq!(restored.last_id, 0);
     }
+    /// The encoder's buffer never grows, so no plaintext is released un-wiped.
+    ///
+    /// **This is the half of secret hygiene a type cannot give you.** `encode` returns
+    /// `Zeroizing<Vec<u8>>`, which wipes the buffer that is alive at the end -- and a
+    /// growing `Vec` releases every earlier buffer on the way, un-wiped, each holding the
+    /// URLs and authorization headers written so far. A security review measured six such
+    /// orphans for a forty-job snapshot. The fix is to reserve the whole length up front;
+    /// what this test checks is that the reserve is actually big enough, because if it is
+    /// not, the growth comes back and nothing else would say so. `len <= capacity` would be
+    /// vacuous -- it is always true -- so the comparison is against the bound itself.
+    #[test]
+    fn encoding_never_grows_its_buffer() {
+        let job = |id: u64| SavedJob {
+            id: JobId(id),
+            options: Options {
+                url: format!(
+                    "https://cdn.example.test/{id}/file.bin?token={}",
+                    "t".repeat(180)
+                ),
+                job_dir: PathBuf::from(format!("/jobs/{id}/with/a/long/enough/path")),
+                output_name: format!("file-{id}.bin"),
+                expected_sha256: Some([7; 32]),
+                allow_http: false,
+                checkpoint_bytes: 65536,
+                max_download_bytes: 1 << 30,
+                bytes_per_second: Some(4096),
+                parallel_connections: 4,
+                request_policy: crate::RequestPolicy::new(
+                    Some(format!("Bearer {}", "a".repeat(120))),
+                    Some(format!("session={}", "b".repeat(90))),
+                    vec![
+                        "https://cdn.example.test".into(),
+                        "https://edge.example.test".into(),
+                    ],
+                )
+                .unwrap(),
+                refresh_from: Some([9; 32]),
+            },
+            priority: Priority::Normal,
+            state: State::Paused,
+            progress: 4096,
+            attempts: 1,
+        };
+        for count in [0_u64, 1, 40] {
+            let jobs: Vec<SavedJob> = (1..=count).map(job).collect();
+            let snapshot = Snapshot {
+                last_id: count,
+                receipts: vec![],
+                config: Config::default(),
+                jobs,
+                queue: (1..=count).map(JobId).collect(),
+            };
+            let reserved = reserved_for(&snapshot);
+            let encoded = encode(&snapshot).unwrap();
+            assert!(
+                encoded.len() <= reserved,
+                "{count} jobs wrote {} bytes into a reserve of {reserved}",
+                encoded.len(),
+            );
+            // And it stays a bound rather than becoming a per-field guess nobody checks:
+            // an estimate wildly above the truth would hide a later field being forgotten.
+            assert!(
+                reserved <= encoded.len() * 2 + 512,
+                "{count} jobs reserved {reserved} for {} bytes",
+                encoded.len(),
+            );
+            assert!(decode(&encoded).is_ok());
+        }
+    }
+
     #[test]
     fn envelope_rejects_changes_and_invalid_lengths() {
         let snapshot = Snapshot {

@@ -13,10 +13,26 @@
 //   * `E0453` for every attribute that tries to permit unsafe -- `allow`, `expect`,
 //     `cfg_attr(..., allow(...))`, inner or outer, however it is spelled or spaced,
 //     with the file and line it sits on;
-//   * the `unsafe_code` lint for every use of `unsafe`, wherever it is.
+//   * the `unsafe_code` lint for every use of `unsafe` it analyses -- with one exception
+//     the compiler itself makes, named below.
 //
 // Nothing here parses Rust. What it does is compare two sets: the allowances the
 // compiler found, and the allowances this file approves.
+//
+// **The exception, because it is a real hole and it is the compiler's own.** The
+// `unsafe_code` lint is declared without `report_in_external_macro`, so rustc does not
+// report a use that comes from a macro defined in *another* crate -- and that is a lint
+// property, not an attribute, so the command-line forbid does not override it. A security
+// review measured it: a `macro_rules!` exported from a crate with no restriction, holding
+// a raw pointer read, expanded three times in a crate that denies `unsafe`, produced zero
+// diagnostics from both crates. A macro's body is not analysed where it is defined either,
+// so there is no invocation of the compiler that reports it.
+//
+// What closes it is not more compiling but a smaller claim plus a ratchet: no crate in
+// this workspace exports a macro, and `exportedMacros` fails the gate if one appears. The
+// check is deliberately a search for one literal, so anything that even mentions it fails
+// closed and has to be decided by a person. Same-crate macros are reported normally, and
+// each expansion is its own site -- see `siteKey`.
 //
 // **What it covers, exactly.** The configurations the compiler compiles. An allowance
 // behind `#[cfg(target_os = "freebsd")]` is invisible on the platforms this project
@@ -30,7 +46,7 @@
 // scan cannot see it. Here every use is reported, and a use in a file this list does
 // not name is a finding.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -113,8 +129,9 @@ export const APPROVED = new Map([
   // The wipe in `Output::drop` is bounded by `LocalSize` rather than by the blob's own
   // `cbData`, because it runs on the failure path and while unwinding, where nothing has
   // checked that field -- see the note on the function. The wipe itself lives in
-  // `wipe_and_release`, which takes the allocator's two calls as parameters: a second
-  // approved item, and the reason the bound is now measured rather than only argued.
+  // `wipe_and_release`, which takes the allocator's two calls as parameters: that is what
+  // makes the bound measurable, and it is an `unsafe fn` so that taking it is still a
+  // decision this gate counts.
   ['crates/queue-secrets/src/lib.rs', {
     allowances: [
       {
@@ -122,14 +139,45 @@ export const APPROVED = new Map([
         platforms: ['win32'],
       },
       {
-        item: 'fn wipe_and_release(block: *mut u8, size: impl Fn(*mut u8) -> usize, free: impl FnOnce(*mut u8)) {',
+        item: 'unsafe fn wipe_and_release(block: *mut u8, size: impl FnOnce(*mut u8) -> usize, free: impl FnOnce(*mut u8)) {',
+        platforms: ['win32'],
+      },
+      // **The `unsafe fn` is the point, and it is why there are three entries.** The first
+      // version of this seam was a *safe* function taking a raw pointer, a write length and
+      // a deallocator -- so a call to it needed no `unsafe`, `#![deny(unsafe_code)]` did not
+      // reach it, this gate did not count it, and the signature recorded here ratified a
+      // caller-chosen write length. Both reviews arrived at that independently. As an
+      // `unsafe fn` every caller is a use the gate counts, including the tests' one wrapper
+      // below, which is where their side of the precondition is discharged.
+      {
+        item: 'fn wipe(block: *mut u8, size: impl FnOnce(*mut u8) -> usize, free: impl FnOnce(*mut u8)) {',
         platforms: ['win32'],
       },
     ],
-    // Nothing outside `cfg(windows)`, so no other platform compiles a single one.
-    uses: { win32: 5, linux: 0, darwin: 0 },
+    // Nothing outside `cfg(windows)`, so no other platform compiles a single one. Six on
+    // win32: the two crypt calls counted once at their `unsafe` block, the copy out of the
+    // blob, the declaration of the `unsafe fn`, the wipe inside it, the call to it from
+    // `Output::drop`, and the tests' wrapper.
+    uses: { win32: 6, linux: 0, darwin: 0 },
   }],
 ]);
+
+/// The chain of call sites a diagnostic was expanded through, innermost first.
+///
+/// `null` for code written where it stands, which is nearly all of it. A span whose
+/// expansion carries no byte offset contributes `unknown`, which folds -- deliberately:
+/// `unaudited` reports a span with no offset, so a count is never quietly taken from one.
+/// The walk is bounded because the chain is data from a process, not a promise.
+export function expansionOf(span, limit = 16) {
+  const through = [];
+  let hop = span?.expansion;
+  while (hop && through.length < limit) {
+    const at = hop.span?.byte_start;
+    through.push(typeof at === 'number' ? at : 'unknown');
+    hop = hop.span?.expansion;
+  }
+  return through.length ? through.join('<') : null;
+}
 
 /// The diagnostics that matter, from a stream of rustc or cargo JSON lines.
 ///
@@ -166,6 +214,14 @@ export function sitesFrom(output) {
       // diagnostic that carries no offset.
       column: primary.column_start ?? 0,
       offset: primary.byte_start ?? null,
+      // **Where it was expanded, when it came out of a macro.** A use inside a
+      // `macro_rules!` body is reported once per expansion, and every one of those
+      // diagnostics points its primary span at the macro's body -- the same file and the
+      // same byte offset. So the offset alone folded three expansions into one site, and a
+      // fourth native call added through a one-line macro inside an already-approved
+      // function would have changed no count at all. A security review measured that end
+      // to end through `findings`. The call site chain is part of what makes a site here.
+      expansion: expansionOf(primary),
       text: (primary.text?.[0]?.text ?? '').trim(),
     });
   }
@@ -180,10 +236,16 @@ export function sitesFrom(output) {
 /// count that exists to make adding one a decision somebody agrees to. A security review
 /// proved it with the two diagnostics rustc emits. The line and column are what a reader
 /// needs; the offset is what identifies the site, with the line and column as the key for
-/// the rare span that carries no offset.
+/// the rare span that carries no offset -- and such a span is reported by `unaudited`, so
+/// no count is taken from a stream that contains one.
+///
+/// **And where it was expanded, if it was.** Every expansion of a same-crate macro points
+/// its primary span at the macro's body, so the offset alone made three uses one site.
+/// The call site chain separates them.
 export function siteKey(site) {
   const where = site.offset ?? `${site.line}:${site.column}`;
-  return `${site.kind}:${site.file}:${where}`;
+  const from = site.expansion ? `@${site.expansion}` : '';
+  return `${site.kind}:${site.file}:${where}${from}`;
 }
 
 /// Errors that are neither of the two this gate reads, which mean the enumeration for
@@ -206,7 +268,23 @@ export function unaudited(output) {
     const diagnostic = parsed.reason === 'compiler-message' ? parsed.message : parsed;
     if (!diagnostic || diagnostic.level !== 'error') continue;
     const code = diagnostic.code?.code;
-    if (code === 'E0453' || code === 'unsafe_code') continue;
+    if (code === 'E0453' || code === 'unsafe_code') {
+      // **A site with no byte offset is not a site this gate can count.** The key falls
+      // back to the line and column, and two uses on one line whose spans carry neither
+      // fold into one -- which is the defect this round was about, one step further out.
+      // rustc 1.98 always reports both, so this is unreachable through it; it is here so
+      // that a stream where it is missing fails rather than counts. An engineering review
+      // named the gap.
+      const primary = (diagnostic.spans ?? []).find((span) => span.is_primary);
+      if (primary && typeof primary.byte_start !== 'number') {
+        reasons.push(
+          `a ${code === 'E0453' ? 'E0453' : 'use-of-unsafe'} diagnostic in ` +
+          `${primary.file_name ?? 'an unnamed file'} carries no byte ` +
+          'offset, so its site cannot be told apart from another on the same line',
+        );
+      }
+      continue;
+    }
     // The summary rustc prints after the real errors, which is not itself a reason.
     if (/^aborting due to/u.test(diagnostic.message ?? '')) continue;
     if (/^For more information/u.test(diagnostic.message ?? '')) continue;
@@ -409,7 +487,7 @@ export function findings({ sites, approved = APPROVED, platform, name = itemAt }
 /// non-zero with no JSON at all, and the first version of this gate read that as
 /// "nothing found". A security review named it: the exit status has to be part of the
 /// answer, not ignored because the diagnostics were quiet.
-export function auditFailed({ status, signal, sites, reasons, output }) {
+export function auditFailed({ status, signal, sites, reasons, output, expectFinished = false }) {
   const said = () => output.split('\n').map((line) => line.trim())
     // cargo echoes the whole rustc command line on failure, thousands of characters of
     // no use to a reader. What is wanted is what it said went wrong.
@@ -425,18 +503,42 @@ export function auditFailed({ status, signal, sites, reasons, output }) {
   // pass on the strength of the lines it happened to emit before it stopped.
   if (signal) return [`was killed by ${signal} part-way through: ${said() || 'and said nothing'}`];
   if (typeof status !== 'number') return [`did not report an exit status: ${said() || 'and said nothing'}`];
+  // **Cargo says when it has finished, and on Windows nothing else does.** An engineering
+  // review measured that a cargo killed from outside exits 1 with no signal on win32 --
+  // Windows has no signal delivery -- so the check above fires only on POSIX, on the two
+  // platforms whose counts this file does not record. `--message-format=json` ends with
+  // `build-finished` on success and on failure alike (measured on both), so its absence is
+  // the one platform-independent way to see a run that stopped before it was done. This is
+  // asked for only of cargo; `auditFile` drives rustc, which emits no such marker.
+  if (expectFinished && !/"reason":\s*"build-finished"/u.test(output)) {
+    return [`stopped before cargo reported the build finished (exit ${status}): ${said() || 'and said nothing'}`];
+  }
   if (status === 0) return [];
   // A non-zero exit is expected when the forbid fires -- and then cargo says only that it
   // could not compile, after the diagnostics this gate has already read. Any other
   // complaint means something else went wrong, and a target that failed for something
   // else was not audited for this.
+  //
+  // **And "could not compile" is only that story when it names the errors.** When the
+  // forbid fires, cargo writes `could not compile X (lib) due to 7 previous errors` -- the
+  // tail is always there, measured against the real run. When rustc *crashes*, cargo exits
+  // normally and writes `could not compile X (lib)` with no tail, then an indented
+  // `Caused by: process didn't exit successfully ... STATUS_ACCESS_VIOLATION`. The old
+  // filter exempted every `could not compile` line and read no indented line at all, so a
+  // compiler that died after one diagnostic was reported as audited. An engineering review
+  // measured it; requiring the tail is what tells the two apart.
   const unexplained = output.split('\n').map((line) => line.trim())
     .filter((line) => !line.startsWith('{'))
-    .filter((line) => /^error(:|\[)/u.test(line))
-    .filter((line) => !/^error: could not compile /u.test(line))
+    .filter((line) => /^(error(:|\[)|Caused by:|process didn't exit successfully)/u.test(line))
+    .filter((line) => !/^error: could not compile .* due to \d+ previous error/u.test(line))
     .filter((line) => !/^error: aborting due to /u.test(line));
   if (unexplained.length) {
-    return [`exited ${status} for a reason this gate does not recognise: ${said()}`];
+    // What a reader needs is the line that says what went wrong, not the first three lines
+    // that begin with a word this filter matches -- which, an engineering review measured,
+    // were three `warning:` lines while the linker error scrolled past.
+    const named = unexplained.map((line) => (line.length > 160 ? `${line.slice(0, 160)}...` : line))
+      .slice(0, 3).join(' / ');
+    return [`exited ${status} for a reason this gate does not recognise: ${named || said()}`];
   }
   if (sites.length) return [];
   return [`exited ${status} with no diagnostic this gate can read: ${said() || 'and said nothing'}`];
@@ -458,6 +560,66 @@ export function auditFile(rustc, path, extra = []) {
     sites,
     reasons: auditFailed({ status: run.status, signal: run.signal, sites, reasons, output }),
   };
+}
+
+/// The workspace's Rust sources, for the one check the compiler cannot make.
+function sources(from, found = []) {
+  for (const entry of readdirSync(from, { withFileTypes: true })) {
+    const path = `${from}/${entry.name}`;
+    if (entry.isDirectory()) {
+      if (entry.name === 'target' || entry.name === '.git') continue;
+      sources(path, found);
+    } else if (entry.name.endsWith('.rs')) {
+      found.push(path);
+    }
+  }
+  return found;
+}
+
+/// A ratchet on the one hole the compiler leaves: a macro exported to another crate.
+///
+/// `unsafe_code` is declared without `report_in_external_macro`, so a use that arrives by
+/// expanding a macro from *another* crate is reported nowhere -- not in the crate that
+/// wrote it, because a macro body is not analysed where it is defined, and not in the crate
+/// that expanded it, because the lint suppresses it there. A security review measured the
+/// whole path: three raw pointer reads in a crate that denies `unsafe`, zero diagnostics.
+///
+/// No crate here exports a macro, and this keeps it that way. It searches for one literal
+/// and fails on any occurrence, in code or in a comment, because the point is not to decide
+/// what an occurrence means -- reading text to decide that is the mistake this whole gate
+/// was rewritten to stop making -- but to make a person decide it. If an exported macro is
+/// ever wanted, the decision goes in `APPROVED`'s sibling here with what was done instead.
+export function exportedMacros(base = root, list = sources, read = (path) => readFileSync(path, 'utf8')) {
+  const reasons = [];
+  for (const path of list(resolvePath(base, 'crates'))) {
+    if (!read(path).includes('macro_export')) continue;
+    reasons.push(
+      `${path.replace(`${base.replaceAll('\\', '/')}/`, '')} mentions macro_export: a macro ` +
+      'exported to another crate can carry `unsafe` that the compiler reports nowhere',
+    );
+  }
+  return reasons;
+}
+
+/// Target kinds this gate does not run, which is not the same as nothing to say about them.
+///
+/// A build script is the highest-privilege code in the tree -- it runs at build time with
+/// the machine's full authority -- and a proc-macro runs inside the compiler. Neither is
+/// compiled by the invocations below, and both used to be skipped in silence, so the
+/// summary spoke for targets nobody had looked at. A security review named it. There are
+/// none in this workspace; if one appears, the gate stops until somebody decides how it is
+/// audited.
+export function unauditableTargets(metadata) {
+  const reasons = [];
+  const known = new Set(['lib', 'bin', 'test', 'bench', 'example']);
+  for (const pkg of metadata.packages ?? []) {
+    for (const target of pkg.targets ?? []) {
+      const [kind] = target.kind;
+      if (known.has(kind)) continue;
+      reasons.push(`${pkg.name} has a ${kind} target (${target.name}) that this gate does not compile`);
+    }
+  }
+  return reasons;
 }
 
 /// Every target in the workspace, as the flags `cargo rustc` needs to select one.
@@ -524,9 +686,10 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  const targets = targetsFrom(JSON.parse(listed.stdout));
+  const metadata = JSON.parse(listed.stdout);
+  const targets = targetsFrom(metadata);
   const sites = [];
-  const reasons = [];
+  const reasons = [...unauditableTargets(metadata), ...exportedMacros()];
   for (const target of targets) {
     const run = spawnSync(
       cargo,
@@ -544,11 +707,12 @@ function main() {
     sites.push(...found);
     for (const reason of auditFailed({
       status: run.status, signal: run.signal, sites: found, reasons: unaudited(output), output,
+      expectFinished: true,
     })) {
       reasons.push(`${target.package} ${target.kind} ${target.name}: ${reason}`);
     }
   }
-  // **One source line is one site, however many configurations compiled it.** Every
+  // **One place in the source is one site, however many configurations compiled it.** Every
   // file is now audited more than once -- as itself and as its own test harness, and a
   // lib also through each target that links it -- so the same `unsafe` block comes back
   // from several invocations. Counting them all would double every number and report
