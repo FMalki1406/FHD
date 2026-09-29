@@ -31,7 +31,22 @@ const _: () = assert!(MAX_INPUT <= u32::MAX as usize);
 #[cfg(windows)]
 const OVERHEAD: usize = 1024 * 1024;
 
-/// How many blocks the guard has released, counted only in a test build.
+/// How many guards have run their destructor, and how many blocks were actually released.
+/// Counted only in a test build.
+///
+/// **Two counters, because one cannot answer both questions -- measured, not assumed.**
+/// The first version counted on entering `drop`, and a security review measured what that
+/// was worth: deleting the `wipe_and_release` call outright left the "released once" test
+/// green, because entering `drop` was all the counter witnessed. Moving it to after
+/// `LocalFree` fixed that and broke the other half: a guard wrongly built on the *failure*
+/// path drops with a null pointer, never reaches the release, and so moved no counter at
+/// all -- a mutation that had been caught went back to surviving. I measured both states
+/// before settling on two counters:
+///
+///   * `DROPPED` says a guard existed and ran. Only a successful call may move it, which is
+///     what keeps the failure path from taking a pointer it cannot vouch for.
+///   * `RELEASES` says the whole path ran: a non-null pointer, a size the allocator reported
+///     inside the bound, the wipe, and `LocalFree` returning.
 ///
 /// **This is the smallest instrumentation that makes the wiring a fact rather than a
 /// reading.** Two rounds of review found the same gap: the wipe's own bound is measured,
@@ -41,6 +56,8 @@ const OVERHEAD: usize = 1024 * 1024;
 /// the plaintext. The same counter also settles the other half, which the previous round
 /// recorded as reviewed-but-unmeasurable: whether a *failed* call touches the pointer. It
 /// costs three lines, no `unsafe`, and nothing at all in a release build.
+#[cfg(all(test, windows))]
+pub(crate) static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(all(test, windows))]
 pub(crate) static RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -222,10 +239,9 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
         /// here, which is what lets a test report a size and check that the wipe stops
         /// there and that a zero frees nothing.
         fn drop(&mut self) {
-            // Counted so that one test can assert the success path reaches here exactly
-            // once and the failure path never does. Test builds only.
+            // A guard existed and ran. Only a successful call may move this. Test builds only.
             #[cfg(test)]
-            RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: `LocalSize` reports the length of the block `pbData` points at, and
             // `LocalFree` releases exactly that pointer, which is how DPAPI documents the
             // output of a call that succeeded; this is its only release, and this type is
@@ -237,6 +253,15 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
                     |block| LocalSize(block.cast()),
                     |block| {
                         LocalFree(block.cast());
+                        // **Counted here, where the release actually happens**, and not
+                        // only on entering `drop`: a review measured that deleting the
+                        // whole `wipe_and_release` call below left the "released once"
+                        // test green, because entering `drop` was all that was witnessed.
+                        // Reaching this line means the pointer was non-null, the allocator
+                        // reported a size within the bound, the block was wiped and
+                        // `LocalFree` has just returned. Test builds only.
+                        #[cfg(test)]
+                        RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     },
                 );
             }
@@ -353,37 +378,46 @@ mod tests {
     fn a_successful_call_releases_its_block_once_and_a_failed_one_never() {
         use std::sync::atomic::Ordering::Relaxed;
         let _order = SERIALIZED.lock().unwrap_or_else(|held| held.into_inner());
-        let before = RELEASES.load(Relaxed);
+        // **Both counters, at every step.** A guard that runs but releases nothing, and a
+        // guard that exists where it must not, are different defects, and a review measured
+        // that each single counter misses one of them: counting only at `drop`'s entry let
+        // the whole release be deleted, and counting only after `LocalFree` let a guard
+        // built on the failure path pass, since its pointer is null and it never gets there.
+        let dropped = || DROPPED.load(Relaxed);
+        let released = || RELEASES.load(Relaxed);
+        let (was_dropped, was_released) = (dropped(), released());
+
         let secret = b"https://example.test/?token=PRIVATE_QUEUE_SECRET";
         let encrypted = protect(secret).unwrap();
         assert_eq!(
-            RELEASES.load(Relaxed),
-            before + 1,
-            "protect did not release the block DPAPI gave it"
+            (dropped(), released()),
+            (was_dropped + 1, was_released + 1),
+            "protect did not wipe and release the block DPAPI gave it"
         );
         assert_eq!(unprotect(&encrypted).unwrap(), secret);
         assert_eq!(
-            RELEASES.load(Relaxed),
-            before + 2,
-            "unprotect did not release the block that held the plaintext"
+            (dropped(), released()),
+            (was_dropped + 2, was_released + 2),
+            "unprotect did not wipe and release the block that held the plaintext"
         );
 
-        // And a failure takes no pointer at all: no guard exists on that path.
+        // And a failure takes no pointer at all: no guard exists on that path, so neither
+        // counter may move -- not even the one that only says a destructor ran.
         let mut tampered = encrypted;
         let end = tampered.len() - 1;
         tampered[end] ^= 0xff;
         assert!(unprotect(&tampered).is_err());
         assert_eq!(
-            RELEASES.load(Relaxed),
-            before + 2,
-            "a failed call handed its out-blob to the allocator"
+            (dropped(), released()),
+            (was_dropped + 2, was_released + 2),
+            "a failed call built a guard over its out-blob"
         );
 
         // A refused input never reaches the call, so it releases nothing either.
         assert_eq!(protect(&[]), Err(Error::InvalidSize));
         assert_eq!(
-            RELEASES.load(Relaxed),
-            before + 2,
+            (dropped(), released()),
+            (was_dropped + 2, was_released + 2),
             "a refused input released something"
         );
     }
