@@ -61,6 +61,21 @@ pub enum StorageError {
     /// delivered. The job needs a new generation, which is a new part file and
     /// an object of its own; the old one is left exactly where it is.
     Superseded,
+    /// The system refused, and what it said cannot be told apart from something
+    /// else it says the same way.
+    ///
+    /// **This exists so that a cause is never invented.** Linux answers `EPERM`
+    /// both for "you are not allowed to link here" and for "this filesystem has
+    /// no hard links at all", and the two want opposite things from an operator.
+    /// Reporting the first when it was the second sends somebody to check
+    /// permissions that were never wrong -- which is what this engine did, and a
+    /// review caught it. Where the system does not separate them, neither does
+    /// this: the refusal is reported as unclassified, with the raw error logged
+    /// for diagnosis, and nobody is told a story.
+    ///
+    /// It is a stop, never a retry: the coordinator sends everything that is not
+    /// a name conflict to `Storage`, which rests the job for an operator.
+    Unclassified,
 }
 impl StorageError {
     pub fn code(self) -> &'static str {
@@ -75,6 +90,7 @@ impl StorageError {
                 "STORAGE-UNSUPPORTED"
             }
             Self::Superseded => "STORAGE-SUPERSEDED",
+            Self::Unclassified => "STORAGE-UNCLASSIFIED",
             Self::Io(ErrorKind::StorageFull) => "STORAGE-FULL",
             Self::Io(ErrorKind::PermissionDenied) => "STORAGE-ACCESS-DENIED",
             Self::Io(ErrorKind::NotFound) => "STORAGE-NOT-FOUND",

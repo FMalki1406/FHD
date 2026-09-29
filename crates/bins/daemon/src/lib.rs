@@ -348,43 +348,22 @@ impl fhd_app::storage::HandleLinker for PlatformLinker {
         // `docs/publication-contract.md`.
         #[cfg(target_os = "linux")]
         {
-            // The same mapping as Windows, from the same kinds -- but what
-            // reaches it on Linux is not what this comment used to say.
+            // **Read from the errno, because the kind loses what matters here.**
+            // An earlier comment in this place claimed a filesystem without hard
+            // links arrives as `Unsupported`. It does not: `link(2)` answers
+            // `EPERM` for that, which std calls `PermissionDenied`, so the
+            // operator was told their permissions were wrong about a filesystem
+            // that simply cannot do it. A review worked the table out and the
+            // correction was recorded as not done. It is done here, in
+            // `linux_link_error`, and what cannot be separated is reported
+            // unclassified rather than guessed.
             //
-            // It claimed a filesystem without hard links arrives as
-            // `Unsupported`. It does not: `link(2)` returns **`EPERM`** for
-            // that, which std calls `PermissionDenied`, so the operator is told
-            // their permissions are wrong about a filesystem that simply cannot
-            // do it. `Unsupported` is reachable here only through `EXDEV`, and
-            // that is itself near-unreachable because the part directory is made
-            // inside the destination folder. A review worked the table out;
-            // correcting the mapping means telling `EPERM` from a real denial,
-            // which needs the errno rather than the kind, and is not done.
-            //
-            // Missing procfs arrives as `Io(NotFound)`, which reads as "your
-            // file is gone" rather than "this machine has no /proc" -- also
-            // recorded, also not fixed. What matters for safety is that no
-            // errno makes the engine retry or fall back to a path: the
+            // What matters for safety is unchanged and does not depend on the
+            // table: no errno makes the engine retry or fall back to a path. The
             // coordinator sends `Conflict` to `Destination` and everything else
             // to `Storage`, both straight to `NeedsAction` with no retry loop.
-            fhd_platform::link_into_directory(file, directory, name).map_err(|failure| {
-                let called = failure.called();
-                let error = match failure.error().kind() {
-                    std::io::ErrorKind::AlreadyExists => fhd_app::storage::StorageError::Conflict,
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
-                        fhd_app::storage::StorageError::Unsupported
-                    }
-                    std::io::ErrorKind::InvalidInput => {
-                        fhd_app::storage::StorageError::InvalidInput
-                    }
-                    other => fhd_app::storage::StorageError::Io(other),
-                };
-                if called {
-                    fhd_app::storage::LinkRefused::after_the_call(error)
-                } else {
-                    fhd_app::storage::LinkRefused::before_the_call(error)
-                }
-            })
+            fhd_platform::link_into_directory(file, directory, name)
+                .map_err(|failure| linux_link_refusal(failure.called(), failure.error()))
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -1584,4 +1563,213 @@ mod told {
         StopReason::Unreadable,
         StopReason::Unconfirmed,
     ];
+}
+
+/// What a refused `linkat` on Linux means, from the errno rather than the kind.
+///
+/// **The numbers are checked against the kernel, not trusted.** They come from
+/// `asm-generic/errno-base.h` and are the same on every Linux architecture, and
+/// `the_errno_constants_are_the_ones_this_kernel_returns` derives two of them from
+/// real syscalls so a wrong constant fails the build's tests rather than quietly
+/// misclassifying a refusal.
+///
+/// | errno | answer | why |
+/// | --- | --- | --- |
+/// | `EEXIST` | `Conflict` | the name is taken, which the caller handles by not replacing it |
+/// | `EXDEV` | `Unsupported` | a capability answer: no link crosses a device |
+/// | `EPERM` | `Unclassified` | **two causes, one code**: not permitted, or a filesystem with no hard links |
+/// | `ENOENT` | `Unclassified` | the `/proc/self/fd` entry did not resolve: no procfs, or the directory went away |
+/// | anything else | the kind, as before | nothing is claimed that was not said |
+///
+/// **Compiled everywhere, used on Linux.** The table is Linux's, but a table that
+/// only compiles on the platform it describes is a table nobody checks until CI --
+/// and this machine cannot cross-compile this crate, because a dev-dependency needs
+/// a C toolchain for the target. So the classification is ordinary Rust over an
+/// `io::Error`, its test runs on every platform, and the one thing that genuinely
+/// needs Linux -- that these numbers are what the kernel returns -- is proved there.
+/// The refusal a Linux link failure becomes: what went wrong, and whether it was asked.
+///
+/// **These two answers come from different places and must keep doing so.** Whether a
+/// directory entry may exist is the mechanism's own report -- it says whether the call
+/// was issued -- and this function only carries it through. The errno decides nothing
+/// about it. Not `EEXIST`, which says a name was there before this call and says
+/// nothing about what this call did with it; not `EXDEV`, which is an answer about
+/// devices. A number that looked like "so nothing was created" would authorise lifting
+/// the seal, removing the part, or publishing again -- on a call that may already have
+/// delivered the user's file. Two reviews rejected that inference in two other
+/// disguises: reading it off the error code, and checking the destination path after
+/// the call. This is the third disguise, and it is refused here rather than in a
+/// comment: `called` goes in and comes out untouched by the classification.
+#[cfg(any(target_os = "linux", test))]
+fn linux_link_refusal(called: bool, error: &std::io::Error) -> fhd_app::storage::LinkRefused {
+    let classified = linux_link_error(error);
+    if called {
+        fhd_app::storage::LinkRefused::after_the_call(classified)
+    } else {
+        fhd_app::storage::LinkRefused::before_the_call(classified)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_link_error(error: &std::io::Error) -> fhd_app::storage::StorageError {
+    use fhd_app::storage::StorageError;
+    // asm-generic/errno-base.h
+    const EPERM: i32 = 1;
+    const ENOENT: i32 = 2;
+    const EEXIST: i32 = 17;
+    const EXDEV: i32 = 18;
+    match error.raw_os_error() {
+        Some(EEXIST) => StorageError::Conflict,
+        Some(EXDEV) => StorageError::Unsupported,
+        // Linux gives `EPERM` both for a denial and for a filesystem that has no
+        // hard links, and an operator would do opposite things about them. The
+        // engine does the same thing either way -- rest the job -- so the honest
+        // report is that the system did not say which.
+        Some(EPERM) => StorageError::Unclassified,
+        // The link source is this process's own descriptor under `/proc/self/fd`.
+        // `ENOENT` there is either a machine without procfs or a destination
+        // directory that has gone; the call cannot tell which, so neither does this.
+        Some(ENOENT) => StorageError::Unclassified,
+        _ => match error.kind() {
+            std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
+            std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
+                StorageError::Unsupported
+            }
+            std::io::ErrorKind::InvalidInput => StorageError::InvalidInput,
+            other => StorageError::Io(other),
+        },
+    }
+}
+
+/// What the Linux link mapping claims, and the proof its numbers are real.
+///
+/// **Two kinds of test, because the table has two ways of being wrong.** The
+/// classification can be wrong -- a cause invented where the system named none --
+/// and the constants can be wrong, which would silently misfile every refusal.
+/// The first is asserted directly; the second is derived from syscalls this
+/// kernel performs, so a number that does not match what Linux returns fails here
+/// rather than in a user's log.
+#[cfg(test)]
+mod linux_link_errors {
+    use super::{linux_link_error, linux_link_refusal};
+    use fhd_app::storage::StorageError;
+    use std::io::Error;
+
+    /// Each classification this build claims it can prove.
+    #[test]
+    fn each_provable_cause_is_classified_and_nothing_else_is_guessed() {
+        // A taken name: the one answer the caller acts on, by refusing to replace.
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(17)),
+            StorageError::Conflict
+        );
+        // A capability answer the system states: no link crosses a device.
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(18)),
+            StorageError::Unsupported
+        );
+        // **The two the system does not separate.** Reporting either as a
+        // permission problem is what sent an operator to check permissions that
+        // were never wrong.
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(1)),
+            StorageError::Unclassified,
+            "EPERM is a denial or a filesystem without hard links, and this build must not pick one"
+        );
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(2)),
+            StorageError::Unclassified,
+            "ENOENT here is no procfs or a vanished directory, and this build must not pick one"
+        );
+        // What is *not* in the table keeps whatever the system said, with nothing
+        // added -- asserted on Linux below, because translating a raw number into a
+        // kind is the platform's own business and this one is not Linux.
+    }
+
+    /// **No errno turns an issued call into "nothing was created".**
+    ///
+    /// The classification describes the system's error and nothing else. Whether a
+    /// directory entry may exist is the mechanism's own report, and it is the only
+    /// thing that may decide it -- because that answer is what authorises lifting a
+    /// seal, removing a part, or publishing again, and a call that was issued may
+    /// already have delivered the user's file. `EEXIST` is the tempting one: it says
+    /// a name was there *before* this call, which sounds like "so this call made
+    /// nothing", and that inference is exactly what must not be drawn. `EXDEV` is the
+    /// other: an answer about devices, not about what happened at the destination.
+    ///
+    /// So every errno in and out of the table is put through the real composition
+    /// twice, and the only thing that moves is what the mechanism said.
+    #[test]
+    fn no_errno_converts_an_issued_call_into_a_refusal_that_made_nothing() {
+        for raw in [1, 2, 13, 17, 18, 28, 5, 122] {
+            let error = Error::from_raw_os_error(raw);
+            let issued = linux_link_refusal(true, &error);
+            assert!(
+                issued.called(),
+                "errno {raw} turned a call that was issued into one that was not"
+            );
+            let never_issued = linux_link_refusal(false, &error);
+            assert!(
+                !never_issued.called(),
+                "errno {raw} turned a call that was never issued into one that was"
+            );
+            // And the classification itself is the same either way: it describes the
+            // system's error, so it cannot be a function of what the mechanism did.
+            assert_eq!(
+                issued.error(),
+                never_issued.error(),
+                "errno {raw} classified differently depending on whether the call went out"
+            );
+            assert_eq!(issued.error(), linux_link_error(&error));
+        }
+    }
+
+    /// Everything the table does not name keeps the kind the system gave it.
+    ///
+    /// Linux only, and not for want of generality: `io::Error::kind()` reads a raw
+    /// number through the host's own table, so asserting this anywhere else would be
+    /// asserting Windows's translation of a Linux errno, which means nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_the_table_does_not_name_keeps_the_kind_the_system_gave() {
+        // ENOSPC: a full disk says so itself and needs no help from this table.
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(28)),
+            StorageError::Io(std::io::ErrorKind::StorageFull)
+        );
+        // EACCES is a denial the system *does* state, so it keeps its own name --
+        // which is the point of refusing to call `EPERM` one.
+        assert_eq!(
+            linux_link_error(&Error::from_raw_os_error(13)),
+            StorageError::Io(std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    /// The constants are the ones this kernel returns, derived rather than trusted.
+    ///
+    /// Linux only: it is the kernel's own answers that are being checked, and no
+    /// other system is claimed to use these numbers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_errno_constants_are_the_ones_this_kernel_returns() {
+        let directory = std::env::temp_dir().join(format!("fhd-errno-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory is usable");
+        let source = directory.join("source");
+        let taken = directory.join("taken");
+        std::fs::write(&source, b"x").expect("the source is written");
+        std::fs::write(&taken, b"y").expect("the other name is written");
+
+        // EEXIST, from a link onto a name that exists.
+        let existing = std::fs::hard_link(&source, &taken).expect_err("the name is taken");
+        assert_eq!(existing.raw_os_error(), Some(17), "EEXIST is not 17 here");
+        assert_eq!(linux_link_error(&existing), StorageError::Conflict);
+
+        // ENOENT, from a link whose source is not there.
+        let missing = std::fs::hard_link(directory.join("absent"), directory.join("new"))
+            .expect_err("the source is absent");
+        assert_eq!(missing.raw_os_error(), Some(2), "ENOENT is not 2 here");
+        assert_eq!(linux_link_error(&missing), StorageError::Unclassified);
+
+        std::fs::remove_dir_all(&directory).expect("the directory is removed");
+    }
 }

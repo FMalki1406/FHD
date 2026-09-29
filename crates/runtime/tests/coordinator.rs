@@ -292,6 +292,178 @@ async fn full_disk_needs_action_and_never_commits_unsynced_bytes() {
     }
 }
 
+/// **A storage error does not delete what was already durable.**
+///
+/// The binding criterion of the disk-failure work, in the words of
+/// `docs/feature-download-to-a-different-disk.md`: no error path may delete
+/// committed extents or a valid part file, and the evidence has to be a test that
+/// injects the error and shows the durable bytes still there. Until now the disk
+/// full test above stopped at the stop: it checked that nothing unsynced was
+/// credited, which is the opposite direction -- that too little was kept, not that
+/// too much was thrown away.
+///
+/// So this one measures the other side, end to end. The failure lands after a
+/// checkpoint, the fault is then lifted the way a user frees space, and the job
+/// finishes. **What proves the progress survived is the transport**: it counts the
+/// bytes it handed out, and a job that had lost its durable extents would have to
+/// ask for them again.
+#[tokio::test]
+async fn a_storage_error_keeps_the_durable_bytes_and_the_job_finishes_without_refetching_them() {
+    let content = body(200_000);
+    let rig = rig(&content, true, None);
+    rig.store.set_faults(StoreFaults {
+        fail_write_at: Some(150_000),
+        ..Default::default()
+    });
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Settled(JobState::NeedsAction))
+    );
+    let job = rig.job().await;
+    assert_eq!(job.reason(), Some(StopReason::Storage));
+
+    // The premise: some bytes really were durable when the error struck.
+    let kept: Vec<DurableExtent> = rig.repo.durable_extents(rig.id).await.unwrap();
+    let durable = rig.durable().await;
+    assert!(durable > 0, "the premise failed: nothing was durable yet");
+    let part = rig
+        .store
+        .bytes(rig.id, job.generation())
+        .expect("the part file was deleted by a storage error");
+    for extent in &kept {
+        let range = extent.range();
+        assert_eq!(
+            &part[range.start() as usize..range.end() as usize],
+            &content[range.start() as usize..range.end() as usize],
+            "a committed extent no longer holds its bytes"
+        );
+    }
+
+    // The disk has room again, and the job is resumed -- not replaced: a storage
+    // error is not a reason to fetch a second copy of anything.
+    rig.store.set_faults(StoreFaults::default());
+    let served_before = rig.transport.served();
+    let generation = job.generation();
+    rig.command(JobCommand::Resume).await;
+    assert_eq!(
+        rig.run().await,
+        Ok(SessionEnd::Published(Published::At(
+            rig.destination.clone()
+        )))
+    );
+    let finished = rig.job().await;
+    assert_eq!(finished.state(), JobState::Completed);
+    assert_eq!(
+        finished.generation(),
+        generation,
+        "a storage error must not change the representation"
+    );
+    assert_eq!(rig.store.published(&rig.destination).unwrap(), content);
+
+    // And nobody had to send the durable bytes twice. The second run may fetch
+    // what was missing and no more -- had the error path dropped the extents, it
+    // would have had to fetch the whole file again, and this is what says it did
+    // not. The bound is exact rather than generous on purpose: a comfortable one
+    // would pass for a job that refetched half of what it already had.
+    let missing = content.len() as u64 - durable;
+    let served_after = rig.transport.served() - served_before;
+    assert!(
+        served_after <= missing,
+        "the resume fetched {served_after} bytes with only {missing} missing:          progress was lost to the error"
+    );
+}
+
+/// A sync that fails keeps every byte that an earlier sync had already made durable.
+///
+/// The other half of the same criterion, on the path that had no test at all: the
+/// fault existed in the double and no test ever set it, so `checkpoint` ->
+/// `on_storage_failure` -> `discard_unsynced` was unmeasured. The fault is turned
+/// on **after** a first checkpoint has succeeded, because a run whose every sync
+/// fails has no durable bytes to lose and would prove nothing.
+///
+/// And it fails **once**. A permanent fault cannot tell this path from the one in
+/// `verify`, which syncs too and stops the same way -- a mutation that swallowed
+/// the checkpoint's error entirely would still land on `NeedsAction` there, and
+/// this test would have called that a pass. With a single failure the two answers
+/// separate: reported, the job rests here; swallowed, the next sync succeeds and
+/// the job finishes.
+#[tokio::test]
+async fn a_failed_sync_discards_only_what_was_never_durable() {
+    let content = body(200_000);
+    let rig = rig(&content, true, None);
+    let (control, receiver) = mpsc::channel(1);
+    let run = rig.coordinator.run(rig.job().await, receiver);
+    let fail_once_durable = async {
+        rig.until_durable().await;
+        rig.store.set_faults(StoreFaults {
+            fail_sync_once: true,
+            ..Default::default()
+        });
+        // Nothing is sent on the control channel; the fault is the whole event.
+        drop(control);
+    };
+    let (end, ()) = tokio::join!(run, fail_once_durable);
+    assert_eq!(end, Ok(SessionEnd::Settled(JobState::NeedsAction)));
+    let job = rig.job().await;
+    assert_eq!(job.reason(), Some(StopReason::Storage));
+
+    let kept: Vec<DurableExtent> = rig.repo.durable_extents(rig.id).await.unwrap();
+    assert!(
+        !kept.is_empty(),
+        "the premise failed: no checkpoint had succeeded before the sync fault"
+    );
+    let part = rig
+        .store
+        .bytes(rig.id, job.generation())
+        .expect("the part file was deleted by a failed sync");
+    for extent in &kept {
+        let range = extent.range();
+        assert_eq!(
+            extent.digest(),
+            digest(&content[range.start() as usize..range.end() as usize]),
+            "an extent that survived a failed sync no longer describes its bytes"
+        );
+        assert_eq!(
+            &part[range.start() as usize..range.end() as usize],
+            &content[range.start() as usize..range.end() as usize]
+        );
+    }
+}
+
+/// A cancel arriving while storage is failing settles the job instead of hanging.
+///
+/// Neither review found this defect, and no test had put the two together: the
+/// suite sets faults in one place and cancels in another. A cancel is the one
+/// command that removes a part on purpose, so the interesting question is not
+/// whether the bytes survive -- they are meant not to -- but whether the job
+/// settles at all when the storage underneath it is refusing writes.
+#[tokio::test]
+async fn a_cancel_during_a_storage_failure_still_settles_the_job() {
+    let content = body(200_000);
+    let rig = rig(&content, true, None);
+    rig.store.set_faults(StoreFaults {
+        fail_write_at: Some(120_000),
+        ..Default::default()
+    });
+    let (control, receiver) = mpsc::channel(1);
+    let run = rig.coordinator.run(rig.job().await, receiver);
+    let cancel = async {
+        rig.until_durable().await;
+        control.send(Control::Cancel).await.unwrap();
+    };
+    let (end, ()) = tokio::join!(run, cancel);
+    let state = match end {
+        Ok(SessionEnd::Settled(state)) => state,
+        other => panic!("the session did not settle: {other:?}"),
+    };
+    assert!(
+        matches!(state, JobState::Cancelled | JobState::NeedsAction),
+        "settled at {state:?}"
+    );
+    // Whichever of the two it lands on, the job is at rest and the record says so.
+    assert_eq!(rig.job().await.state(), state);
+}
+
 #[tokio::test]
 async fn restart_reproves_durable_extents_and_rejects_corruption() {
     let content = body(90_000);

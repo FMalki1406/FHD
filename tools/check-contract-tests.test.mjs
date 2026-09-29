@@ -207,13 +207,13 @@ test('a test attribute broken across lines is read', () => {
   assert.deepEqual(testsIn(source), ['broken_across_lines', 'and_another_attribute_after_it']);
 });
 
-/// Both suites are specified, and each one's source says the same thing this file
+/// Every suite is specified, and each one's source says the same thing this file
 /// does.
 ///
 /// Read off disk rather than asserted as a count, because a count is what somebody
 /// updates without looking. A name in one list and not the other is the failure.
 test('every suite declares exactly the tests its source contains', () => {
-  assert.equal(SUITES.length, 2, 'a suite was added or removed without updating this test');
+  assert.equal(SUITES.length, 3, 'a suite was added or removed without updating this test');
   for (const suite of SUITES) {
     const declared = [...testsIn(readFileSync(suite.source, 'utf8'))].sort();
     const specified = [...suite.required.keys()].sort();

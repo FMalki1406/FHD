@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -346,6 +346,15 @@ impl TransferRepository for MemoryTransfers {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreFaults {
     pub fail_sync: bool,
+    /// The next `sync` fails, and the fault clears itself.
+    ///
+    /// **A run whose every sync fails cannot show that a failed one keeps what
+    /// earlier ones made durable** -- it never had any. Worse, it cannot tell the
+    /// checkpoint path from the verify path, because both sync and both would
+    /// report the same stop. One failure separates them: with the failure
+    /// reported the job rests, and with it swallowed the next sync succeeds and
+    /// the job finishes, which is a difference a test can see.
+    pub fail_sync_once: bool,
     /// Writes touching this offset fail with StorageFull.
     pub fail_write_at: Option<u64>,
     /// The next `create` fails, and nothing is recorded for it.
@@ -588,8 +597,15 @@ impl SegmentFile for MemoryFile {
     }
     fn sync(&mut self) -> Result<(), StorageError> {
         self.usable()?;
-        if self.faults.lock().unwrap().fail_sync {
-            return Err(StorageError::Io(std::io::ErrorKind::Other));
+        {
+            let mut faults = self.faults.lock().unwrap();
+            if faults.fail_sync {
+                return Err(StorageError::Io(std::io::ErrorKind::Other));
+            }
+            if faults.fail_sync_once {
+                faults.fail_sync_once = false;
+                return Err(StorageError::Io(std::io::ErrorKind::Other));
+            }
         }
         let mut data = self.data.lock().unwrap();
         data.durable = data.live.clone();
@@ -724,6 +740,7 @@ pub struct ScriptedTransport {
     faults: Mutex<VecDeque<FetchFault>>,
     changed: Mutex<bool>,
     fetches: AtomicUsize,
+    served: Arc<AtomicU64>,
 }
 impl ScriptedTransport {
     pub fn new(body: Vec<u8>, ranges: bool, chunk: usize) -> Self {
@@ -736,6 +753,7 @@ impl ScriptedTransport {
             faults: Mutex::default(),
             changed: Mutex::new(false),
             fetches: AtomicUsize::new(0),
+            served: Arc::new(AtomicU64::new(0)),
         }
     }
     /// Places this transport's sources on a distinct origin, for scheduling tests.
@@ -767,6 +785,14 @@ impl ScriptedTransport {
     }
     pub fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
+    }
+    /// Bytes handed out so far, over every fetch.
+    ///
+    /// A request count cannot say whether a resume kept its progress -- a job
+    /// that lost its durable bytes asks for the same ranges again and the count
+    /// looks ordinary. This says how much had to be sent.
+    pub fn served(&self) -> u64 {
+        self.served.load(Ordering::SeqCst)
     }
 }
 impl Transport for ScriptedTransport {
@@ -811,6 +837,7 @@ impl Transport for ScriptedTransport {
                 chunk: self.chunk,
                 delivered: 0,
                 fault,
+                served: self.served.clone(),
             }) as Box<dyn ByteStream>)
         })
     }
@@ -822,6 +849,13 @@ struct ScriptedStream {
     chunk: usize,
     delivered: usize,
     fault: Option<FetchFault>,
+    /// Bytes this transport has handed out, across every stream it made.
+    ///
+    /// Counting requests is not enough to say a resume kept its progress: a job
+    /// that lost its durable bytes would fetch the same ranges again and the
+    /// request count would look ordinary. What says the bytes survived an error
+    /// is that nobody had to send them twice.
+    served: Arc<AtomicU64>,
 }
 impl ByteStream for ScriptedStream {
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> PortFuture<'a, Result<usize, TransportError>> {
@@ -842,6 +876,7 @@ impl ByteStream for ScriptedStream {
             buf[..limit].copy_from_slice(&self.body[self.at..self.at + limit]);
             self.at += limit;
             self.delivered += limit;
+            self.served.fetch_add(limit as u64, Ordering::SeqCst);
             Ok(limit)
         })
     }

@@ -29,6 +29,8 @@ const PACKAGE = 'fhd-daemon';
 const TARGET = 'publication';
 const WITNESS_SOURCE = 'crates/bins/daemon/tests/delivery_witness.rs';
 const WITNESS_TARGET = 'delivery_witness';
+const STORAGE_SOURCE = 'crates/bins/daemon/tests/storage_failure.rs';
+const STORAGE_TARGET = 'storage_failure';
 
 /// name -> the platforms it must run and pass on.
 ///
@@ -98,6 +100,25 @@ export const WITNESS_REQUIRED = new Map([
   ],
 ]);
 
+/// What a storage failure may not cost, on the destination's own disk.
+///
+/// The binding criterion of the disk-failure work: no error path deletes committed
+/// extents or a valid part file. It is required on both platforms that publish,
+/// because the claim is about storage rather than about linking -- and the part of
+/// it that needs a real filesystem is the reopen, where a record that credited
+/// something it should not have is the difference between resuming and starting
+/// again.
+export const STORAGE_REQUIRED = new Map([
+  [
+    'a_full_destination_disk_keeps_the_record_honest_and_the_part_resumable',
+    ['win32', 'linux'],
+  ],
+  [
+    'a_failed_sync_leaves_the_record_crediting_only_what_survived_it',
+    ['win32', 'linux'],
+  ],
+]);
+
 /// The suites this gate runs, in order.
 export const SUITES = [
   { source: SOURCE, target: TARGET, label: 'Publication contract', required: REQUIRED },
@@ -106,6 +127,12 @@ export const SUITES = [
     target: WITNESS_TARGET,
     label: 'Delivery witness',
     required: WITNESS_REQUIRED,
+  },
+  {
+    source: STORAGE_SOURCE,
+    target: STORAGE_TARGET,
+    label: 'Storage failure',
+    required: STORAGE_REQUIRED,
   },
 ];
 
