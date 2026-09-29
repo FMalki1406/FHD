@@ -15,6 +15,13 @@
 #[cfg(windows)]
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 
+// `cbData` is a `u32`, and the input's length is cast into it. The cast is lossless only
+// while the guard above it cannot admit a length that a `u32` cannot hold, so that is
+// checked here rather than trusted: if `MAX_INPUT` ever grows past `u32::MAX`, this fails
+// to compile instead of silently encrypting a truncated prefix of the caller's secret.
+#[cfg(windows)]
+const _: () = assert!(MAX_INPUT <= u32::MAX as usize);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     UnsupportedPlatform,
@@ -35,12 +42,66 @@ fn transform(_: &[u8], _: bool) -> Result<Vec<u8>, Error> {
     Err(Error::UnsupportedPlatform)
 }
 
-/// The one place in this crate where `unsafe` is permitted.
+/// Wipes a DPAPI output block, then releases it -- with the allocator's two calls passed
+/// in, so that the bound on the wipe is something a test can watch.
 ///
-/// Four native calls, each reviewed and each with its own `SAFETY` note below:
-/// `CryptProtectData`/`CryptUnprotectData` on a bounded owned buffer; `LocalSize` and
-/// the wipe it bounds; `LocalFree`; and the copy out of the blob, which happens only
-/// after success, a non-null pointer and a length inside `MAX_INPUT`.
+/// **Nothing here forms a slice.** `LocalSize` reports the size of the *block*, which
+/// Microsoft documents may exceed the size that was asked for, so the bytes past what
+/// DPAPI wrote are of unknown initialisation. `slice::from_raw_parts_mut` requires every
+/// element of the slice to be initialised, so building a `&mut [u8]` across the block
+/// would be undefined behaviour however carefully the length had been obtained. A
+/// security review named this; the version before it formed exactly that slice.
+///
+/// **The volatile write is the guarantee, not the fence.** A plain store into memory that
+/// is about to be released is a store nothing can observe, and a compiler may drop it --
+/// the review measured that in emitted assembly, which is also why the comment that
+/// credited the fence with keeping the wipe alive is gone. `write_volatile` may not be
+/// elided. The fence stays as belt and braces and claims nothing.
+///
+/// **A size of zero releases nothing.** `LocalSize` returns zero for a handle it does not
+/// recognise, so a zero is the allocator saying it has no such allocation -- and handing
+/// that same pointer to `LocalFree` next would be asking it to release the thing it has
+/// just denied owning. The old code wiped nothing in that case and freed anyway.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn wipe_and_release(block: *mut u8, size: impl Fn(*mut u8) -> usize, free: impl FnOnce(*mut u8)) {
+    if block.is_null() {
+        return;
+    }
+    let allocated = size(block);
+    if allocated == 0 {
+        return;
+    }
+    for offset in 0..allocated {
+        // SAFETY: the block belongs to the caller alone -- `Output` owns it, no other
+        // reference to it exists, and `transform` has copied out of it before this runs --
+        // and `allocated` is its length by the allocator's own account, so every address
+        // here lies inside that one allocation and is valid for a write of one byte. That
+        // the allocator's reported length is writable throughout is an inference from the
+        // `LocalAlloc`/`LocalSize` contract rather than a sentence Microsoft writes; it is
+        // the same inference that passing the pointer to `LocalFree` already rests on.
+        // `u8` needs no alignment beyond one, and a volatile write needs no initialised
+        // value under it.
+        unsafe { block.add(offset).write_volatile(0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    free(block);
+}
+
+/// The one place in this crate where `unsafe` is permitted -- together with
+/// `wipe_and_release`, which the gate approves by its own signature.
+///
+/// Five native calls in all, each reviewed and each with its own `SAFETY` note:
+/// `CryptProtectData`/`CryptUnprotectData` on a bounded owned buffer; the copy out of the
+/// blob, which happens only after success, a non-null pointer and a length inside
+/// `MAX_INPUT`; `LocalSize` and `LocalFree`, passed to `wipe_and_release` as the two
+/// closures below; and the wipe there that the first of them bounds.
+///
+/// **What DPAPI protects, and what it does not.** `CRYPTPROTECT_UI_FORBIDDEN` with no
+/// entropy and no flags binds the ciphertext to this user on this machine: any process
+/// running as the same user can call `unprotect` on it. It keeps the queue's credentials
+/// out of a file readable by another account or copied off the machine; it is not a
+/// defence against code already running as the user.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
@@ -72,7 +133,7 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
         /// refuses a `cbData` of zero or one above `MAX_INPUT`, so the code already
         /// treats that field as needing a check before it is believed. A failed
         /// `CryptProtectData` is not documented to leave the out-blob untouched, so a
-        /// length written there by a call that failed could have sent this `zeroize`
+        /// length written there by a call that failed could have sent that wipe
         /// past the end of the allocation: a wipe intended to protect a secret,
         /// writing wherever a failed call happened to leave a number.
         ///
@@ -81,27 +142,24 @@ fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {
         /// does not recognise. So the wipe is bounded by the allocation on every path
         /// -- including the ones that made the old bound unsafe -- and it still covers
         /// what it was for: on `unprotect` this buffer holds the plaintext.
+        ///
+        /// The two allocator calls are passed to `wipe_and_release` instead of being made
+        /// here, which is what lets a test report a size and check that the wipe stops
+        /// there and that a zero frees nothing.
         fn drop(&mut self) {
-            if self.0.pbData.is_null() {
-                return;
-            }
-            // SAFETY: a non-null `pbData` from DPAPI is a `LocalAlloc` handle, which is
-            // what this asks about. It reads nothing through the pointer.
-            let allocated = unsafe { LocalSize(self.0.pbData.cast()) };
-            if allocated > 0 {
-                // SAFETY: the allocation is this struct's alone -- no other reference
-                // to it exists, and `transform` copies out of it before dropping -- and
-                // `allocated` is its length by the allocator's own account.
-                unsafe {
-                    use zeroize::Zeroize;
-                    std::slice::from_raw_parts_mut(self.0.pbData, allocated).zeroize();
-                }
-            }
-            // SAFETY: DPAPI documents its output as `LocalAlloc`ated and released with
-            // `LocalFree`, and this is the only release of it.
-            unsafe {
-                LocalFree(self.0.pbData.cast());
-            }
+            wipe_and_release(
+                self.0.pbData,
+                // SAFETY: this is reached only for a non-null pointer, and a non-null
+                // `pbData` from DPAPI is a `LocalAlloc` handle, which is what this asks
+                // about. It reads nothing through the pointer.
+                |block| unsafe { LocalSize(block.cast()) },
+                // SAFETY: DPAPI documents its output as `LocalAlloc`ated and released with
+                // `LocalFree`, and this is the only release of it. It is reached only after
+                // `LocalSize` has recognised the handle.
+                |block| {
+                    unsafe { LocalFree(block.cast()) };
+                },
+            );
         }
     }
     let mut output = Output(CRYPT_INTEGER_BLOB {
@@ -165,6 +223,71 @@ mod tests {
         changed[end] ^= 0xff;
         assert!(unprotect(&changed).is_err());
         assert_eq!(protect(&[]), Err(Error::InvalidSize));
+    }
+
+    /// The wipe stops at the size it was told, and the bytes after it are untouched.
+    ///
+    /// This is the claim that could not be tested while the wipe read its length out of
+    /// the blob and called the allocator itself: showing the danger would have meant
+    /// making DPAPI fail *and* leave a non-null pointer with a false length behind, which
+    /// no test can arrange. With the two calls passed in, the bound is a number this test
+    /// chooses -- so the guard region below is the measurement, and the record that called
+    /// this fix "reviewed but not coverable" was wrong about that.
+    #[test]
+    fn the_wipe_covers_the_reported_size_and_no_more() {
+        let mut block = vec![0xab_u8; 64];
+        let pointer = block.as_mut_ptr();
+        let freed = std::cell::Cell::new(0_usize);
+        wipe_and_release(pointer, |_| 16, |_| freed.set(freed.get() + 1));
+        assert_eq!(
+            &block[..16],
+            &[0_u8; 16],
+            "the reported bytes are not wiped"
+        );
+        assert!(
+            block[16..].iter().all(|byte| *byte == 0xab),
+            "the wipe ran past the reported size"
+        );
+        assert_eq!(freed.get(), 1, "the block was not released");
+    }
+
+    /// A size of zero is the allocator denying the handle: nothing is wiped, nothing freed.
+    #[test]
+    fn a_reported_size_of_zero_wipes_nothing_and_releases_nothing() {
+        let mut block = vec![0xab_u8; 16];
+        let pointer = block.as_mut_ptr();
+        let freed = std::cell::Cell::new(0_usize);
+        wipe_and_release(pointer, |_| 0, |_| freed.set(freed.get() + 1));
+        assert!(
+            block.iter().all(|byte| *byte == 0xab),
+            "a block the allocator does not know was written to"
+        );
+        assert_eq!(
+            freed.get(),
+            0,
+            "a pointer the allocator has just denied owning was passed to it to free"
+        );
+    }
+
+    /// A null blob -- what `transform` holds before the call, and after a failed one --
+    /// is neither measured nor freed.
+    ///
+    /// The size reported here is zero on purpose. A non-zero one would also fail if the
+    /// null check were dropped, but it would fail by writing through null and taking the
+    /// test process down with it; this way the same mutation fails on an assertion.
+    #[test]
+    fn a_null_block_is_not_measured_or_released() {
+        let asked = std::cell::Cell::new(0_usize);
+        let freed = std::cell::Cell::new(0_usize);
+        wipe_and_release(
+            std::ptr::null_mut(),
+            |_| {
+                asked.set(asked.get() + 1);
+                0
+            },
+            |_| freed.set(freed.get() + 1),
+        );
+        assert_eq!((asked.get(), freed.get()), (0, 0), "a null blob was used");
     }
 }
 

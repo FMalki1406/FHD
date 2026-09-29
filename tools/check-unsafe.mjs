@@ -112,11 +112,17 @@ export const APPROVED = new Map([
   }],
   // The wipe in `Output::drop` is bounded by `LocalSize` rather than by the blob's own
   // `cbData`, because it runs on the failure path and while unwinding, where nothing has
-  // checked that field -- see the note on the function.
+  // checked that field -- see the note on the function. The wipe itself lives in
+  // `wipe_and_release`, which takes the allocator's two calls as parameters: a second
+  // approved item, and the reason the bound is now measured rather than only argued.
   ['crates/queue-secrets/src/lib.rs', {
     allowances: [
       {
         item: 'fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, Error> {',
+        platforms: ['win32'],
+      },
+      {
+        item: 'fn wipe_and_release(block: *mut u8, size: impl Fn(*mut u8) -> usize, free: impl FnOnce(*mut u8)) {',
         platforms: ['win32'],
       },
     ],
@@ -151,10 +157,33 @@ export function sitesFrom(output) {
       kind: code === 'E0453' ? 'allowance' : 'usage',
       file: primary.file_name.replaceAll('\\', '/'),
       line: primary.line_start,
+      // **The column and the byte offset, because a line is not a site.** Two `unsafe`
+      // blocks can sit on one line, and the compiler reports each of them -- but a key
+      // made of the file and the line alone folded them into one, so a file with two
+      // uses on a line counted one and a new block added beside an existing one changed
+      // no number. A security review proved it with the two diagnostics. The byte offset
+      // is what identifies a site; the column is kept for a reader and for the rare
+      // diagnostic that carries no offset.
+      column: primary.column_start ?? 0,
+      offset: primary.byte_start ?? null,
       text: (primary.text?.[0]?.text ?? '').trim(),
     });
   }
   return sites;
+}
+
+/// What makes one site one site, for folding the same one reported by several targets.
+///
+/// **The byte offset, not the line.** Two `unsafe` blocks can sit on one line, and a key
+/// made of the file and the line folded them into one: a file with two uses on a line
+/// counted one, and a block added beside an existing one changed no number -- in the very
+/// count that exists to make adding one a decision somebody agrees to. A security review
+/// proved it with the two diagnostics rustc emits. The line and column are what a reader
+/// needs; the offset is what identifies the site, with the line and column as the key for
+/// the rare span that carries no offset.
+export function siteKey(site) {
+  const where = site.offset ?? `${site.line}:${site.column}`;
+  return `${site.kind}:${site.file}:${where}`;
 }
 
 /// Errors that are neither of the two this gate reads, which mean the enumeration for
@@ -380,18 +409,37 @@ export function findings({ sites, approved = APPROVED, platform, name = itemAt }
 /// non-zero with no JSON at all, and the first version of this gate read that as
 /// "nothing found". A security review named it: the exit status has to be part of the
 /// answer, not ignored because the diagnostics were quiet.
-export function auditFailed({ status, sites, reasons, output }) {
-  if (reasons.length) return reasons;
-  if (status === 0) return [];
-  if (sites.length) return [];
-  // cargo echoes the whole rustc command line on failure, thousands of characters of no
-  // use to a reader. What is wanted is what it said went wrong.
-  const said = output.split('\n').map((line) => line.trim())
+export function auditFailed({ status, signal, sites, reasons, output }) {
+  const said = () => output.split('\n').map((line) => line.trim())
+    // cargo echoes the whole rustc command line on failure, thousands of characters of
+    // no use to a reader. What is wanted is what it said went wrong.
     .filter((line) => /^(error|warning|Caused by|failed)/u.test(line))
     .map((line) => (line.length > 160 ? `${line.slice(0, 160)}...` : line))
     .slice(0, 3)
     .join(' / ');
-  return [`exited ${status} with no diagnostic this gate can read: ${said || 'and said nothing'}`];
+  if (reasons.length) return reasons;
+  // **A process that did not finish did not audit anything**, whatever it managed to
+  // print first. A security review pointed out that one diagnostic was enough to call a
+  // target audited, so a run killed part-way through -- or one that failed for a reason
+  // cargo prints as plain text, like a linker it could not find -- was read as a clean
+  // pass on the strength of the lines it happened to emit before it stopped.
+  if (signal) return [`was killed by ${signal} part-way through: ${said() || 'and said nothing'}`];
+  if (typeof status !== 'number') return [`did not report an exit status: ${said() || 'and said nothing'}`];
+  if (status === 0) return [];
+  // A non-zero exit is expected when the forbid fires -- and then cargo says only that it
+  // could not compile, after the diagnostics this gate has already read. Any other
+  // complaint means something else went wrong, and a target that failed for something
+  // else was not audited for this.
+  const unexplained = output.split('\n').map((line) => line.trim())
+    .filter((line) => !line.startsWith('{'))
+    .filter((line) => /^error(:|\[)/u.test(line))
+    .filter((line) => !/^error: could not compile /u.test(line))
+    .filter((line) => !/^error: aborting due to /u.test(line));
+  if (unexplained.length) {
+    return [`exited ${status} for a reason this gate does not recognise: ${said()}`];
+  }
+  if (sites.length) return [];
+  return [`exited ${status} with no diagnostic this gate can read: ${said() || 'and said nothing'}`];
 }
 
 /// Compiles one file with the forbid and returns what the compiler said.
@@ -406,7 +454,10 @@ export function auditFile(rustc, path, extra = []) {
   const output = `${run.stdout ?? ''}${run.stderr ?? ''}`;
   const sites = sitesFrom(output);
   const reasons = unaudited(output);
-  return { sites, reasons: auditFailed({ status: run.status, sites, reasons, output }) };
+  return {
+    sites,
+    reasons: auditFailed({ status: run.status, signal: run.signal, sites, reasons, output }),
+  };
 }
 
 /// Every target in the workspace, as the flags `cargo rustc` needs to select one.
@@ -492,7 +543,7 @@ function main() {
     const found = sitesFrom(output);
     sites.push(...found);
     for (const reason of auditFailed({
-      status: run.status, sites: found, reasons: unaudited(output), output,
+      status: run.status, signal: run.signal, sites: found, reasons: unaudited(output), output,
     })) {
       reasons.push(`${target.package} ${target.kind} ${target.name}: ${reason}`);
     }
@@ -503,9 +554,7 @@ function main() {
   // from several invocations. Counting them all would double every number and report
   // every allowance twice.
   const seen = new Map();
-  for (const site of sites) {
-    seen.set(`${site.kind}:${site.file}:${site.line}`, site);
-  }
+  for (const site of sites) seen.set(siteKey(site), site);
   const messages = findings({ sites: [...seen.values()], platform: process.platform });
   if (reasons.length || messages.length) {
     console.error(`Unsafe policy failed on ${process.platform}:`);

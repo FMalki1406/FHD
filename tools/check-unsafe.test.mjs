@@ -5,8 +5,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  APPROVED, auditFailed, auditFile, findings, itemBelow, resolveCargo, sitesFrom, targetsFrom,
-  unaudited,
+  APPROVED, auditFailed, auditFile, findings, itemBelow, resolveCargo, siteKey, sitesFrom,
+  targetsFrom, unaudited,
 } from './check-unsafe.mjs';
 
 /// The compiler these tests put their samples to.
@@ -112,6 +112,52 @@ test('a literal that looks like an allowance is not reported', () => {
   }
 });
 
+/// Two uses on one line are two uses.
+///
+/// **A line is not a site.** The key that identified a site was the file and the line, so
+/// two `unsafe` blocks written on one line folded into one: the file counted one use
+/// where the compiler had reported two, and a block added beside an existing one changed
+/// no number at all -- in the very count that exists to make adding one a decision. A
+/// security review proved it with the two diagnostics, and this is those two diagnostics.
+///
+/// The compiler is asked, because the claim is about what it reports; the deduplication
+/// is then asserted on the same shape, since the real gate sees each site from several
+/// invocations of the same file.
+test('two uses of unsafe on one line are counted as two', () => {
+  const rustc = resolveRustc();
+  const base = mkdtempSync(join(tmpdir(), 'fhd-unsafe-one-line-'));
+  try {
+    const file = join(base, 'pair.rs');
+    // Two blocks, one line, one allowance over them.
+    writeFileSync(
+      file,
+      [
+        '#![deny(unsafe_code)]',
+        '#[allow(unsafe_code)]',
+        `pub fn two() -> u32 { let a = ${unsafeBody}; let b = ${unsafeBody}; a + b }`,
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const { sites, reasons } = auditFile(rustc, file);
+    assert.deepEqual(reasons, [], 'the sample must compile, or it proves nothing');
+    const uses = sites.filter((site) => site.kind === 'usage');
+    assert.equal(uses.length, 2, `the compiler reported ${uses.length} use(s): ${JSON.stringify(uses)}`);
+    assert.equal(uses[0].line, uses[1].line, 'the premise failed: they are not on one line');
+    assert.notEqual(uses[0].column, uses[1].column, 'the two have the same column');
+    assert.notEqual(uses[0].offset, uses[1].offset, 'the two have the same byte offset');
+
+    // And the key the gate itself deduplicates by keeps them apart, while still folding
+    // the same site reported by two invocations into one. `siteKey` is the gate's own
+    // function, not a copy of it: a first version of this test computed the key here, so
+    // a mutation that put the line back in the real key passed unnoticed.
+    assert.equal(new Set(uses.map(siteKey)).size, 2, 'the two uses share a key');
+    assert.equal(new Set([...uses, ...uses].map(siteKey)).size, 2, 'the same site did not fold');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 /// A target that would not compile has not been audited, and says so.
 test('an error the gate cannot classify is reported rather than ignored', () => {
   const rustc = resolveRustc();
@@ -131,20 +177,40 @@ test('an error the gate cannot classify is reported rather than ignored', () => 
 test('diagnostics are read from rustc and from cargo, and nothing else is', () => {
   const bare = JSON.stringify({
     code: { code: 'E0453' },
-    spans: [{ is_primary: true, file_name: 'crates\\a\\src\\lib.rs', line_start: 7, text: [{ text: '    #[allow(unsafe_code)]' }] }],
+    spans: [{
+      is_primary: true, file_name: 'crates\\a\\src\\lib.rs', line_start: 7, column_start: 5,
+      byte_start: 120, text: [{ text: '    #[allow(unsafe_code)]' }],
+    }],
   });
   const wrapped = JSON.stringify({
     reason: 'compiler-message',
     message: {
       code: { code: 'unsafe_code' },
-      spans: [{ is_primary: true, file_name: 'crates/a/src/lib.rs', line_start: 9, text: [{ text: 'unsafe { }' }] }],
+      spans: [{
+        is_primary: true, file_name: 'crates/a/src/lib.rs', line_start: 9, column_start: 9,
+        byte_start: 210, text: [{ text: 'unsafe { }' }],
+      }],
     },
   });
   const noise = ['not json', JSON.stringify({ reason: 'compiler-artifact' }), ''].join('\n');
   const sites = sitesFrom([bare, wrapped, noise].join('\n'));
   assert.deepEqual(sites, [
-    { kind: 'allowance', file: 'crates/a/src/lib.rs', line: 7, text: '#[allow(unsafe_code)]' },
-    { kind: 'usage', file: 'crates/a/src/lib.rs', line: 9, text: 'unsafe { }' },
+    {
+      kind: 'allowance', file: 'crates/a/src/lib.rs', line: 7, column: 5, offset: 120,
+      text: '#[allow(unsafe_code)]',
+    },
+    {
+      kind: 'usage', file: 'crates/a/src/lib.rs', line: 9, column: 9, offset: 210,
+      text: 'unsafe { }',
+    },
+  ]);
+  // A span with no offset still yields a site, keyed by line and column instead.
+  const spare = JSON.stringify({
+    code: { code: 'unsafe_code' },
+    spans: [{ is_primary: true, file_name: 'a.rs', line_start: 1, text: [{ text: 'unsafe { }' }] }],
+  });
+  assert.deepEqual(sitesFrom(spare), [
+    { kind: 'usage', file: 'a.rs', line: 1, column: 0, offset: null, text: 'unsafe { }' },
   ]);
 
   // The two the gate reads are not "unaudited"; anything else at error level is.
@@ -269,6 +335,54 @@ test('a run that did not audit anything is not read as a clean one', () => {
   assert.deepEqual(
     auditFailed({ status: 1, sites: [], reasons: ['mismatched types'], output: '' }),
     ['mismatched types'],
+  );
+
+  // **A process that did not finish did not audit anything**, whatever it printed first.
+  // One diagnostic used to be enough to call a target audited, so a run killed part-way
+  // through, or one that failed for something cargo prints as plain text, passed on the
+  // strength of the lines it managed to emit. A security review named it.
+  const killed = auditFailed({
+    status: null, signal: 'SIGKILL', sites: [{ kind: 'usage' }], reasons: [], output: '',
+  });
+  assert.equal(killed.length, 1, JSON.stringify(killed));
+  assert.match(killed[0], /killed by SIGKILL part-way through/u);
+
+  // No status at all, which is what a spawn that never completed leaves.
+  assert.match(
+    auditFailed({ status: null, sites: [{ kind: 'usage' }], reasons: [], output: '' })[0],
+    /did not report an exit status/u,
+  );
+
+  // A failure cargo reports as plain text, after our diagnostics have been read.
+  const other = auditFailed({
+    status: 101,
+    signal: null,
+    sites: [{ kind: 'usage' }],
+    reasons: [],
+    output: [
+      JSON.stringify({ code: { code: 'unsafe_code' }, level: 'error', message: 'usage of an unsafe block' }),
+      'error: linker `cc` not found',
+      'error: could not compile `queue-secrets` (lib test) due to 1 previous error',
+    ].join('\n'),
+  });
+  assert.equal(other.length, 1, JSON.stringify(other));
+  assert.match(other[0], /for a reason this gate does not recognise/u);
+  assert.match(other[0], /linker/u);
+
+  // And the ordinary case stays ordinary: the forbid fired, cargo said it could not
+  // compile, and that is the whole story.
+  assert.deepEqual(
+    auditFailed({
+      status: 101,
+      signal: null,
+      sites: [{ kind: 'usage' }],
+      reasons: [],
+      output: [
+        JSON.stringify({ code: { code: 'unsafe_code' }, level: 'error', message: 'usage of an unsafe block' }),
+        'error: could not compile `fhd-platform` (lib) due to 52 previous errors',
+      ].join('\n'),
+    }),
+    [],
   );
 });
 
