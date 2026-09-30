@@ -70,8 +70,14 @@ pub enum StorageError {
     /// Reporting the first when it was the second sends somebody to check
     /// permissions that were never wrong -- which is what this engine did, and a
     /// review caught it. Where the system does not separate them, neither does
-    /// this: the refusal is reported as unclassified, with the raw error logged
-    /// for diagnosis, and nobody is told a story.
+    /// this: the refusal is reported as unclassified, and nobody is told a story.
+    ///
+    /// **What happens to the number is the adapter's business, not this type's.**
+    /// This value carries no detail and none can be read out of it -- an earlier
+    /// version of this comment said the raw error was logged, which was a promise
+    /// about code that lives elsewhere and, when a review checked, was not being
+    /// kept. The adapter that classifies a refusal records the number it saw before
+    /// discarding it, and that is stated where it is done rather than here.
     ///
     /// It is a stop, never a retry: the coordinator sends everything that is not
     /// a name conflict to `Storage`, which rests the job for an operator.

@@ -175,11 +175,35 @@ impl Directory {
     /// the engine refuses to put its database and part files there, which is the
     /// point. A real installation makes a directory of its own under the user's
     /// local application data, and so does this.
+    /// **This harness requires `LOCALAPPDATA` on Windows**, rather than falling back to
+    /// the shared temporary directory as it used to.
+    ///
+    /// What the fallback risks is measured rather than supposed. On this machine, with
+    /// the engine's own check: `%LOCALAPPDATA%\fhd-tests` is clean, plainly spelled and
+    /// canonically, freshly made and left from an earlier run. The shared temporary
+    /// directory reports **two** components that another principal can move aside, and a
+    /// directory under the working tree's own volume reports **three** --
+    /// `D:\Projects`, `D:\Projects\FHD` and `D:\Projects\FHD\target`, each granting
+    /// `S-1-5-11` (Authenticated Users) enough to rename it. An engine opened on either
+    /// is refused, correctly, and the refusal surfaces as every integration case failing
+    /// at `Engine::open`.
+    ///
+    /// **That three is a reproduction of a signature, not a history.** A run elsewhere
+    /// failed with `SwappableStatePath(3)`, and this shows a root that produces exactly
+    /// that count; it does not establish which root that run used, and nothing here
+    /// should be read as saying it did.
+    ///
+    /// The failure below is per test, because this is called per test. What changes is
+    /// what it says: an environment named in one line instead of a count from a check
+    /// two layers down.
     fn base() -> PathBuf {
         #[cfg(windows)]
-        let root = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        let root = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect(
+            "LOCALAPPDATA is unset, and this harness requires it: the engine refuses a \
+             state directory whose path another principal can move aside, and the roots \
+             measured as fallbacks on this machine -- the shared temporary directory and \
+             a directory on the working tree's volume -- are both of that kind",
+        ));
         #[cfg(not(windows))]
         let root = std::env::temp_dir();
         let base = root.join("fhd-tests");

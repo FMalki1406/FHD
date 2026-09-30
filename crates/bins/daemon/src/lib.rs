@@ -1600,6 +1600,30 @@ mod told {
 /// disguises: reading it off the error code, and checking the destination path after
 /// the call. This is the third disguise, and it is refused here rather than in a
 /// comment: `called` goes in and comes out untouched by the classification.
+/// Records the number behind an unclassified refusal, and nothing else.
+///
+/// The classification throws away a distinction the system did not make; it does not
+/// have to throw away the evidence. One code an operator can search for, and one small
+/// integer from a fixed table -- no path, no name, nothing the destination or the
+/// source could carry.
+///
+/// **The number travels as `value`, because that is the field this engine's logger
+/// prints.** `ALLOWED` is an allowlist of field names, and a field outside it is
+/// dropped without a word: a first version of this called the field `errno` and the
+/// log would have carried the code with no number at all -- the same promise broken
+/// in a second place, after a review had just caught it in the first. Widening the
+/// allowlist would have been the worse fix, since what it admits is what can reach a
+/// log file.
+#[cfg(any(target_os = "linux", test))]
+fn unclassified(errno: i32) {
+    tracing::event!(
+        target: "fhd",
+        tracing::Level::WARN,
+        code = "STORAGE-UNCLASSIFIED",
+        value = errno,
+    );
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn linux_link_refusal(called: bool, error: &std::io::Error) -> fhd_app::storage::LinkRefused {
     let classified = linux_link_error(error);
@@ -1625,11 +1649,22 @@ fn linux_link_error(error: &std::io::Error) -> fhd_app::storage::StorageError {
         // hard links, and an operator would do opposite things about them. The
         // engine does the same thing either way -- rest the job -- so the honest
         // report is that the system did not say which.
-        Some(EPERM) => StorageError::Unclassified,
+        //
+        // **And the number is written down.** "Unclassified" is where a diagnosis has
+        // to start, and this is the last place that still knows it. A review found
+        // that claimed and not done. What is recorded is the number alone: no path,
+        // no name, nothing the destination or the source could carry.
+        Some(EPERM) => {
+            unclassified(EPERM);
+            StorageError::Unclassified
+        }
         // The link source is this process's own descriptor under `/proc/self/fd`.
         // `ENOENT` there is either a machine without procfs or a destination
         // directory that has gone; the call cannot tell which, so neither does this.
-        Some(ENOENT) => StorageError::Unclassified,
+        Some(ENOENT) => {
+            unclassified(ENOENT);
+            StorageError::Unclassified
+        }
         _ => match error.kind() {
             std::io::ErrorKind::AlreadyExists => StorageError::Conflict,
             std::io::ErrorKind::Unsupported | std::io::ErrorKind::CrossesDevices => {
@@ -1654,10 +1689,23 @@ mod linux_link_errors {
     use super::{linux_link_error, linux_link_refusal};
     use fhd_app::storage::StorageError;
     use std::io::Error;
+    use std::sync::Mutex;
+
+    /// Every test here classifies, and classifying an unclassifiable refusal emits.
+    ///
+    /// **`tracing` caches a callsite's interest globally.** A first evaluation from a
+    /// thread with no subscriber can cache "never", and then the event is skipped for
+    /// everyone -- so a capture running beside another test that emits sees one record,
+    /// or none, depending on which thread got there first. The full suite caught exactly
+    /// that: the capture below saw `value=1` and not `value=2` and the test failed. The
+    /// telemetry crate hit the same thing and answered it the same way, so this is that
+    /// answer rather than a new one.
+    static CALLSITE: Mutex<()> = Mutex::new(());
 
     /// Each classification this build claims it can prove.
     #[test]
     fn each_provable_cause_is_classified_and_nothing_else_is_guessed() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|held| held.into_inner());
         // A taken name: the one answer the caller acts on, by refusing to replace.
         assert_eq!(
             linux_link_error(&Error::from_raw_os_error(17)),
@@ -1686,6 +1734,73 @@ mod linux_link_errors {
         // kind is the platform's own business and this one is not Linux.
     }
 
+    /// The number behind an unclassified refusal reaches the log, through the
+    /// allowlist that decides what may.
+    ///
+    /// **Written because the claim was made twice and kept neither time.** The type's
+    /// documentation said the raw error was logged while the path dropped it; a review
+    /// caught that. The fix then named the field `errno`, which `ALLOWED` does not
+    /// admit, so the event would have carried a code and no number -- true in the
+    /// source, false in the log. So the assertion goes through the production visitor:
+    /// what it collects is exactly what an operator would see.
+    #[test]
+    fn an_unclassified_refusal_records_the_number_an_operator_will_see() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target() == "fhd"
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                // The production visitor, allowlist and all.
+                let mut fields = super::Fields(String::new());
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .expect("the capture is readable")
+                    .push(fields.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let _serial = CALLSITE.lock().unwrap_or_else(|held| held.into_inner());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(lines.clone()), || {
+            // With this subscriber installed, so an interest cached before it is not
+            // what decides whether the events below happen.
+            tracing::callsite::rebuild_interest_cache();
+            // Two that cannot be classified, and one that can: the classified one must
+            // say nothing, or every ordinary conflict would write a warning.
+            let _ = linux_link_error(&Error::from_raw_os_error(1));
+            let _ = linux_link_error(&Error::from_raw_os_error(2));
+            let _ = linux_link_error(&Error::from_raw_os_error(17));
+        });
+        let lines = lines.lock().expect("the capture is readable");
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected one record per unclassified refusal and none for a conflict: {lines:?}"
+        );
+        for (line, errno) in lines.iter().zip([1, 2]) {
+            assert!(
+                line.contains("code=STORAGE-UNCLASSIFIED"),
+                "the record does not carry the code: {line}"
+            );
+            assert!(
+                line.contains(&format!("value={errno}")),
+                "the record does not carry the number {errno}: {line}"
+            );
+        }
+    }
+
     /// **No errno turns an issued call into "nothing was created".**
     ///
     /// The classification describes the system's error and nothing else. Whether a
@@ -1701,6 +1816,7 @@ mod linux_link_errors {
     /// twice, and the only thing that moves is what the mechanism said.
     #[test]
     fn no_errno_converts_an_issued_call_into_a_refusal_that_made_nothing() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|held| held.into_inner());
         for raw in [1, 2, 13, 17, 18, 28, 5, 122] {
             let error = Error::from_raw_os_error(raw);
             let issued = linux_link_refusal(true, &error);
@@ -1732,6 +1848,7 @@ mod linux_link_errors {
     #[cfg(target_os = "linux")]
     #[test]
     fn what_the_table_does_not_name_keeps_the_kind_the_system_gave() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|held| held.into_inner());
         // ENOSPC: a full disk says so itself and needs no help from this table.
         assert_eq!(
             linux_link_error(&Error::from_raw_os_error(28)),
@@ -1752,6 +1869,7 @@ mod linux_link_errors {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_errno_constants_are_the_ones_this_kernel_returns() {
+        let _serial = CALLSITE.lock().unwrap_or_else(|held| held.into_inner());
         let directory = std::env::temp_dir().join(format!("fhd-errno-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("the directory is usable");
         let source = directory.join("source");

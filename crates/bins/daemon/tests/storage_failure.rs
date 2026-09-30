@@ -59,12 +59,16 @@ use tokio::sync::mpsc;
 struct Faults {
     /// The next write covering this offset fails with `StorageFull`, and clears.
     fail_write_at: Option<u64>,
-    /// The next sync fails, and clears.
+    /// How many syncs succeed before one fails. `None` means none of them fails.
     ///
-    /// One failure rather than a standing one, because a run whose every sync fails
-    /// never makes anything durable and so has nothing to lose -- and a test of what
-    /// survives a failure needs something to have survived it.
-    fail_sync_once: bool,
+    /// **Counted rather than switched, because the count is the premise.** Arming a
+    /// failure before the run meant the *first* sync failed, nothing was ever
+    /// committed, and a test of "what survives a failed sync" then had nothing to
+    /// survive it -- it accepted an empty record and, with an empty record, a part
+    /// that had vanished. A review caught exactly that, and a mutation deleting the
+    /// part on a storage failure would have passed. Letting `n` syncs through first
+    /// makes durable bytes a condition of the test rather than a hope about timing.
+    fail_sync_after: Option<usize>,
 }
 
 /// The production store, with one refusal in front of it.
@@ -127,7 +131,19 @@ impl SegmentFile for FaultyFile {
     fn sync(&mut self) -> Result<(), StorageError> {
         let refuse = {
             let mut faults = self.faults.lock().expect("the faults are readable");
-            std::mem::take(&mut faults.fail_sync_once)
+            match faults.fail_sync_after {
+                Some(0) => {
+                    // Fails once, then lets the disk work again: what a test needs
+                    // afterwards is a resume that can finish.
+                    faults.fail_sync_after = None;
+                    true
+                }
+                Some(left) => {
+                    faults.fail_sync_after = Some(left - 1);
+                    false
+                }
+                None => false,
+            }
         };
         if refuse {
             return Err(StorageError::Io(std::io::ErrorKind::Other));
@@ -548,6 +564,14 @@ async fn a_full_destination_disk_keeps_the_record_honest_and_the_part_resumable(
 /// they will still be there after a power cut. So what must survive here is not the
 /// part alone but the **honesty of the record** -- it may credit only what a sync
 /// returned for, and that is what the reopened engine is asked about.
+///
+/// **The failure comes after bytes are durable, and that is the whole test.** The
+/// first version armed it before the run, so the first sync failed, nothing was ever
+/// committed, and the assertions then allowed an empty record -- and with an empty
+/// record, a part that had disappeared. A security review named it: a mutation
+/// deleting the part on a storage failure passed. The fault now lets one sync
+/// through, the record is required to be non-empty before anything else is claimed,
+/// and the part must be there afterwards with no branch that excuses its absence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_sync_leaves_the_record_crediting_only_what_survived_it() {
     let body = content(3 * 1024 * 1024);
@@ -555,8 +579,9 @@ async fn a_failed_sync_leaves_the_record_crediting_only_what_survived_it() {
     let (port, served) = serve(body.clone(), 0);
 
     let engine = Wired::open(&state, &body, port).await;
+    // One sync succeeds -- committing extents -- and the next one fails.
     engine.arm(Faults {
-        fail_sync_once: true,
+        fail_sync_after: Some(1),
         ..Default::default()
     });
     assert_eq!(
@@ -569,10 +594,20 @@ async fn a_failed_sync_leaves_the_record_crediting_only_what_survived_it() {
     let generation = job.generation();
     let before = engine.extents().await;
     let durable: u64 = before.iter().map(|(range, _)| range.len()).sum();
+    // **The premise, asserted rather than hoped for.** Without durable bytes there is
+    // nothing for a failed sync to have kept, and every assertion below is vacuous.
+    assert!(
+        durable > 0,
+        "the premise failed: the sync that failed was the first one, so nothing had          been committed and this test would prove nothing"
+    );
     assert!(
         durable < body.len() as u64,
         "the premise failed: the whole file was credited although a sync failed"
     );
+    let part = engine
+        .part(generation)
+        .expect("the part file was removed by a failed sync");
+    record_matches_disk(&before, &part, &body);
 
     drop(engine);
     let engine = Wired::open(&state, &body, port).await;
@@ -581,15 +616,12 @@ async fn a_failed_sync_leaves_the_record_crediting_only_what_survived_it() {
         before,
         "reopening the engine changed what the record credits"
     );
-    if let Some(part) = engine.part(generation) {
-        record_matches_disk(&before, &part, &body);
-    } else {
-        assert!(
-            before.is_empty(),
-            "the part file is gone while the record still credits {} extents",
-            before.len()
-        );
-    }
+    // No branch excuses the part being gone: the record credits bytes, so the file
+    // that holds them has to be there, and it has to hold them.
+    let part = engine
+        .part(generation)
+        .expect("the part file did not survive the restart after a failed sync");
+    record_matches_disk(&before, &part, &body);
 
     let served_before = served.load(Ordering::SeqCst);
     engine.resume().await;
